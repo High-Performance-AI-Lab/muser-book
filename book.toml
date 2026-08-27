@@ -10,12 +10,13 @@ build-dir = "book"
 create-missing = false
 
 [output.html]
-default-theme = "rust"
-preferred-dark-theme = "navy"
+default-theme = "light"
+preferred-dark-theme = "light"
 # Must match the Pages subpath: https://high-performance-ai-lab.github.io/muser-book/ .
 # Set to "/" only if the book is hosted at a domain root.
 site-url = "/muser-book/"
 no-section-label = false
+additional-css = ["theme/custom.css"]
 additional-js = ["src/mermaid.min.js", "src/mermaid-init.js"]
 
 [preprocessor]

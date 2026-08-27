@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- High Performance AI Lab mark, light-surface variant.
+       A 4x4 grid of memory pages: the lit pages climb as a measured series
+       (1, 3, 2, 4); the oxide page top right is the decode head (the hot
+       page); the rest stay dim. Ramp = site teal -> cobalt; head = site
+       primary oxide. Dark-surface twin: the .github org repo's
+       assets/org-logo.svg. Grid: 9px pages, 2px gaps, 11px margin, rx 2. -->
+  <rect width="64" height="64" rx="14" fill="#faf9f7"/>
+  <!-- unlit pages -->
+  <g fill="#e8e7e5">
+    <rect x="11" y="11" width="9" height="9" rx="2"/>
+    <rect x="11" y="22" width="9" height="9" rx="2"/>
+    <rect x="11" y="33" width="9" height="9" rx="2"/>
+    <rect x="22" y="11" width="9" height="9" rx="2"/>
+    <rect x="33" y="11" width="9" height="9" rx="2"/>
+    <rect x="33" y="22" width="9" height="9" rx="2"/>
+  </g>
+  <!-- lit pages: the measured series, teal->cobalt by (col+row)/6 -->
+  <rect x="11" y="44" width="9" height="9" rx="2" fill="#0f766e"/>
+  <rect x="22" y="44" width="9" height="9" rx="2" fill="#137383"/>
+  <rect x="22" y="33" width="9" height="9" rx="2" fill="#167098"/>
+  <rect x="22" y="22" width="9" height="9" rx="2" fill="#1a6cac"/>
+  <rect x="33" y="44" width="9" height="9" rx="2" fill="#167098"/>
+  <rect x="33" y="33" width="9" height="9" rx="2" fill="#1a6cac"/>
+  <rect x="44" y="44" width="9" height="9" rx="2" fill="#1a6cac"/>
+  <rect x="44" y="33" width="9" height="9" rx="2" fill="#1e69c1"/>
+  <rect x="44" y="22" width="9" height="9" rx="2" fill="#2166d6"/>
+  <!-- the decode head, the hot page -->
+  <rect x="44" y="11" width="9" height="9" rx="2" fill="#c2410c"/>
+</svg>

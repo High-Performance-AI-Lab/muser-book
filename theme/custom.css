@@ -1,0 +1,152 @@
+/* ============================================================
+   High Performance AI Lab — book theme
+   Matches the lab website: paper #faf9f7, ink #1c1917, oxide
+   #c2410c primary, teal #0f766e / cobalt #2563eb secondaries;
+   Inter body, IBM Plex Sans display, JetBrains Mono code.
+   Light-only, like the site.
+   ============================================================ */
+
+/* Self-hosted variable fonts — the same faces the lab website uses.
+   Files live in src/hpal-fonts/ (copied unhashed to the book root);
+   paths are relative to this stylesheet's location in theme/. */
+@font-face {
+  font-family: "Inter Variable";
+  font-style: normal; font-weight: 100 900; font-display: swap;
+  src: url("../hpal-fonts/inter-latin-wght-normal.woff2") format("woff2-variations");
+}
+@font-face {
+  font-family: "IBM Plex Sans Variable";
+  font-style: normal; font-weight: 100 900; font-display: swap;
+  src: url("../hpal-fonts/ibm-plex-sans-latin-wght-normal.woff2") format("woff2-variations");
+}
+@font-face {
+  font-family: "JetBrains Mono Variable";
+  font-style: normal; font-weight: 100 800; font-display: swap;
+  src: url("../hpal-fonts/jetbrains-mono-latin-wght-normal.woff2") format("woff2-variations");
+}
+
+:root {
+  --hpal-paper: #faf9f7;
+  --hpal-paper-2: #f5f4f1;
+  --hpal-ink: #1c1917;
+  --hpal-muted: #57534e;
+  --hpal-line: rgba(28, 25, 23, 0.12);
+  --hpal-oxide: #c2410c;
+  --hpal-oxide-deep: #9a3412;
+  --hpal-teal: #0f766e;
+  --hpal-cobalt: #2563eb;
+}
+
+/* mdBook theme variables, overridden for every theme class so the book
+   is brand-light regardless of a stored theme preference */
+:root, html.light, html.rust, html.coal, html.navy, html.ayu {
+  --bg: var(--hpal-paper);
+  --fg: var(--hpal-ink);
+  --sidebar-bg: var(--hpal-paper-2);
+  --sidebar-fg: var(--hpal-muted);
+  --sidebar-non-existant: #c9c5c0;
+  --sidebar-active: var(--hpal-oxide);
+  --sidebar-spacer: var(--hpal-line);
+  --scrollbar: #c9c5c0;
+  --icons: var(--hpal-muted);
+  --icons-hover: var(--hpal-oxide);
+  --links: var(--hpal-oxide);
+  --inline-code-color: var(--hpal-teal);
+  --theme-popup-bg: #ffffff;
+  --theme-popup-border: var(--hpal-line);
+  --theme-hover: var(--hpal-paper-2);
+  --quote-bg: var(--hpal-paper-2);
+  --quote-border: var(--hpal-line);
+  --table-border-color: var(--hpal-line);
+  --table-header-bg: var(--hpal-paper-2);
+  --table-alternate-bg: #fdfcfb;
+  --searchbar-border-color: var(--hpal-line);
+  --searchbar-bg: #ffffff;
+  --searchbar-fg: var(--hpal-ink);
+  --searchbar-shadow-color: rgba(28, 25, 23, 0.08);
+  --searchresults-header-fg: var(--hpal-muted);
+  --searchresults-border-color: var(--hpal-line);
+  --searchresults-li-bg: #ffffff;
+  --search-mark-bg: #fde5d8;
+  --color-scheme: light;
+  --footnote-highlight: #fde5d8;
+}
+
+/* Typography: same stacks as the website */
+html, body {
+  font-family: "Inter Variable", "Inter", system-ui, -apple-system, sans-serif;
+}
+h1, h2, h3, h4, h5, .menu-title {
+  font-family: "IBM Plex Sans Variable", "IBM Plex Sans", "Inter Variable", sans-serif;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+code, pre, kbd, .sidebar .part-title {
+  font-family: "JetBrains Mono Variable", "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+}
+
+/* Chrome: hairlines instead of shadows, paper surfaces */
+#menu-bar {
+  background: var(--hpal-paper);
+  border-bottom: 1px solid var(--hpal-line);
+  box-shadow: none;
+}
+#menu-bar.bordered { border-bottom-color: var(--hpal-line); }
+.menu-title { color: var(--hpal-ink); font-size: 1.55rem; }
+
+/* The lab mark next to the book title */
+.menu-title::before {
+  content: "";
+  display: inline-block;
+  width: 0.95em;
+  height: 0.95em;
+  margin-right: 0.45em;
+  vertical-align: -0.12em;
+  background-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 42 42"><g fill="%23e4e1dc"><rect x="0" y="0" width="9" height="9" rx="2"/><rect x="0" y="11" width="9" height="9" rx="2"/><rect x="0" y="22" width="9" height="9" rx="2"/><rect x="11" y="0" width="9" height="9" rx="2"/><rect x="22" y="0" width="9" height="9" rx="2"/><rect x="22" y="11" width="9" height="9" rx="2"/></g><rect x="0" y="33" width="9" height="9" rx="2" fill="%230f766e"/><rect x="11" y="33" width="9" height="9" rx="2" fill="%23137383"/><rect x="11" y="22" width="9" height="9" rx="2" fill="%23167098"/><rect x="11" y="11" width="9" height="9" rx="2" fill="%231a6cac"/><rect x="22" y="33" width="9" height="9" rx="2" fill="%23167098"/><rect x="22" y="22" width="9" height="9" rx="2" fill="%231a6cac"/><rect x="33" y="33" width="9" height="9" rx="2" fill="%231a6cac"/><rect x="33" y="22" width="9" height="9" rx="2" fill="%231e69c1"/><rect x="33" y="11" width="9" height="9" rx="2" fill="%232166d6"/><rect x="33" y="0" width="9" height="9" rx="2" fill="%23c2410c"/></svg>');
+  background-size: contain;
+  background-repeat: no-repeat;
+}
+
+/* Light-only: hide the theme picker (the site commits to one look) */
+#mdbook-theme-toggle, #theme-toggle { display: none; }
+
+/* Content rhythm */
+.content { line-height: 1.65; }
+.content a { color: var(--hpal-oxide); text-decoration: none; }
+.content a:hover { color: var(--hpal-oxide-deep); text-decoration: underline; text-underline-offset: 3px; }
+.content h1, .content h2 { border-bottom: 1px solid var(--hpal-line); padding-bottom: 0.3em; }
+.content blockquote {
+  border-left: 3px solid var(--hpal-oxide);
+  border-top: 0; border-right: 0; border-bottom: 0;
+  background: var(--hpal-paper-2);
+}
+.content pre {
+  border: 1px solid var(--hpal-line);
+  border-radius: 6px;
+}
+.content :not(pre) > code {
+  background: var(--hpal-paper-2);
+  border-radius: 4px;
+  padding: 0.1em 0.35em;
+}
+.content table { border-collapse: collapse; }
+.content table th {
+  font-family: "JetBrains Mono Variable", monospace;
+  font-size: 0.78em;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--hpal-muted);
+}
+
+/* Sidebar: mono part titles, oxide active chapter */
+.sidebar { font-size: 0.86em; }
+.sidebar .part-title {
+  font-size: 0.72em;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--hpal-muted);
+}
+.chapter li.chapter-item a.active { color: var(--hpal-oxide); font-weight: 600; }
+
+/* Navigation arrows */
+.nav-chapters:hover, .mobile-nav-chapters:hover { color: var(--hpal-oxide); }
