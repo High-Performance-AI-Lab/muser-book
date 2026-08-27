@@ -103,10 +103,9 @@ lesson survives on Muser's live path, the book says so and cites it.
 
 ## What this book is *not*
 
-- It is **not** launch copy. Launch wording is governed by
-  `docs/launch-claims.md` in the Muser repo. This book is an engineering
-  document: it may state *what was measured and under what scope*, and every
-  number carries its receipt, but nothing here is a product claim.
+- It is **not** marketing. Every number states what was measured and under
+  what scope — device, model, quantization, reps — and cites its receipt.
+  If you want a sales pitch, this is the wrong book.
 - It is **not** a survey of dead ends for their own sake. Rejected designs
   (the linear distributed-speculative lane, native NVFP4 speculative decode
   under Fallback B, the ANE route for v0.1) appear where their *failure*
