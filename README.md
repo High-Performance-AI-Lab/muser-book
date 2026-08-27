@@ -13,7 +13,7 @@ to a retained evidence receipt.
 ## Read it
 
 The rendered book publishes to GitHub Pages from this repository's `main`
-branch: `https://<org>.github.io/muser-book/`.
+branch: `https://high-performance-ai-lab.github.io/muser-book/`.
 
 ## Build it locally
 

@@ -12,7 +12,7 @@ create-missing = false
 [output.html]
 default-theme = "rust"
 preferred-dark-theme = "navy"
-# Must match the Pages subpath: https://<owner>.github.io/<repo-name>/ .
+# Must match the Pages subpath: https://high-performance-ai-lab.github.io/muser-book/ .
 # Set to "/" only if the book is hosted at a domain root.
 site-url = "/muser-book/"
 no-section-label = false
