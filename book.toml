@@ -1,0 +1,24 @@
+[book]
+title = "How to Write an Inference Engine"
+authors = ["The Muser program"]
+description = "The Muser book — Muse Glimmer on Apple Metal, kvpack, and disaggregated prefill. A zero-to-hero book: how Muser generates one token of Muse Glimmer on Apple Silicon, and how a GB10 prefills NVFP4 across an authenticated handoff."
+src = "src"
+language = "en"
+
+[build]
+build-dir = "book"
+create-missing = false
+
+[output.html]
+default-theme = "rust"
+preferred-dark-theme = "navy"
+# Must match the Pages subpath: https://<owner>.github.io/<repo-name>/ .
+# Set to "/" only if the book is hosted at a domain root.
+site-url = "/muser-book/"
+no-section-label = false
+additional-js = ["src/mermaid.min.js", "src/mermaid-init.js"]
+
+[preprocessor]
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"
