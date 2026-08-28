@@ -24,23 +24,36 @@ observing another's state?
 The answer in Muser is a discipline, stated in one line of the architecture
 document: "One scheduler owns one accelerator and between one and four resident
 slots" `[docs/muser-architecture.md §Slots and scheduling]`. This chapter takes
-that sentence apart. There are two schedulers, actually — an engine-side owner
-of the Metal queue, and a server-side pool that admits requests into slots —
-and the design keeps them deliberately separate. By the end you will know why
-four is the number, what exactly a slot owns, what is shared and why sharing is
-safe, and how a 250 µs rendezvous turns four independent request threads into
-one packed Metal submission without any of them giving up its slot.
+that sentence apart, clause by clause. The first thing to say about it is that
+the singular is a simplification: there are two schedulers, an engine-side owner
+of the Metal queue and a server-side pool that admits requests into slots, and
+the design keeps them deliberately separate. Walking that separation is most of
+the chapter, because it is where the interesting decisions live. By the end you
+will know why four is the number, what exactly a slot owns, what is shared and
+why sharing is safe, and how a 250 µs rendezvous turns four independent request
+threads into one packed Metal submission without any of them giving up its
+slot.
 
 ---
 
 ## 34.1 The problem a scheduler solves
 
+Where does the time go when several people talk to one machine at once? Not
+into any single kernel — those are the same kernels Part III measured, and they
+do not get slower because a second user showed up. It goes into the waiting:
+whose token runs next, and who is stuck behind whom. That is the question a
+scheduler exists to answer, and answering it badly does not show up as a
+uniform slowdown you can average away. It shows up as one user's stream
+visibly freezing while somebody else's document is processed.
+
 Start from the hardware. One Mac, one GPU, one `MTLCommandQueue`
 ([Ch 2](02-metal-compute-model.md)). Multiple HTTP requests arrive; each wants
 a generation; each generation is a serial loop of one-token forward passes
-through the same 52-layer graph. Naively, every request could open its own
-session and submit its own command buffers onto the shared queue. Three things
-go wrong with that picture:
+through the same 52-layer graph. The obvious design is no design at all: let
+every request open its own session, submit its own command buffers onto the
+shared queue, and let Metal sort out the ordering. It is worth walking that
+picture to its failures, because each failure is a requirement in disguise, and
+the scheduler that follows is shaped by exactly these three:
 
 1. **Interleaving is uncontrolled.** A 512-row prefill chunk from request B can
    land in front of request A's next decode token, and A's user stares at a
@@ -76,7 +89,11 @@ Metal-only tests with no server in sight
 
 ## 34.2 The engine scheduler: one owner for one queue
 
-Here is the whole type. This is the "one scheduler" of the architecture
+Take the engine level first, and take it on its own terms: given one Metal
+queue and several host threads that all want to encode onto it, who goes next?
+That is the entire brief. It is a narrow question, and the answer is small
+enough to read in one sitting — no work-stealing deques, no priority heaps, no
+timer wheel. Here is the whole type, the "one scheduler" of the architecture
 sentence, and it is 25 lines including comments:
 
 ```rust
@@ -113,8 +130,11 @@ call you can forget to make.
 
 ### Acquire: decode first, prefill only into silence
 
-Every graph — every token, every prefill chunk — acquires the scheduler before
-encoding. The policy lives in `acquire`:
+What breaks if this next part is wrong? A streaming user's next word arrives
+behind somebody else's document, and no amount of kernel tuning downstream will
+give it back. Every graph — every token, every prefill chunk — acquires the
+scheduler before encoding, which makes this one loop the place where the felt
+responsiveness of the whole server is decided. The policy lives in `acquire`:
 
 ```rust
 // crates/muser-engine/src/decode.rs:1053-1069
@@ -158,6 +178,10 @@ Decode the eligibility line, because both clauses are the design:
 
 ### Fairness: ascending cyclic order
 
+Exclusivity on its own is not fairness. A fast slot can drop its permit and ask
+again immediately, and nothing in `!state.active` stops it from winning that
+race every time; the loser would simply wait, correctly and forever. Fairness
+has to be something the code asserts, not something that emerges. So
 `next_decode_sequence` implements the rotation promised by the doc comment:
 
 ```rust
@@ -177,7 +201,13 @@ fn next_decode_sequence(state: &AcceleratorSchedulerState) -> Option<usize> {
 
 With sequences {1, 3, 4} waiting and `last_decode = 3`, the next selection is
 4, then wraps to 1, then 3 — strictly cyclic. No sequence can be skipped twice
-in a row by a peer. This is the "preventing a hot slot from repeatedly
+in a row by a peer. Put it the other way round: the waiting set is a circle and
+`last_decode` is a finger resting on it, so selection never looks for the
+*best* candidate, only for the *next* one. That is why asking more often buys a
+hot slot nothing — it only returns to its own place on the circle sooner, and
+the place is where the turn comes from.
+
+This is the "preventing a hot slot from repeatedly
 reacquiring the accelerator ahead of its peers" clause made algorithmic, and
 the same rotation reappears at the server level (§34.5), where the batch sorts
 its candidates by a matching `decode_rotation_key`
@@ -185,9 +215,15 @@ its candidates by a matching `decode_rotation_key`
 
 ### Chunk shrinking: keeping decode's escape hatch open
 
-Decode-over-prefill has a sharp edge the engine also handles: once a prefill
-chunk has *started*, decode must wait for it. So the chunk *boundary* itself is
-adaptive, in `forward_into`:
+"Prefill only into silence" sounds like it settles the matter. It does not, and
+the gap is worth seeing before the fix, because the fix looks arbitrary
+otherwise. The rule is checked at *acquisition* only, and a permit once granted
+is not preemptible: once a prefill chunk has started encoding, every decode
+token that queues behind it waits for the whole chunk. Tightening the rule is
+not available as a move — you cannot abandon a half-encoded graph, and you
+cannot ask the GPU to put a command buffer down. What is available is the size
+of the thing decode has to wait for. So the chunk *boundary* becomes adaptive,
+in `forward_into`:
 
 ```rust
 // crates/muser-engine/src/decode.rs:2097-2107
@@ -215,7 +251,13 @@ side.
 ## 34.3 What a slot is: the state inventory
 
 "One scheduler owns one accelerator and between one and four resident slots."
-What, precisely, is a slot? The architecture document inventories it:
+The word "slot" has been carrying a lot of weight for two sections now, and it
+is time to open it. It is the unit the whole design is bounded in, which means
+an error in either direction is expensive. Put too much into a slot and four of
+them will not fit in memory. Put too little in, and two users end up quietly
+sharing a buffer that nobody intended them to share — the kind of bug that
+looks like a rare sampling glitch and is really a correctness breach. So: what,
+precisely, is a slot? The architecture document inventories it:
 
 > Each slot owns independent target KV, DFlash state, logits, RNG, sampler and
 > grammar state, detokenizer/stop state, and cancellation state. Immutable
@@ -290,11 +332,11 @@ struct RequestSamplerState {
 One `Mt19937` stream per stochastic sampler feature — the deterministic
 Mersenne Twister of [Ch 21](21-sampling-argmax-and-grammar.md), snapshot-able
 and restore-able so the same RNG stream survives across local/remote lanes and
-across a session save/restore. Grammar state (`GrammarMatcher`, GBNF Earley
-recognizer [crates/muser-server/src/grammar.rs:1-9]), the streaming
-detokenizer, and the stop filter are constructed per request in the generation
-loop [crates/muser-server/src/openai.rs:2266-2270]. Cancellation is a flag
-checked between tokens — §34.6.
+across a session save/restore. Grammar state, the streaming detokenizer, and
+the stop filter are built fresh for every request, inside the generation loop
+[crates/muser-server/src/openai.rs:2266-2270]; the grammar matcher there is a
+GBNF Earley recognizer, `GrammarMatcher` [crates/muser-server/src/grammar.rs:1-9].
+Cancellation is a flag checked between tokens — §34.6.
 
 **What is shared** is the counter-list, `MetalShared`:
 
@@ -324,7 +366,16 @@ never write the same buffer; they borrow the same read-only weights
 ([Ch 3](03-unified-memory-and-buffers.md)'s zero-copy mmap views) and take
 turns at the queue.
 
-The bound on how many of these may exist — why four — has two halves. The
+Notice what that argument does *not* need. There is no lock guarding the
+weights, because nothing writes them; the sequence-local handle reaches them
+through an `Arc`, which hands out shared references and nothing else. Isolation
+here is a shape in the type layout rather than a convention somebody has to
+remember at every call site — which is why the sharing story can be stated in
+one sentence and then trusted for the rest of the chapter.
+
+Which brings us to the number the architecture sentence asserts without
+arguing. Why four, and not eight, or simply as many as will fit? The bound has
+two halves, and they were set by different arguments. The
 **memory** half is [Ch 22](22-the-price-of-context.md)'s arithmetic: one
 slot's KV at the 131,072-position limit is ≈1.827 GB and four slots ≈7.306 GB
 on the 96 GB M3 Ultra `[docs/memory-footprint.md]`. The **throughput** half is
@@ -335,8 +386,14 @@ an accident of memory.
 
 ## 34.4 The server level I: `SlotPool` — bounded admission
 
-Above the engine sits the server's `InferenceRuntime`, and its doc-commented
-fields state the second level's job:
+The engine level knows how to take turns. What it does not know is how many
+players there should be: the type you just read holds a `BTreeSet` of waiting
+sequence IDs and has no capacity at all, so nothing in it would refuse a fifth
+resident sequence, or a fiftieth. Bounding the population is the server's job,
+and the question it answers is the unglamorous one every serving system has to
+answer somewhere — what happens to the request that arrives when every slot is
+already taken? Above the engine sits the server's `InferenceRuntime`, and its
+doc-commented fields state the second level's job:
 
 ```rust
 // crates/muser-server/src/state.rs:221-243
@@ -394,16 +451,23 @@ pub(crate) struct SlotPool {
 }
 ```
 
-Acquire [crates/muser-server/src/state.rs:545-590] pops a free slot if one
-exists; otherwise it counts itself among the waiters — and if 64 waiters are
-already queued it fails immediately with `SlotAcquireError::Overloaded` (an
-HTTP-level rejection, not a hang). A poisoned mutex or a missing session
-latches the pool **unhealthy** permanently: every subsequent acquire returns
-`Unhealthy`, which surfaces as HTTP 503
-[crates/muser-server/src/axum_httpd.rs:1066-1070]. That latch is fail-closed
-scheduling — the same culture as the producer's exit-75
-[Ch 28](28-the-gx10-and-vllm-nvfp4-prefill.md) — and [Ch 37](37-server-sessions-and-security.md)
-finishes the story.
+Acquire pops a free slot if one exists; otherwise the caller counts itself
+among the waiters, and if 64 waiters are already queued it fails immediately
+with `SlotAcquireError::Overloaded` — an HTTP-level rejection, not a hang
+[crates/muser-server/src/state.rs:545-590]. That is the ordinary path, and it is
+the boring half.
+
+The interesting half is what happens when the pool cannot trust itself. A
+poisoned mutex or a missing session does something stronger than fail one
+request: it latches the pool **unhealthy** permanently, so every later acquire
+returns `Unhealthy` and surfaces as HTTP 503
+[crates/muser-server/src/axum_httpd.rs:1066-1070]. Only an operator restart
+clears it. This is the same fail-closed reflex as the producer's exit-75 in
+[Ch 28](28-the-gx10-and-vllm-nvfp4-prefill.md), and the reason it is worth
+naming twice is that both are refusals to guess: a lock poisoned mid-decode
+means some sequence's GPU state was abandoned in an unknown condition, and
+nothing available at that moment can tell you which sequence or how badly.
+[Ch 37](37-server-sessions-and-security.md) finishes the story.
 
 ## 34.5 The server level II: `DecodeBatcher` — the 250 µs rendezvous
 
@@ -457,6 +521,16 @@ state.queue.extend(remainder);
 5. The runner installs each job's result, clears `running`, and notifies; the
    blocked threads wake with their token computed.
 
+The election is the part that trips people up, so here it is once more from a
+different angle. Nobody hands over a slot. Every request thread still owns its
+own `Session` for the whole generation, start to finish; what the batcher
+borrows is only the *turn* — the right to be the thread that encodes this one
+step. Several threads go to sleep, one of them does the encoding for all of
+them, and each wakes with its own row's result installed in its own cell. The
+batch is an implementation detail of a single step, not a transfer of
+ownership, which is exactly why nothing above this layer has to know that a
+batch happened at all.
+
 The 250 µs window is a *latency budget spent to buy bandwidth amortization*:
 if a second and third row are 100 µs behind the first, waiting for them costs
 each early row a fraction of a millisecond and saves up to three full weight
@@ -472,14 +546,29 @@ instinct behind the constant:
 enabled: metal && resident_slots > 1,
 ```
 
-What the four-way packing buys in absolute throughput on this hardware is not
-claimed as a measurement anywhere in the campaign docs [unverified] — the
-design justification in source is the weight-pass amortization argument above,
-and the qualification cells were run per-lane, not per-width.
+That comment is the closest the source comes to citing evidence, and notice
+what it cites: a latency *cell*, a lane, not a width. So we went looking for
+the payoff on the other side of the trade — the throughput the packing is
+supposed to buy. What we expected to find was a width sweep, one resident row,
+then two, then four, tokens per second for each —
+because that is the obvious way to settle a packing argument, and packing
+arguments are easy to believe and easy to get wrong. It is not in the evidence.
+The qualification cells were run per-lane, not per-width, so what the four-way
+packing buys in absolute throughput on this hardware is not claimed as a
+measurement anywhere in the campaign docs [unverified]. The absence is worth
+stating plainly instead of papering over: the case for packing, here, is a
+design argument read out of the source — the weight-pass amortization above —
+and not a measured one. The lesson we took away from the search is that a
+campaign measures what it was asked to release, and concurrency width was not
+on that list.
 
 ## 34.6 Keeping the owner clean, and the staging generation
 
-Two disciplines complete the design.
+A scheduler is only as good as what it refuses to admit into the critical
+section, and as good as what it does when the far end of a socket stops
+listening. Two disciplines answer those two questions. A third rule then guards
+the slot count against a tenant that would otherwise walk in through a side
+door.
 
 **Nothing slow happens on the accelerator owner.** The architecture document
 lists what stays off: "Tokenization, sampling, grammar/tool parsing, disk,
@@ -512,13 +601,18 @@ match sender.try_send(item) {
 }
 ```
 
-A client that stops reading gets a 5 s grace (`SLOW_CLIENT_GRACE`,
-[crates/muser-server/src/axum_httpd.rs:55]) — backpressure relief, not a
-hostage situation — and then the request is *cancelled*, not parked: the
-error type maps to HTTP 499
-"Client Closed Request" [crates/muser-server/src/openai.rs:649, 665]. A
-disconnected socket cancels immediately (the closed-channel arm of the same
-match, axum_httpd.rs:2319). The resumable-stream variant keeps the same rule
+Read that match arm by arm, because it encodes a policy rather than plumbing. A
+client that has merely fallen behind is given room: the generator retries,
+sleeping briefly between attempts, instead of failing on the first full
+channel. That is backpressure relief, and the budget for it is 5 s
+(`SLOW_CLIENT_GRACE`, [crates/muser-server/src/axum_httpd.rs:55]). When the
+budget runs out the request is *cancelled*, not parked — relief, not a hostage
+situation — and the error type maps to HTTP 499
+"Client Closed Request" [crates/muser-server/src/openai.rs:649, 665]. A socket
+that has already gone away does not even get the grace: the closed-channel arm
+of the same match cancels it immediately (axum_httpd.rs:2319).
+
+The resumable-stream variant keeps the same rule
 on purpose — its comment is the isolation contract in miniature: "A connected
 client that remains backpressured for the full grace period still cancels this
 request, as required by the serving isolation contract"
@@ -594,9 +688,14 @@ entirely.*
 
 ## 34.8 Tradeoffs
 
-**Decode-absolute vs prefill-throughput.** Prefill runs only when no decode
-waits (`decode.rs:1058`), and chunk boundaries collapse 512→64 under decode
-pressure (`decode.rs:2103-2107`). The cost side is explicit: under concurrent
+Each of these was a real fork, and each was settled by giving something up. The
+honest way to read the four below is as prices paid, not as features.
+
+**Decode-absolute vs prefill-throughput.** Every scheduling policy is a
+decision about whose time is cheap, and this one says the prefiller's is.
+Prefill runs only when no decode waits (`decode.rs:1058`), and chunk boundaries
+collapse 512→64 under decode pressure
+(`decode.rs:2103-2107`). The cost side is explicit: under concurrent
 load, prefill throughput drops (smaller chunks, deferred acquisition). The
 benefit side is structural, not a measured serving cell: decode latency is
 bounded by one 64-row interval plus the running decode queue, which is the
@@ -606,8 +705,12 @@ throughput matrices (e.g. the six-depth plain matrix
 concurrent decode pressure, so they do not adjudicate this trade — the code's
 own comments are the design record.
 
-**The 250 µs window as a spent latency budget.** With `--parallel 1` the
-batcher disables itself because the window "only delays every token in the
+**The 250 µs window as a spent latency budget.** Coalescing is a bet: you delay
+work you already have in hand in order to collect work that has not arrived
+yet. Where the bet cannot pay — one resident slot, no second row physically
+possible — the delay is pure loss, and the code declines to take it. With
+`--parallel 1` the batcher disables itself because the window
+"only delays every token in the
 release-relevant parallel-1 latency cell" [crates/muser-server/src/state.rs:281-284];
 at `--parallel > 1` the window trades ≤250 µs per packed row for up to
 three avoided weight passes. No five-rep measurement of the packed-batch win
@@ -615,17 +718,21 @@ exists in the campaign evidence [unverified]; the justification in source is
 the weight-pass amortization argument of [Ch 1], and the constant is small
 enough to dominate in only one direction.
 
-**Two schedulers instead of one.** A single admission-plus-dispatch monolith
-would remove a level, but the engine would then know about HTTP concepts
-(slots, waiters, overload) and the server about Metal concepts (permits,
-encoders). The split keeps `muser-engine` independently testable — the
-scheduler tests run without any server [crates/muser-engine/src/decode.rs:6295-6306]
-— and lets the batcher's unsafe row-packing (`SAFETY: a DecodeJob exists only
-while its caller is blocked inside decode`, state.rs:390-392) stay in the one
-crate where its invariants are local. The cost is that fairness is maintained
-twice, at both levels, by matching rotation keys (`next_decode_sequence`
-decode.rs:1142; `decode_rotation_key` state.rs:444) — a duplication that must
-not drift.
+**Two schedulers instead of one.** A single admission-plus-dispatch monolith is
+the design you reach for first, and it genuinely removes a level of
+indirection. Follow it one step further, though, and the two vocabularies
+collide: the engine would have to learn slots, waiters, and overload, which are
+HTTP-shaped ideas, and the server would have to learn permits and encoders,
+which are Metal-shaped ones. The split keeps `muser-engine` independently
+testable — the scheduler tests run with no server anywhere in sight
+[crates/muser-engine/src/decode.rs:6295-6306] — and it lets the batcher's
+unsafe row-packing (`SAFETY: a DecodeJob exists only while its caller is
+blocked inside decode`, state.rs:390-392) live in the one crate where its
+invariants are local facts rather than cross-crate promises. The price is paid
+in duplication, and it is the kind that rots quietly: fairness is now
+maintained twice, once at each level, by two rotation keys that have to agree
+(`next_decode_sequence` decode.rs:1142; `decode_rotation_key` state.rs:444) —
+a duplication that must not drift.
 
 **Fail-closed admission over best-effort recovery.** The unhealthy latch
 (state.rs:474-478) turns uncertain GPU state into a hard 503 wall until an

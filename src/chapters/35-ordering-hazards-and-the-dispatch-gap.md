@@ -23,20 +23,26 @@ and you read stale bytes; get it wrong in the other and you stall the GPU for
 no reason.
 
 This chapter does three things. It teaches the hazard taxonomy — RAW, WAW,
-WAR — with timelines small enough to check by eye. It inventories Muser's
-*actual* ordering tools, verified in source: one command buffer per token,
-tracked buffers by default, two barrier forms, a serial/concurrent encoder
-switch, and queue-ordered submissions instead of fences. Then it spends that
-vocabulary on the campaign's most instructive measurement: the bounded
-one-token diagnosis that reconciled a +196 dispatch-closure gap into four
-named families and rejected the largest of them for changing logprobs beyond
-contract. The recurring question of this book — what may be moved without
-breaking the exactness contract? — has never had a sharper answer than
-"not these 104 groups."
+WAR — with timelines small enough to check by eye. It walks Muser's *actual*
+ordering tools, verified in source: one command buffer per token, tracked
+buffers by default, two barrier forms, a serial/concurrent encoder switch, and
+queue-ordered submissions instead of fences. Then it spends that vocabulary on
+the campaign's most instructive measurement: the bounded one-token diagnosis
+that reconciled a +196 dispatch-closure gap into four named families and
+rejected the largest of them for changing logprobs beyond contract. That last
+part is a story about wanting something and not being allowed to have it, and
+we tell it that way, because the recurring question of this book — what may be
+moved without breaking the exactness contract? — has never had a sharper
+answer than "not these 104 groups."
 
 ---
 
 ## 35.1 What one queue buys — and what it does not
+
+Start with the question every ordering bug is an answer to: what has the
+platform already promised us, and what do we still owe it ourselves? Getting
+that boundary wrong in either direction is expensive, so it is worth drawing
+carefully before any Muser code appears.
 
 Recall the Metal execution model of [Ch 2](02-metal-compute-model.md). You
 record kernel dispatches onto a `MTLComputeCommandEncoder`, end the encoding,
@@ -66,6 +72,12 @@ what you mean is how [Ch 34](34-scheduler-and-slots.md)'s clean design
 acquires invisible state.
 
 ## 35.2 The three hazards, from zero
+
+Before the definitions, the stake. What does it cost to classify one of these
+memory relationships wrongly? Not a crash, usually. The failure is a number
+that is merely *different* — different enough to fail a bit-exactness diff
+weeks later, on someone else's machine, with nothing in the log to point at.
+That is why the taxonomy below is worth memorizing rather than looking up.
 
 A **hazard** is a pair of memory operations whose *order* changes the result.
 Three kinds can hurt you; classify every buffer relationship into exactly one
@@ -133,10 +145,13 @@ against the weight arena, zero barriers, by construction.
 
 ## 35.3 Muser's actual ordering tools
 
-The ancestor Ferrite engine solved this problem with a compiled `Vec<Op>`
-program and a frozen per-model barrier plan (§35.8). Muser has no such
-machinery — there is no `Op` enum, no compiler pass, no plan. The ordering
-model is five explicit devices, each verifiable in source.
+So what do we actually reach for when a dependency has to be stated? It is
+worth asking suspiciously, because the ancestor answered the same question
+with a great deal of machinery. The Ferrite engine solved this problem with a
+compiled `Vec<Op>` program and a frozen per-model barrier plan (§35.8). Muser
+has no such machinery — there is no `Op` enum, no compiler pass, no plan. What
+it has instead is five explicit devices, each verifiable in source, and the
+discipline to place them by hand.
 
 ### Tool 1 — one command buffer per token, one queue
 
@@ -174,17 +189,32 @@ fn shared_tracked() -> MTLResourceOptions {
 }
 ```
 
-That comment is a small incident report. An earlier revision (`b9678d4`)
-flipped the engine to untracked globally, before any explicit-dependency
-contract existed; the final greedy token IDs stayed identical, but the DFlash
-draft's *conditioning* — the hidden states it reads — changed. Something as
-distant as hazard-tracking mode perturbed numerics through scheduling
-overlaps, and that is disqualifying in an engine whose contract is
-reproducible bits. The default since is tracked. One documented exception:
-multi-gigabyte KV planes may allocate `uninitialized` — and that is an
-initialization contract, not a tracking one; debug builds *poison* the bytes
-(`0xDEAD`) so a premature read is conspicuous, and the ring metadata
-guarantees every read row was written first
+That comment is a war story compressed into a code block, and it is worth
+unpacking, because the bet it records is one we lost. The fork is a tempting
+one: tracking is not free — the driver re-derives, on every dispatch, the
+dependencies you already know — and switching it off is the standard way to
+buy that cost back. So an earlier revision (`b9678d4`) flipped the engine to
+untracked globally, before any explicit-dependency contract existed. What we
+expected was a cheaper encode with identical output, on the reasoning that
+the graph's real dependencies were already written down as barriers anyway.
+
+What we got was quieter than a crash and worse. The final greedy token IDs
+stayed identical — decode the fixture, read the text, and nothing at all looks
+wrong — but the DFlash draft's *conditioning*, the hidden states it reads,
+changed. The lesson is the one this chapter keeps circling: a knob that sits
+nowhere near the arithmetic can still perturb numerics, here through
+scheduling overlap, and in an engine whose contract is reproducible bits
+"the tokens still match" is not a passing grade. So the decision was to revert
+and stay reverted: tracked is the default, and untracked mode is not
+re-openable until every crossing dependency carries an explicit fence or
+barrier.
+
+One documented exception survives, and it is worth separating from the story
+above so it is not misread as a crack in it: multi-gigabyte KV planes may
+allocate `uninitialized` — and that is an initialization contract, not a
+tracking one; debug builds *poison* the bytes (`0xDEAD`) so a premature read
+is conspicuous, and the ring metadata guarantees every read row was written
+first
 [crates/muser-engine/src/metal/buffer.rs:246-277].
 
 ### Tool 3 — two barrier forms
@@ -249,8 +279,10 @@ SWA route, partials-before-reducer on the split routes
 
 ### Tool 4 — serial versus concurrent encoder, as a flag
 
-The prefill encoder can run either way, and the choice is an environment
-variable with the A/B history in a comment:
+Serial or concurrent — which should the prefill encoder be? The engine
+declines to answer permanently. It ships a default and keeps the loser
+reachable behind an environment variable, with the A/B history recorded in the
+comment beside it:
 
 ```rust
 // crates/muser-engine/src/decode.rs:975-979
@@ -262,8 +294,12 @@ variable with the A/B history in a comment:
 
 Default: concurrent grouping of the independent projection GEMMs (the
 `MUSER_SERIAL_PREFILL_DISPATCH` flag at `decode.rs:1331-1333` restores the
-serial encoder for exact A/B comparisons). The same select-by-graph structure
-appears in `new_prefill_graph_encoder`, which also documents the command
+serial encoder for exact A/B comparisons). The retained flag matters for the
+same reason the receipts do — a performance default you cannot switch off is a
+default nobody can re-measure, and the comment names the measurement that
+decided this one: the launch tax the serial encoder paid on the prefill
+benchmark. The same select-by-graph structure appears in
+`new_prefill_graph_encoder`, which also documents the command
 buffer's reference contract — unretained references, "This matches pinned
 llama.cpp's commandBufferWithUnretainedReferences contract"
 [crates/muser-engine/src/decode.rs:6102-6122].
@@ -286,9 +322,10 @@ That is the whole ordering model. Now spend it on the measurement.
 
 On 2026-08-15 the campaign asked: where does the one-token decode deficit
 live? The instrument was `MUSER_METAL_PHASE_PROFILE` and its `PhaseProfiler`
-— and the first finding of the investigation was that the instrument itself
-was wrong in two ways, which the note corrects before presenting any number
-[docs/decode-dispatch-gap-20260815.md].
+— and the first finding of the investigation was not about decode at all. The
+instrument itself was wrong in two ways. We went looking for the deficit and
+found the ruler bent first, which is why the note corrects the ruler before it
+presents any number [docs/decode-dispatch-gap-20260815.md].
 
 **What a "closure" is.** The profiler counts calls to the Rust `dispatch`
 closure, each submitted as its own command buffer with a synchronous wait —
@@ -298,16 +335,23 @@ encodes the graph into one shared encoder with a single wait, so
 "diagnostic wall time minus reported GPU time" mostly measures the
 diagnostic's own hundreds of submit/wait cycles. Any statement like "the gap
 is N dispatches of overhead" is therefore a category error; the honest unit
-is *profiling closures*.
+is *profiling closures*. Put plainly, the profiler measures a graph that
+production never runs, and its unit is a boundary in our own Rust code rather
+than a launch on the GPU. Every count in the next two sections is in that
+unit: read them as boundaries we can name, never as kernels the hardware
+issued.
 
-**Two label defects had shifted timings.** Production labels omitted
+**Two label defects had shifted timings.** The tell was arithmetic that could
+not be true: more labels printed than samples taken. Production labels omitted
 `lm_head` (its time silently attributed to the following `softcap` label),
 and the legacy schedule declared a separate SWA `kv_store` in all 39 SWA
 layers although the implementation at position 2,048 combines KV publication
 and attention in one closure — 603 labels printed for 564 samples, "every
-legacy per-label timing after the first extra label was shifted." The
-profiler was fixed to derive labels from post-append ring state and to abort
-on label/sample count mismatch [docs/decode-dispatch-gap-20260815.md].
+legacy per-label timing after the first extra label was shifted." The fix went
+past the two defects to the class: the profiler now derives labels from
+post-append ring state and aborts outright on a label/sample count mismatch,
+so the next such bug stops the run instead of quietly re-attributing time
+[docs/decode-dispatch-gap-20260815.md].
 
 This is the book's measurement culture in miniature, and it recurs in
 [Ch 38](38-measuring-against-llama-cpp.md): before a number can mean
@@ -315,11 +359,17 @@ anything, the instrument's own error model must be on the table.
 
 ## 35.5 The +196 reconciliation
 
-With a corrected instrument, the bounded one-token diagnostic (pinned
-16,756,681,056-byte target, 2,048-token fixture, one teacher token) counted
-**760 profiling closures** for the production graph against **564** for the
-legacy schedule — a difference of **+196** — and then reconciled the
-difference *exactly* into four families
+With a trustworthy instrument we could finally ask the counting question and
+believe the answer: how much bigger is the production graph than the legacy
+schedule, and is the difference waste? The bounded one-token diagnostic
+counted **760 profiling closures** for the production graph against **564**
+for the legacy schedule — a difference of **+196**. The fixture behind that
+count is worth stating once, because every number in this section and the next
+shares it: the pinned 16,756,681,056-byte target, a 2,048-token fixture, one
+teacher token.
+
+The interesting part is not the size of the gap. It is that the gap reconciled
+*exactly*, with no unexplained remainder, into four families
 [docs/decode-dispatch-gap-20260815.md §Corrected closure-count diff]:
 
 | Family | Δ closures | What it is | Disposition |
@@ -347,9 +397,13 @@ which exists for a reason.
 
 ## 35.6 What was landed, what was rejected
 
-The same note then ran the reduction candidates, all on the same fixture
-(pinned target, 2,048-token fixture, one teacher token, bounded phase
-diagnostic) [docs/decode-dispatch-gap-20260815.md §Landed and rejected
+Naming four families is a diagnosis, not a cure. The question we actually
+cared about is narrower and harsher: which of them can be removed without
+changing a single bit of the output? So the note ran the candidates as
+experiments rather than as a plan — each on the fixture just described (pinned
+target, 2,048-token fixture, one teacher token, bounded phase diagnostic), and
+each judged by one gate, the SHA-256 of the full logit row
+[docs/decode-dispatch-gap-20260815.md §Landed and rejected
 reductions]:
 
 | Step | Groups | GPU ms | Full-logit SHA-256 changed? | Verdict |
@@ -365,33 +419,52 @@ SHA-256 is over the full logit row — the exactness gate
 [docs/decode-dispatch-gap-20260815.md].*
 
 **The one landed change** is the +1 family: remove the last-row copy. It is
-bit-exact by construction (no arithmetic touched — one 6,656-element f32
-copy eliminated), its single-run GPU delta is **−0.136 ms (−0.34 %)**, and
-its wall sample went *up* 4.380 ms — diagnostic submit/wait noise, no wall
-claim made [docs/decode-dispatch-gap-20260815.md]. A lesson in miniature:
-the only guaranteed-free lunch was a bookkeeping copy, and it was worth a
-third of a percent.
+bit-exact by construction — no arithmetic is touched, one 6,656-element f32
+copy simply stops happening — so it never had to argue with the gate at all.
+Its single-run GPU delta is **−0.136 ms (−0.34 %)**. Its wall sample went *up*
+4.380 ms, and that number we do not believe: it is the diagnostic's own
+submit/wait noise, which is precisely why the instrument had to be
+characterized before this table could be read, and no wall claim was made
+[docs/decode-dispatch-gap-20260815.md]. A lesson in miniature: the only
+guaranteed-free lunch in the whole table was a bookkeeping copy, and it was
+worth a third of a percent.
 
-**The 104-group fusion is rejected on exactness, not on speed.** The
-available dual-norm fusion collapses the separated norm boundaries into
-655 groups — and changes the logit bytes (Table 35.2, row 3). A corrected
-fusion that replaces the four-SIMD-group `rsqrt` reduction with the pinned
-llama 32-SIMD-group reduction *twice*, preserving the intervening f32
-device-memory publication and reread, keeps the bits (row 4) — and its
-five-sample streamed serving result was 26.714 tok/s median (CV 0.079 %)
-versus llama's 33.428: "the exact reduction is useful but does not by itself
-close Stage A" [docs/decode-dispatch-gap-20260815.md]. The one-query GQA
-specialization measured 28.290 tok/s median (CV 0.193 %), ratio **0.8463×**,
-prefill 1.0366× — Stage A still 13.37 points below its 98 % decode bar at
-that moment [docs/decode-dispatch-gap-20260815.md]. (How Stage A eventually
-closed — by changing the anchor itself, J0/J1 — is
+**The 104-group fusion is rejected on exactness, not on speed.** This is the
+family we wanted most — the largest one, and the one whose removal looks like
+pure structure rather than arithmetic — so we took the swing. The available
+dual-norm fusion does collapse the separated norm boundaries into 655 groups,
+exactly as advertised. It also changes the logit bytes (Table 35.2, row 3),
+which ends the argument before performance is even discussed. The gate is not
+"faster." The gate is "identical."
+
+The second swing was the careful one. Replace the four-SIMD-group `rsqrt`
+reduction with the pinned llama 32-SIMD-group reduction *twice*, preserve the
+intervening f32 device-memory publication and reread, and the bits survive
+(row 4). We expected that to be the answer: the same structural win as before,
+merely performed correctly this time. It was not. Its five-sample streamed
+serving result was 26.714 tok/s median (CV 0.079 %) versus llama's 33.428, and
+the note's own verdict is the sentence to carry away: "the exact reduction is
+useful but does not by itself close Stage A"
+[docs/decode-dispatch-gap-20260815.md]. The one-query GQA specialization said
+the same thing from another direction, measuring 28.290 tok/s median
+(CV 0.193 %), ratio **0.8463×**, prefill 1.0366× — Stage A still 13.37 points
+below its 98 % decode bar at that moment
+[docs/decode-dispatch-gap-20260815.md]. What the two swings taught together is
+that closure count is not the currency the gap is denominated in: removing a
+boundary buys less than counting boundaries suggests it should. (How Stage A
+eventually closed — by changing the anchor itself, J0/J1 — is
 [Ch 38](38-measuring-against-llama-cpp.md)'s story; the gap families
 survived it.)
 
-**The hybrid postmortem.** The earlier, more aggressive attempt reused the
-legacy retained-activation schedule and selected fast fused boundaries. It
-preserved the greedy token and failed the public numerical contract, with
-every number worth quoting [docs/decode-dispatch-gap-20260815.md §Rejected
+**The hybrid postmortem.** Before either of those disciplined attempts there
+was a bolder one, and it is the one worth re-telling, because it failed in the
+most instructive way on offer. The idea was to take the whole prize at once:
+reuse the legacy retained-activation schedule and select the fast fused
+boundaries wherever they existed. The first look said it worked — the greedy
+token was preserved, so you could decode the fixture, print the text, and see
+nothing at all. Then we looked underneath the token, at the full distribution,
+and found that it had failed the public numerical contract. Every number in
+that postmortem is worth quoting [docs/decode-dispatch-gap-20260815.md §Rejected
 hybrid postmortem]:
 
 - full-logit maximum absolute error: **4.6300888e-4**; mean absolute error
@@ -406,9 +479,13 @@ hybrid postmortem]:
 Read that last bullet slowly, because it is this book's precision thesis in
 one measurement. A one-ULP difference in one f16 value — the seventeenth-bit
 wobble of a rounding-order change in the fused residual/norm chain — is
-invisible in the sampled token and fatal to the contract. The attempt "was
-removed rather than hidden behind a tolerance or shipped as an alternate
-route" [docs/decode-dispatch-gap-20260815.md]. Evidence retained under
+invisible in the sampled token and fatal to the contract. Put the other way
+round: the argmax that picks a token is a lossy hash of the distribution, so a
+check written against the token cannot see a change in the thing the token was
+computed from. That is why the attempt "was removed rather than hidden behind
+a tolerance or shipped as an alternate route"
+[docs/decode-dispatch-gap-20260815.md], and why we kept the run that convicted
+it — evidence retained under
 `muser-receipt://pinned-token-parity-20260814-v{3,4}/`.
 
 ## 35.7 What the gap reveals about what an engine is for
@@ -437,8 +514,14 @@ enabling asset for every measured claim Parts IV–VI made.
 
 ## 35.8 Ancestor contrast: the compiled barrier plan that was not ported
 
-The ancestor Ferrite engine ordered its decode differently, and the contrast
-is instructive enough to box.
+One question is still owed an answer, and it is the one a skeptical reader has
+been holding since the tools section: is hand-placing every barrier a choice,
+or just what happens when nobody gets around to building the tool? The
+ancestor is the control experiment, because it did build the tool. That is why
+this contrast belongs in the chapter rather than in an appendix — it decides
+how you should read every barrier you have just been shown, as deliberate
+design or as absence. The ancestor Ferrite engine ordered its decode
+differently, and the contrast is instructive enough to box.
 
 > **The Ferrite design (lineage, not Muser).** Ferrite compiled its decode
 > graph into a `Vec<Op>` program at load time — routing decisions resolved
@@ -471,6 +554,11 @@ a small, fixed, audited graph does not need a compiler — only a taxonomy,
 five tools, and the discipline to write every dependency down.
 
 ## 35.9 Tradeoffs
+
+Four choices in this chapter were live enough to have an alternative someone
+could reasonably have picked. Here they are with the evidence attached, so
+that the next person to reopen one starts from what was measured rather than
+from what seems obvious.
 
 **Tracked-by-default vs untracked-plus-plan.** Tracking costs driver-side
 dependency analysis on every dispatch; the ancestor measured −2 to −4 % for

@@ -25,6 +25,13 @@ industrial versions of exactly this construction.
 
 ## 5.1 Why fp16 alone cannot carry a 30B model
 
+Before we can argue about formats we have to know what we are carrying. Two
+questions decide everything that follows: how many weights are there, and
+how many bytes may each one cost? The first has an exact answer, and it is
+worth counting ourselves rather than trusting the nameplate on the box —
+every byte estimate in this chapter is built on that count, so an error here
+would quietly poison the whole argument.
+
 A **weight** (also called a **parameter**) is one learned coefficient of the
 model. Muse Glimmer is nominally a 30B-class model; counting the tensors the
 loader actually validates gives a precise number. The engine's config
@@ -56,7 +63,11 @@ TOTAL               :                                        27,853,389,824  ≈
 counted total is ≈ 27.85 B. Norm vectors (~1.7 M values) are lost in the
 rounding here.*
 
-Now the two walls.
+That count is the input to everything else in the chapter. Two walls stand
+between it and a working decode loop, and they fail in different ways: one
+asks whether the model *fits*, the other whether it can be *read fast
+enough*. Only the second one settles the format question, but the first is
+where most people's intuition starts, so we take it first.
 
 **The capacity wall.** [**f16**](../glossary.md#f16) — a 16-bit IEEE float, the
 "half precision" format — is the smallest widely-used *floating-point*
@@ -67,25 +78,34 @@ representation, at 2 bytes per weight:
 ```
 
 The decode host is one Mac with an M3 Ultra and **96 GB** of unified memory
-(`[docs/memory-footprint.md]` intro). Add what must live beside the weights:
-the [KV cache](../glossary.md#kv-cache) — the per-token Key/Value attention
-memory of Chapter 1's cost model; [Ch 22](22-the-price-of-context.md) owns
-it in depth — which for the release configuration (four full-context slots
-at 131,072 tokens) is 7.306 GB, the DFlash draft artifact 1,631,205,312 B,
-the
-vision projector 1,400,328,928 B, and ~0.99 GB of f32 batch-activation
-widths for prefill `[docs/memory-footprint.md]`. That sum is already ≈ 67 GB
-— and `memory-footprint.md` is explicit that *"summing artifact sizes with
-the KV formula is … only a lower bound"*: the operating system, Metal's
-pipelines and workspaces, and per-slot sampler state all live in the same
-96 GB. An fp16 model is not a plan; it is a hope.
+(`[docs/memory-footprint.md]` intro). Fifty-odd gigabytes against ninety-six
+looks like room to spare, and that is exactly the trap: the weights never
+occupy memory alone. Everything needed to serve one request has to live
+beside them — the [KV cache](../glossary.md#kv-cache), the per-token
+Key/Value attention memory of Chapter 1's cost model
+([Ch 22](22-the-price-of-context.md) owns it in depth), which for the release
+configuration (four full-context slots at 131,072 tokens) is 7.306 GB; the
+DFlash draft artifact 1,631,205,312 B; the vision projector
+1,400,328,928 B; and ~0.99 GB of f32 batch-activation widths for prefill
+`[docs/memory-footprint.md]`.
+
+That sum is already ≈ 67 GB, and it is a floor, not a total.
+`memory-footprint.md` is explicit about its own incompleteness — *"summing
+artifact sizes with the KV formula is … only a lower bound"* — because the
+operating system, Metal's pipelines and workspaces, and per-slot sampler
+state all draw on the same 96 GB and none of them appear in the addition.
+An fp16 model is not a plan; it is a hope.
 
 **The bandwidth wall — the one that settles it.** Chapter 1 established that
 decode is ~99% reading weights: every token's forward pass streams the whole
-model through the GPU. Quantization is how Muser attacks that stream. The
-pinned kquant artifact is **16,756,681,056 bytes**
-(`[docs/memory-footprint.md]` artifact manifest; the same constant is
-asserted in code at `[crates/muser-engine/src/lib.rs:14]`). Per weight, that
+model through the GPU. There is no cache trick and no clever ordering that
+lets a decode step skip a weight: if it is in the model, it goes across the
+bus, once per token. Quantization is how Muser attacks that stream.
+
+The pinned kquant artifact is **16,756,681,056 bytes**. We hold that figure
+twice over — it is the size recorded in the artifact manifest
+`[docs/memory-footprint.md]`, and the identical constant is pinned in the
+engine crate itself `[crates/muser-engine/src/lib.rs:14]`. Per weight, that
 is:
 
 ```
@@ -106,7 +126,8 @@ else in Part II is the engineering of "small and controlled."
 
 ## 5.2 Numbers as bits: f32 and f16
 
-To shrink a number we must first say what a number *is* in memory. An IEEE
+Fewer bits per weight, then. But which bits, and taken from where? To shrink
+a number we must first say what a number *is* in memory. An IEEE
 754 float is a sign, an exponent, and a mantissa (fraction):
 
 ```
@@ -132,6 +153,13 @@ values** — a [**codebook**](../glossary.md#codebook). Four bits select among
 — half a byte, values 0–15 — and two nibbles pack into one byte, which is
 where the storage win comes from: 0.5 bytes per weight.
 
+Said the other way round: we stop recording *what the weight is* and start
+recording *which of a short agreed list of values it sits nearest to*. The
+list itself never goes over the bus, because sender and reader already know
+it. That substitution — value for index, memory for agreement — is the whole
+of quantization; everything after it is bookkeeping about how the list is
+chosen.
+
 Two families of codebook exist, and Part II contains one of each:
 
 - **Integer (uniform) codebooks.** The 16 values are evenly spaced: a
@@ -153,15 +181,26 @@ without spending bytes.
 
 ## 5.4 One scale for everything: too crude
 
-The first scheme everyone writes down: one global step size for the whole
-tensor, chosen from the largest magnitude weight. Say a tensor's weights
+The first scheme everyone writes down is the one that needs no bookkeeping
+at all: one global step size for the whole tensor, chosen from the largest
+magnitude weight, shared by every weight in every row. Take it seriously for
+a moment, because on paper it looks unimprovable — a single stored number of
+overhead for hundreds of millions of weights, which rounds to no overhead at
+all.
+
+So follow it through and see where it lands. Say a tensor's weights
 span roughly ±0.5, so a symmetric 4-bit grid with 16 levels would use a step
 of 1.0/15 ≈ 0.067. Any weight is then replaced by the nearest multiple of
-0.067. But real weight *blocks* are much narrower than the global span — a
+0.067. The arithmetic is sound; the assumption buried underneath it is not.
+Real weight *blocks* are much narrower than the global span — a
 few dozen neighboring weights typically cluster inside a band a tenth as
 wide. A global grid spends most of its 16 levels on values that never occur
-in that neighborhood, and the local error is needlessly large. This is the
-same failure mode we will demonstrate concretely in §5.7 (the DC-offset
+in that neighborhood, and the local error is needlessly large.
+
+That is the lesson worth carrying out of the dead end: a codebook is worth
+only as much as its agreement with the values it is actually asked to
+encode. What you save on the header, you pay back with interest in error.
+We will watch the same failure play out concretely in §5.7 (the DC-offset
 problem), and it is why no format in this book uses a single global scale.
 
 The fix is to **quantize locally, not globally**.
@@ -184,12 +223,22 @@ A block of 32 weights might span only ±0.05, so its private scale is ~0.1/15
 distribution; that is the entire trick, and it is the idea behind every
 "K-family" format in Chapter 6.
 
+Turn it around once more, because this is the sentence the rest of Part II
+leans on: the narrower the range a scale has to cover, the more of your
+sixteen levels land where the data actually is. Bits do not become more
+precise by being more numerous. They become more precise by being asked a
+narrower question.
+
 The scale itself is stored in floating point (typically f16, 2 bytes),
 because it must cover a wide range of magnitudes across blocks with only a
 few values of precision — the same division of labor as Figure 5.3, now
 between the *scale* (coarse, wide-range) and the *index* (fine, local).
 
 ## 5.6 Symmetric vs asymmetric: the min+offset trick
+
+One stored number per block, or two? The choice looks like arithmetic and is
+really a question about what you are willing to assume about the data before
+you have looked at it.
 
 **[Symmetric](../glossary.md#symmetric-quantization)** quantization assumes the
 block's values are roughly centered on zero. One number per block — the
@@ -221,17 +270,27 @@ far from zero. A block whose values all lie in, say, [0.30, 0.42] forces a
 symmetric grid to cover ±0.42, and every negative level is wasted: only
 about half the grid is ever addressed. The asymmetric grid puts `min = 0.30`
 at index 0 and uses all 16 levels inside the 0.12-wide band — a resolution
-roughly 3.5× finer for the same 4 bits. (Whether *weight* blocks in a given
-checkpoint carry enough offset to matter is an empirical property of the
-checkpoint [unverified for Muse Glimmer]; the format designers clearly
-thought it worth the bytes, since the release artifact pays for asymmetric
-blocks on most tensors — Chapter 6.)
+roughly 3.5× finer for the same 4 bits.
+
+There is an honest gap in that argument, and it matters for what we are
+allowed to claim later. Whether *weight* blocks in a given checkpoint
+actually carry enough offset to make the trick pay is an empirical property
+of the checkpoint, and it is not one we measured for this one
+[unverified for Muse Glimmer]. What we can say is that the format designers
+thought it worth the bytes: the release artifact pays for asymmetric blocks
+on most tensors, which is Chapter 6's byte-level story.
 
 ## 5.7 The worked example: an 8-element block, 4 bits, every step
 
-This is the heart of the chapter — the template every later quant chapter
-reuses. We quantize one block by hand. **The numbers below are schematic**,
-chosen so the arithmetic is clean; they are not taken from any checkpoint.
+Everything so far has been argument. Now we do the thing itself, slowly,
+with nothing hidden — because a reader who has packed one block by hand can
+read any format in this book, and a reader who has not will be taking the
+byte layouts ahead on faith. This is the heart of the chapter — the
+template every later quant chapter reuses. We quantize one block by hand.
+**The numbers below are schematic**, chosen so the arithmetic is clean; they
+are not taken from any checkpoint. Watch two things as they go past: where
+the error ends up landing, which is not where most people guess, and how
+few bytes the block costs when we are done.
 
 **The block.** Eight weights:
 
@@ -316,15 +375,24 @@ Three observations that generalize far beyond this toy:
    the grid. Real weights don't sit on grids; real mean error lands near
    `scale/4`. The toy flatters us — keep that in mind when extrapolating.
 
-**Step 7 — the symmetric control.** Quantize the same block symmetrically:
-scale = amax/7, reading the 4 bits as signed indices −7…+7,
+**Step 7 — the symmetric control.** A worked example that only ever runs one
+way proves nothing, so before accepting the asymmetric header we send the
+same block through the other geometry and compare. Quantize it
+symmetrically: scale = amax/7, reading the 4 bits as signed indices −7…+7,
 amax = 0.29, so scale = 0.29/7 ≈ 0.0414 — *coarser than 0.03* even before
 accounting for the wasted negative levels this almost-centered block barely
-uses. The offset here is mild (min = −0.15, max = 0.29); for a strongly
-one-signed block the symmetric penalty is the full factor-of-two of
+uses. The extra stored number has already earned its keep — and it earned it
+on a block that was nearly centered to begin with, which is the weakest case
+we could have handed it. The offset here is mild (min = −0.15, max = 0.29); for a
+strongly one-signed block the symmetric penalty is the full factor-of-two of
 Figure 5.4.
 
 ## 5.8 What the error costs downstream
+
+A hundredth here and a hundredth there — does any of it survive contact with
+the model, or does it wash out? The question matters because the answer
+decides how nervous to be, and the honest answer is: it does not wash out,
+but it also does not behave like noise.
 
 A weight's quantization error is not an isolated blemish — it is a
 *deterministic* perturbation of the model. Each [dot
@@ -340,19 +408,29 @@ Chapter 12 makes for normalization). Three honest statements about the cost:
   Muser's kquant lane reproduces llama.cpp's numbers *bit-for-bit on the
   shared format* precisely because the bytes and the arithmetic order are
   pinned `[crates/muser-engine/src/quant/k_block.rs:169-177]`.
-- **Quality loss is real but bounded by measurements, not vibes.** Muser
-  measures it with gates: NVFP4-versus-kquant relative perplexity and
-  top-token disagreement are budgeted per depth and content class, and one
-  published content-local sensitivity (docs text at 65,536 tokens: 15.134%
-  vs a 13.339% calibrated gate) is carried *as part of the claim*
+- **Quality loss is real, but it is bounded by measurements rather than by
+  vibes.** Muser does not assert that quantization is harmless; it budgets
+  the harm and then checks the budget. NVFP4-versus-kquant relative
+  perplexity and top-token disagreement are gated per depth and per content
+  class, and where one content class came in above its calibrated gate, the
+  number was published rather than buried: docs text at 65,536 tokens,
+  15.134% against a 13.339% calibrated gate, carried *as part of the claim*
   `[claims #10]`. Chapter 7 tells that story.
 - **You cannot compare formats by one number.** The same 4-bit-class
-  quantization is invisible in plain decode (parity-within-noise,
-  §5.9) and decisive in batched speculative verification (6.81 tok/s
-  no-go, Chapter 7). The cost of precision hides in batch shapes and
-  content classes, and the gates exist to localize it.
+  quantization is invisible in plain decode — the lanes land inside each
+  other's noise, as §5.9 will show — and decisive the moment the shape of
+  the work changes: in batched speculative verification the same bytes
+  produce a 6.81 tok/s no-go, the story Chapter 7 tells. Precision, in
+  other words, does not have a price. It has a price *per batch shape and
+  per content class*, which is why the gates are written to localize the
+  cost instead of returning a single verdict.
 
 ## 5.9 Block size: the memory-vs-overhead dial
+
+How big should a block be? It sounds like a tuning knob and is really a
+fork in the road, because the two ends of the dial fail for opposite
+reasons — and the formats waiting in the next two chapters are best read as
+two different answers to this one question.
 
 The block header (min + scale, say 4 bytes as two f16s) is paid once per
 block. The **[bitrate](../glossary.md#bitrate)** — bits per weight — is:
@@ -407,31 +485,45 @@ between storage, error, and kernel complexity — not just a storage number.
 
 ## 5.10 Tradeoffs
 
-**Asymmetric vs symmetric, measured in bytes.** The min+offset trick costs
-one extra stored number per block. At N = 32 with f16 headers that is
+**Asymmetric vs symmetric, measured in bytes.** What does honesty about
+offsets actually cost, in the only currency decode cares about? The
+min+offset trick costs one extra stored number per block. At N = 32 with f16
+headers that is
 4 + 64/32 = 6 bits/weight symmetric vs 4 + 96/32 = 7 bits/weight
 asymmetric — a 17% storage tax for offset robustness. Q4_K's two-level
 hierarchy is precisely the invention that recovers the tax: min+offset at
 4.5 bits/weight, the same bitrate a plain symmetric 32-block would waste
 (`4 + 16/32 = 4.5`). Chapter 6 walks the real bytes.
 
-**4 bits vs 16, measured in tokens.** The lane throughputs: kquant
-(≈4.81 bits/weight average) 35.440 tok/s and native NVFP4 (4.5 bits/weight)
-35.491 tok/s, in the same paired five-rep cell — **parity within noise,
-never claimed faster** `[claims #11]` (full cell: 66-token prefix, 32
-teacher-forced tokens, F16 KV, adjacent lease window, +0.1444% for NVFP4).
-The measured existence of two independent ~4.5-bit artifacts running at
-parity with the f16-KV llama.cpp comparator is the strongest statement this
-book can make that quantization, done at this rate, does not tax decode
-throughput. What 4 bits *does* tax — the batched speculative verify path —
-is a Chapter 7 measurement.
+**4 bits vs 16, measured in tokens.** Does the shrinking actually buy
+tokens, or does the decode side hand the savings straight back as unpacking
+work? The lane throughputs answer it: kquant (≈4.81 bits/weight average)
+35.440 tok/s and native NVFP4 (4.5 bits/weight) 35.491 tok/s, measured in
+the same paired five-rep cell — **parity within noise, never claimed
+faster** `[claims #11]`. The measured existence of two independent ~4.5-bit
+artifacts running at parity with the f16-KV llama.cpp comparator is the
+strongest statement this book can make that quantization, done at this rate,
+does not tax decode throughput.
 
-**Why not 2 bits?** Nothing in this chapter's arithmetic forbids it — 2-bit
-codebooks exist in the wild. But at 4 levels per block the quantization
-error approaches the size of the local scale itself, and §5.8's
-error-compounding has nowhere to hide. Muser's own gates localized quality
-cost at 4-bit-class formats to specific content classes `[claims #10]`;
-no 2-bit lane was ever qualified in this program [unverified — no
+The scope of that cell matters as much as the figures do, so we carry it
+rather than round it away: a 66-token prefix, 32 teacher-forced tokens, F16
+KV, an adjacent lease window, and a +0.1444% edge for NVFP4 — a margin no
+one should read as a win, and the reason the claim says *parity* and stops
+there. What 4 bits *does* tax — the batched speculative verify path — is a
+Chapter 7 measurement.
+
+**Why not 2 bits?** The dial in the previous section has a lower end too,
+and after a chapter spent shrinking things the fair question is why we
+stopped where we stopped. Nothing in this chapter's arithmetic forbids going
+further — 2-bit codebooks exist in the wild. But at 4 levels per block the
+quantization error approaches the size of the local scale itself, and §5.8's
+error-compounding has nowhere to hide: the error stops being a correction to
+the weight and starts being most of the weight. Muser's own gates localized
+quality cost at 4-bit-class formats to specific content classes
+`[claims #10]`, and even that took a calibrated per-content gate to see at
+all. So the ending here is an admission rather than a verdict: we do not
+know what the next step down would have cost on this model, because no
+2-bit lane was ever qualified in this program [unverified — no
 measurement exists in the retained evidence].
 
 ## 5.11 What comes next

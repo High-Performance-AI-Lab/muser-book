@@ -32,13 +32,22 @@ Muser implements both, plus a third consumer of the same distribution:
 **exact speculative acceptance** — the CPU-side step that decides how many
 DFlash draft tokens to keep ([Ch 8](08-the-dflash-draft.md),
 [Ch 33](33-speculation-and-the-distributed-verdict.md)). All three need
-different amounts of the logits vector, and that fact explains this
-chapter's architecture: the *reduction* (argmax) can run on the GPU in two
+different amounts of the logits vector, and that is the question this
+chapter is really about. Finding a maximum is the easy part; the hardware
+does that in its sleep. The hard part is deciding how much of the
+distribution has to be standing in front of the policy at the moment it
+chooses — because that, and not the reduction, is what sets the traffic
+between GPU and CPU. Hence the architecture: the *reduction* (argmax) can
+run on the GPU in two
 phases and cost a 4-byte read-back, but the *policy* layers need the whole
 distribution on the CPU — so the serving path reads the full vocab row
 back every token, and the GPU argmax lives on the no-readback routes.
 
 ## 21.2 Why greedy is the reference — determinism is the gate
+
+Everything that follows turns on a question that is easy to walk straight
+past: which policy is allowed to be the *reference* — the one the product
+ships, or the one a test can check?
 
 The book's measured spine is exact-token parity against pinned llama.cpp
 ([Ch 38](38-measuring-against-llama-cpp.md)): five-repetition cells whose
@@ -54,15 +63,22 @@ contract, not just a bench convenience.
 
 ## 21.3 The reduction problem — two phases under the 1,024-thread limit
 
+Where does the difficulty in picking a maximum actually live? Not in the
+comparison — that is one instruction. It lives in the geometry of who is
+allowed to talk to whom.
+
 Argmax is a reduction: collapse 202,048 floats to one (value, index) pair.
 The natural GPU pattern is the **tree reduction** — at each step half the
 threads fold in their neighbor, the active stride halves, `log₂(n)` steps
-finish. The catch is geometry: a tree lives in
+finish. The catch is exactly that geometry: a tree lives in
 [threadgroup memory](../glossary.md#threadgroup) and Apple Silicon caps a
 threadgroup at 1,024 threads (`maxThreadsPerThreadgroup`,
 [Metal-PG]). The vocab is ~197× that. So: split the input into chunks,
 reduce each chunk independently, then reduce the partials — the
-**two-phase reduction** (Figure 21.1).
+**two-phase reduction** (Figure 21.1). Put the other way round: the
+hardware will not let you hold one conversation among two hundred thousand
+threads, so you hold a small conversation per chunk and then one more among
+the chunk winners.
 
 ```
    logits [202048]                                                one token id
@@ -85,9 +101,19 @@ chunk holds `202,048 − 201,728 = 320` elements (the ragged tail the
 The comparison is **strictly greater**, so ties keep the lower index —
 "matching the scalar first-maximum convention" of the reference sampler
 (`argmax_f32.metal:4-6`) and of the CPU helper (`api.rs:1842-1849`). That
-deterministic tiebreak is load-bearing for byte-identical diffs.
+deterministic tiebreak is load-bearing for byte-identical diffs. It is worth
+sitting with why: if two logits landed exactly equal and the tiebreak
+wobbled between them — a different chunk winning on a different run — a
+parity cell would fail for a reason that has nothing to do with arithmetic,
+and the failure would be intermittent, which is the worst kind to chase.
+The strict `>` is what makes ties boring.
 
 ## 21.4 The Metal kernels — the two-phase tree, and the greedy variant
+
+Two things are worth watching for as you read the kernel below, because
+they are the questions a tree reduction always has to answer. What does a
+thread do when there is no element for it to load? And why does a barrier
+appear *inside* the loop rather than once before it?
 
 Phase 1, verbatim — one threadgroup of 1,024 threads per chunk:
 
@@ -140,7 +166,11 @@ single `u32`, the token id. The file's own header notes the lineage:
 (`argmax_f32.metal:4-5`) — the ancestor's device [ferrite-book Ch 20],
 ported with Muse's vocab arithmetic.
 
-The **greedy serving variant** adds two fail-closed features, and its
+That is the reduction as a textbook would leave it. Serving asks two more
+questions of it. What should a maximum-finder do when one of the numbers it
+is comparing is not a number at all? And how do you honour a request that
+says "never stop" without lying to everyone else about what the model
+actually scored? The **greedy serving variant** answers both, and its
 header comment is the specification:
 
 ```metal
@@ -167,6 +197,13 @@ That is the ignore-eos feature done without corrupting the distribution
 other consumers see.
 
 ## 21.5 The Rust dispatch
+
+A two-kernel reduction has a hazard the one-kernel version does not: the
+second kernel reads a buffer the first one wrote, and nothing in Metal
+volunteers to order that for you. Getting it wrong does not crash — it
+silently reads stale partials, which is how you end up debugging a sampler
+that is occasionally, unreproducibly wrong. So the ordering is stated by
+hand.
 
 Two wrappers record the pairs. `encode_greedy_argmax_f32` (the serving
 variant) — phase 1 over `⌈202,048/1,024⌉ = 198` threadgroups, an explicit
@@ -195,8 +232,18 @@ inter-phase barrier; phase 2 grid `(1, 1, 1)` × `(1024, 1, 1)`.**
 
 ## 21.6 Reading the result back — two routes, two sizes
 
-Here is the point where Muser's design departs from the ancestor's
-"4 bytes and done" story, and the departure is the chapter's core lesson.
+Everything so far argues for a tiny read-back, and a tiny read-back is
+exactly what we expected to ship. The ancestor had already settled the
+question: the GPU already found the maximum, so copy the maximum and
+nothing else — "4 bytes and done". We carried that expectation into the
+serving path, and it did not survive there: every consumer serving cares
+about turned out to want the numbers the argmax throws away.
+
+This is the point where Muser's design departs from the ancestor's story,
+and the departure is the chapter's core lesson: the size of the read-back
+is not decided by the reduction. It is decided by the policy standing
+behind it. Muser therefore has two routes, and which one a request takes
+is a statement about what that request intends to do with the numbers.
 
 **Route A — serving: the full distribution comes back.** `Session::decode`
 holds a retained, vocab-sized CPU buffer and refills it every token:
@@ -220,15 +267,22 @@ pub fn decode(&mut self, input: DecodeInput) -> Result<DecodeResult, EngineError
 }
 ```
 
-The GPU→CPU hand-off itself is one line at the end of the batch graph —
+The GPU→CPU hand-off itself is one line at the end of the batch graph:
 `batch_logits.as_slice()[..token_count * self.cfg.vocab_size].to_vec()`
-(`decode.rs:3659`) — a `StorageModeShared` zero-copy view followed by a
-copy of **202,048 f32 = 808,192 B ≈ 789 KiB per token**
+(`decode.rs:3659`). Read it in two halves. The `as_slice()` is a
+`StorageModeShared` zero-copy view — the CPU is looking straight at the
+buffer the GPU wrote, and nothing has moved yet
 ([Ch 3](03-unified-memory-and-buffers.md): unified memory makes this a
-memcpy, not a device transfer). Then `argmax(&logits)` — the CPU's
-five-line first-maximum scan (`api.rs:1842-1849`) — picks the greedy
-token, and `ensure_finite_logits` fails closed on any nonfinite entry
-(`api.rs:1851-1856`).
+memcpy, not a device transfer). The `to_vec()` is the half that costs:
+**202,048 f32 = 808,192 B ≈ 789 KiB per token**, copied so the caller owns
+a row that will not change under it.
+
+What happens to that row next is deliberately dull. The CPU's own
+five-line first-maximum scan picks the greedy token, and
+`ensure_finite_logits` refuses the row outright if any entry is nonfinite —
+the same fail-closed instinct as the kernel's high-bit latch, arriving by a
+different road. Both helpers sit a few lines apart in the same file
+(`api.rs:1842-1849` and `api.rs:1851-1856`).
 
 Why pay 789 KiB when 4 bytes would answer the greedy question? Because
 serving's consumers need the *distribution*, not the winner: the sampled
@@ -238,6 +292,13 @@ and above all **exact speculative acceptance** (§21.9), whose contract is
 "acceptance against full target distributions"
 (`verify_full_speculative_mt_ordered`, `sampling.rs:1033`). The one
 vocabulary-sized copy is the price of every downstream policy being exact.
+
+Said the other way round, because this is the sentence the rest of the
+chapter hangs on: the read-back is not sized by what the winner costs to
+report, it is sized by what the hungriest consumer on the route needs to
+see. Greedy alone would be cheap. Greedy plus a grammar plus a speculator
+is not, and you do not get to find out which one you are until the request
+arrives.
 
 **Route B — the GPU-resident greedy chain: 4 bytes per token.** When (and
 only when) the policy is pure greedy, Muser keeps the whole loop on the
@@ -269,25 +330,38 @@ where the policy permits it.
 
 ## 21.7 The sampler — pinned RNG, per-request state
 
-The sampled path's first commitment is the random number generator: a
-bit-for-bit reimplementation of libc++'s `std::mt19937` — "the
-`std::mt19937` engine used by the source-pinned llama.cpp sampler",
-kept in-tree "rather than using `StdRng`, whose algorithm is deliberately
-unspecified … makes seeded API results stable across Rust and `rand`
-releases" (`sampling.rs:53-56`), with libc++'s exact `uniform_f32`/`f64`
-conversions (`:107-120`) and snapshot/restore for durable sessions
-(`:88-105`). The engine test pins known vectors
-(`mt19937_matches_libcxx_engine_and_uniform_distributions`,
-`:1105-1133`).
+What breaks if the random number generator is wrong? Nothing you can see
+in a single response — and everything you can see in a diff. Two engines
+given the same seed and the same prompt have to walk the same sequence of
+draws, or the cross-engine determinism contract from the top of this
+chapter is a slogan.
 
-The distribution chain is a scalar, ordered pipeline —
-`distribution_ordered` (`sampling.rs:399`) — applying, in source order:
-`top_n_sigma` masking against the max (llama's newer filter), `top_k`
-truncation, `typical_p`, `top_p` nucleus cutoff, each over the full
-candidate list with llama-matching tie and ordering conventions (the
-source comments mark each: "Upstream masks in place and intentionally
-leaves candidate order untouched", `:432-434`; "Locally-typical order is
-part of the source contract", `:477-479`).
+So the sampled path's first commitment is not a sampler at all; it is an
+engine. Muser carries a bit-for-bit reimplementation of libc++'s
+`std::mt19937` — "the `std::mt19937` engine used by the source-pinned
+llama.cpp sampler". It is kept in-tree deliberately, "rather than using
+`StdRng`, whose algorithm is deliberately unspecified … makes seeded API
+results stable across Rust and `rand` releases". The same commitment runs
+downward: libc++'s exact `uniform_f32`/`f64` conversions rather than
+Rust's, and snapshot/restore of the engine state, so a durable session
+reopened later resumes mid-stream instead of quietly reseeding. The
+evidence trail is short and worth keeping in one place — the engine and
+its rationale at `sampling.rs:53-56`, the conversions at `:107-120`,
+snapshot and restore at `:88-105`, and the test that pins known vectors
+against libc++ at `mt19937_matches_libcxx_engine_and_uniform_distributions`
+(`:1105-1133`).
+
+On top of the engine sits the distribution chain: a scalar, ordered
+pipeline, `distribution_ordered` (`sampling.rs:399`). The order is not
+ours to choose. It applies, in source order, `top_n_sigma` masking against
+the max (llama's newer filter), `top_k` truncation, `typical_p`, then the
+`top_p` nucleus cutoff, each over the full candidate list. What makes it
+delicate is that the tie and ordering conventions must match upstream even
+where upstream looks careless — and the source comments say so out loud:
+"Upstream masks in place and intentionally leaves candidate order
+untouched" (`:432-434`), "Locally-typical order is part of the source
+contract" (`:477-479`). Those two comments are the difference between a
+filter that *agrees* with llama.cpp and one that merely resembles it.
 
 The state lives per request in the server, as four separated RNG streams
 plus sampler scalars — snapshottable for session persistence:
@@ -311,6 +385,10 @@ half of that story, and its snapshot/restore is what lets a migrated
 session resume its exact draw sequence.
 
 ## 21.8 Grammar-constrained sampling — GBNF on the CPU
+
+Now the awkward case. A request demands JSON, and the sampler — which
+knows nothing about JSON — draws a token that would break it. What should
+happen to that draw?
 
 Structured-output requests constrain the token stream to a grammar — JSON
 schemas, quoted literals. The engine surface is a pinned llama-style
@@ -354,7 +432,14 @@ CPU: the mask-and-rerun needs the whole candidate vector.
 
 ## 21.9 Exact speculative acceptance — the CPU contract
 
-The third consumer closes the loop with [Ch 8](08-the-dflash-draft.md)'s
+The third consumer is the hungriest, and the one with the most to lose.
+Speculation is supposed to be free: a small model guesses ahead, the big
+model checks the guesses, and the output is *the same text you would have
+got anyway*, only sooner. Get the check subtly wrong and it stops being a
+speed-up and becomes a quality change nobody asked for and nobody can see
+in a benchmark.
+
+That closes the loop with [Ch 8](08-the-dflash-draft.md)'s
 draft model. When DFlash proposes tokens, acceptance is computed on the
 CPU against the full target distribution — the function the campaign
 calls the exactness anchor for speculation:
@@ -414,6 +499,12 @@ distribution. On the first rejection, the residual
 `max(p − q, 0)` is renormalized and the replacement token is drawn from it
 through the same pinned Mt19937 stream (`uniform_real_distribution<float>`
 per attempt, the libc++ double draw for selection — `sampling.rs:1001-1007`).
+
+In plainer words: the draft model is allowed to be wrong as often as it
+likes, and the residual step is what makes that harmless. It is not
+allowed to change what the target model would have said. The accept rule
+and the residual draw are two halves of one guarantee, and dropping either
+half turns speculation from a lossless optimization into an approximation.
 "Exact" is not a hope here; the qualifier compares every full target-logit
 row in its gates (256 greedy tokens plus all rows,
 [crates/muser-bench/src/remote.rs:8-10]). The engine-level driver
@@ -425,11 +516,17 @@ measured fate of moving this acceptance off the Mac.
 ## 21.10 Tradeoffs
 
 **Full-distribution read-back vs GPU-only selection.** Route A costs
-~789 KiB of unified-memory copy per token — arithmetic against the token's
-weight read (~16.76 GB at the artifact scale, [Ch 1](01-why-inference-is-a-memory-problem.md))
-puts it near 0.005 %, though it is a *serial* addition on the critical
-path, not a bandwidth event; no retained measurement isolates its wall
-cost **[unverified]**. What it buys is exactness for three consumers at
+~789 KiB of unified-memory copy per token. Set that beside the traffic the
+same token already generates — a weight read of ~16.76 GB at the artifact
+scale ([Ch 1](01-why-inference-is-a-memory-problem.md)) — and the copy
+lands near 0.005 % of it, which sounds like the end of the argument. It is
+not, and this is the part that trips people up. The copy is not a
+bandwidth event competing with the weights; it is a *serial* addition on
+the critical path, and cheap bytes on a critical path are still time
+somebody waits for. How much time, we cannot say: no retained measurement
+isolates its wall cost **[unverified]**.
+
+What the copy buys is exactness for three consumers at
 once: the sampler chain, grammar re-rolls, and speculative acceptance
 against full target distributions. Route B (4 bytes/token) exists precisely
 for the policy that needs none of them — pure greedy — and is the
@@ -454,16 +551,34 @@ sample. Muser pins the rejection form for the same reason it pins
 mt19937: cross-engine reproducibility is the product feature.
 
 **CPU acceptance vs GPU acceptance for speculation.** The acceptance rule
-itself is trivially parallelizable, but its inputs are two full
-vocab-sized distributions per draft token and its outputs feed the pinned
-RNG; keeping it on the CPU next to the sampler keeps one authoritative
-draw stream. The distributed lane that moved verification *off the Mac*
-was measured and rejected on throughput, not on exactness — the
-verifier-only ceilings of 20.15/40.04/55.96 tok/s against the 107.9 tok/s
-kquant bar [nvfp4-distributed-speculative-frontier-20260818; [Ch 33](33-speculation-and-the-distributed-verdict.md)]
-— and the native W4A4 variant collapsed to 6.805 tok/s with verification
-consuming 35.915 s of a 37.619 s span [nvfp4-fast-lane-evidence; ledger
-F-series]. Exactness was never the casualty; time was.
+is trivially parallelizable, and for a while that looked like an
+invitation. Verification is the expensive half of speculation; the Mac is
+the busy machine; there was other hardware sitting on the network. Why not
+move the verifier off the Mac and let the Mac get on with decoding?
+
+We built that lane and measured it, expecting the Mac's returned time to
+pay for the wire. It did not come close. Take the wire and the draft model
+out of the accounting entirely and ask only how fast the remote verifier
+could go on its own: the verifier-only ceilings came in at
+20.15/40.04/55.96 tok/s against the 107.9 tok/s kquant bar — the *best
+imaginable* case for the lane was already far under the number it had to
+beat, so no amount of tuning downstream could rescue it. That run is
+retained [nvfp4-distributed-speculative-frontier-20260818;
+[Ch 33](33-speculation-and-the-distributed-verdict.md)].
+The native W4A4 variant went further in the wrong direction: 6.805 tok/s,
+with verification alone consuming 35.915 s of a 37.619 s span
+[nvfp4-fast-lane-evidence; ledger F-series]. At that point the verifier
+was not a step inside the decode loop; it *was* the loop.
+
+What the failure taught is the sentence to take away from the whole
+section: exactness was never the casualty, time was. Nothing about moving
+acceptance would have made it less exact — the rule is the rule wherever
+it runs. What moving it does change is everything around it: the rule's
+inputs are two full vocab-sized distributions per draft token, and its
+outputs feed the pinned RNG. So keeping acceptance on the CPU beside the
+sampler is not a purity argument. It is the arrangement that leaves one
+authoritative draw stream, and no network between the two halves of a
+decision that has to be made for every token.
 
 ## 21.11 Where the gap lives
 

@@ -14,8 +14,13 @@
 
 Chapter 14 ended with Q rotated (on the sliding layers), K likewise, V
 untouched — and the current token's K and V waiting to be written into the
-store attention will read. This chapter is that write. To produce a token,
-attention must score the current query against the
+store attention will read. This chapter is that write.
+
+Before any code, the question this chapter answers: where does a long
+session's memory actually live, and what does keeping it cost? The answer
+starts one step earlier, with why a store has to exist at all.
+
+To produce a token, attention must score the current query against the
 **Key** of every visible past token and take a weighted sum of their
 **Values** ([Ch 16](16-attention-decode-kernels.md) does the math from
 zero). The Key and Value of past token `i` depend only on token `i` — they
@@ -43,7 +48,11 @@ One model, two memory regimes, decided by `layer % 4 == 3`
 
 ## 15.2 The planes in code — `MetalKvPlane`
 
-The per-layer cache object is seven fields:
+Start with the object, because everything the ring does later is
+bookkeeping held in its fields — and it is worth knowing up front what a
+wrong field costs. A plane that loses track of which row is its oldest
+does not crash; it hands attention some other token's key and keeps
+going. The per-layer cache object is seven fields:
 
 ```rust
 // crates/muser-engine/src/decode.rs:182
@@ -65,14 +74,20 @@ struct MetalKvPlane {
   `len` are currently live.
 - **`origin_logical` / `origin_physical`** — the ring's explicit
   bookkeeping: which *logical* token position sits at the front of the
-  live window, and which *physical* slot it occupies. These two numbers
-  are the whole difference between Muser's ring and the naive
-  "position mod capacity" addressing — and the extraction manifest records
-  that the naive form was a named out-of-bounds hazard in the ancestor
-  ("Ferrite indexed by absolute position; the ring modulus was
-  unwired/stubbed" — the SWA ring-address translation is Muser-owned,
-  `docs/extraction-manifest.md`).
+  live window, and which *physical* slot it occupies. Said the other way
+  round, the plane never asks "where does token *n* belong?"; it asks
+  "how far has my window slid since I last knew where its front was?"
 - **`head_major`** — which of the two layouts this plane uses (§15.3).
+
+Those two origin fields are the whole difference between this ring and
+the obvious alternative, addressing straight by "position mod capacity",
+and we did not choose the long way round for elegance. The ancestor
+engine took the obvious route and it bit: the extraction manifest records
+the naive form as a named out-of-bounds hazard — "Ferrite indexed by
+absolute position; the ring modulus was unwired/stubbed" — which is why
+the SWA ring-address translation is Muser-owned rather than inherited
+(`docs/extraction-manifest.md`). Carrying the origins explicitly costs
+two integers per plane and deletes that whole class of bug.
 
 Allocation is per layer kind, and it is where the two regimes become
 concrete:
@@ -97,14 +112,28 @@ for layer in 0..cfg.n_layers {
 ```
 
 A sliding layer gets `min(max_context, 2,048)` rows, **token-major**; a
-NoPE layer gets `max_context` rows, **head-major**. (The zero-fill comment
-is not cosmetic: an earlier doc's claim that Metal KV buffers were
-allocated without a CPU memset is *wrong for live planes* — they zero-fill
-by design, and only detached remote-install generations use uninitialized
-storage; cite the corrected fact, not the stale line
-`[docs/kvpack-merge-handoff §3 D2, per the 2026-08-20 audit]`.)
+NoPE layer gets `max_context` rows, **head-major**.
+
+The zero-fill comment sitting in that loop is worth a detour, because the
+reason it matters for anyone reading Muser's docs beside this book is
+that we had the fact backwards in writing before we had it right. An
+engineering doc stated that Metal KV buffers were allocated without a CPU
+memset. It is a plausible claim — a buffer that is about to be overwritten
+row by row looks like a pure waste of a memset — and it stood long enough
+to be quoted. The audit that went checking found the opposite for live
+planes: they zero-fill on purpose, so that a wrapped SWA row can never
+expose uninitialized storage while a sequence boundary is in flight. Only
+detached remote-install generations take the uninitialized path. The
+correction is retained, and it is the corrected fact that should be cited,
+never the stale line:
+`[docs/kvpack-merge-handoff §3 D2, per the 2026-08-20 audit]`.
 
 ## 15.3 The two layouts
+
+Why should one model carry two layouts at all? Because a layout is never
+chosen for the writer's convenience. It is chosen for whoever reads it
+most often — and the two layer classes have different readers, so they
+get different shapes.
 
 `kv_dim = n_kv_heads × head_dim = 2 × 128 = 256` halves per token row.
 The two planes lay those halves out differently:
@@ -133,6 +162,12 @@ index formulas are the store kernels' own (`muse_reference.metal:1224`,
 `:1228`); why each layout pairs with its layer class is §15.6's tradeoff.
 
 ## 15.4 The store kernels
+
+With the shapes settled, the write itself is an anticlimax, and that is
+the design. The useful question here is not "how does the store work?"
+but "how little is the store allowed to know?" — because every fact the
+GPU kernel is told about token positions is a fact that can be wrong on
+the GPU, where nothing checks it.
 
 Two kernels write K/V; both are pure quantize-free copies — the values are
 already f32 in the activation buffers and f16 in the planes.
@@ -211,8 +246,14 @@ origin_logical) % capacity` — never as `logical % capacity`.
 
 ## 15.5 Ring write-position arithmetic — `append`
 
-The CPU-side reservation that decides `write_index` is eleven lines and
-fail-closed:
+Everything so far has deferred one question: which row does this token's
+K and V land in? The stake is unusually quiet. Get the row wrong and
+nothing crashes — attention simply scores the query against some other
+token's key, the logits shift, and the only symptom is generated text
+that is subtly worse than it should be, at a rate no test that checks for
+crashes will ever catch. So the arithmetic that answers the question is
+small, explicit, and refuses to guess. The CPU-side reservation that
+decides `write_index` is eleven lines and fail-closed:
 
 ```rust
 // crates/muser-engine/src/decode.rs:263
@@ -283,8 +324,14 @@ The plane's rotation (where `origin_physical` points) looks like
 implementation detail. It is not — it is *numerics*. Attention scans rows
 in physical order and floating-point accumulation is order-sensitive, so
 two planes holding identical rows in different rotations produce
-different last-bit logits. The restore path documents this with a test
-name in the comment:
+different last-bit logits.
+
+Put it plainly, because this is the idea in the chapter most worth
+re-reading: the same keys, stored starting at a different slot, are
+summed in a different order, and a different order of floating-point
+additions is a different number. The rotation is not where the data
+happens to sit. The rotation is part of the data. The restore path
+documents exactly this, with a test name in the comment:
 
 ```rust
 // crates/muser-engine/src/decode.rs:376
@@ -309,6 +356,11 @@ weight-side care could fix. Bitwise replay requires the *rotation* to
 travel with the cache.
 
 ## 15.7 Footprint per token, derived by hand
+
+Now the bill. Two questions a reader actually has — what does a session
+cost in memory, and where does that cost concentrate — are answerable
+with nothing but multiplication, so we would rather you re-derive them
+than take our word.
 
 One K row per layer = `n_kv_heads × head_dim × 2 B = 2 × 128 × 2 = 512 B`;
 K and V together = **1,024 B per layer per token** — topology-derived
@@ -342,6 +394,12 @@ this chapter's derivation as the per-layer-class split it is.
 
 ## 15.8 Tradeoffs
 
+The store could have been built differently at four points — how the
+cells are compared, how the planes are laid out, what precision they
+hold, and whether the store is its own dispatch at all. Each alternative
+deserves a price rather than a dismissal. Start with the frame the rest
+of them are argued in.
+
 **A 2×2 that splits the confounds.** The ancestor book's sharpest KV
 device was a 2×2 layout × precision matrix whose ratios multiplied out to
 the combined effect, exposing that a flag named "addressing" was mostly a
@@ -349,14 +407,21 @@ precision swap `[ferrite-book Ch 14]`. Muser's KV matrix has the same
 shape with different axes — **layout (token-major vs head-major) × layer
 class (SWA-RoPE vs NoPE)** — and the decomposition that matters is the
 payload split of §15.7: at depth, the NoPE cells carry ≈95.5 % of the
-bytes and the SWA rings ≈4.5 %. That split, not any kernel choice, is why
-the disaggregated lane streams "SWA groups (~82 MB) early" and holds "the
-NoPE bulk (95.7 % of payload)" until prefill finishes layer 51 — a burst
-schedule that later collided with EEE link idle states
-(`[docs/kvpack-merge-handoff §6 "Pacing reality"]`,
-[Ch 31](31-the-wire-discipline.md)). When you change one cell of this
-2×2, re-derive the payload split before predicting anything about the
-wire.
+bytes and the SWA rings ≈4.5 %.
+
+That split, not any kernel choice, is what shaped the disaggregated
+lane's send schedule: stream the "SWA groups (~82 MB) early" and hold
+"the NoPE bulk (95.7 % of payload)" back until prefill finishes layer 51.
+The reasoning felt free — the small planes are ready first, so send them
+first and buy overlap for nothing. On the wire it was not free. A
+burst-then-wait shape is exactly the traffic pattern that lets an
+EEE-capable link drop into an idle state between bursts, and the pacing
+section of the merge handoff is where that collision is written down
+(`[docs/kvpack-merge-handoff §6 "Pacing reality"]`);
+[Ch 31](31-the-wire-discipline.md) tells the story properly. The lesson
+outlives the wire: the payload split is an input to schedules made three
+layers of abstraction away, so when you change one cell of this 2×2,
+re-derive the split before predicting anything downstream of it.
 
 **Ring + growing plane vs one layout, vs paging.** Why not one layout for
 all 52 layers? A token-major *growing* NoPE plane would make each head's
@@ -400,6 +465,10 @@ K/V as a side effect; see [Ch 16](16-attention-decode-kernels.md).
 
 ## 15.9 Where the gap lives
 
+The book's running question about the decode gap is which dispatches are
+waste and which are structure. This chapter is where that question gets
+its least comfortable answer, twice.
+
 Two of the four +196 families live here. **52 KV-publication splits**
 (production's separate `kv_store` + `attention` closures vs legacy's
 combined `kv_store_attention`) are classed "session/publication structure
@@ -408,8 +477,10 @@ combined `kv_store_attention`) are classed "session/publication structure
 And **39 SWA wrapped-ring staging groups** are the batch graph's
 multi-row ring feature — the staging shadow of
 [Ch 36](36-prefill-vs-decode-paths.md) — kept "until a bit-exact
-ring-aware replacement exists." Neither is waste in the ordinary sense;
-both are structure the exactness contract refuses to cheapen, and the
+ring-aware replacement exists." Neither is waste in the ordinary sense.
+Both are dispatches that exist because removing them would change a
+number the exactness contract does not allow to change — which is a
+harder thing to argue away than a merely inefficient loop. The
 note's own ranked list still hopes for "a one-row ring-aware attention
 path that avoids SWA staging, gated by bitwise KV and full-logit equality
 at positions 1, 31, 32, 33, 2,047, 2,048, and 2,049." This chapter is

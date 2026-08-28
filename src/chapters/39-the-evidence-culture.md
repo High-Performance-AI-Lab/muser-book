@@ -11,12 +11,16 @@
 ## 39.1 The chapter that makes the other chapters cheap to trust
 
 Chapter 38 gave you the instrument: interleaved ratios, exact-token gates,
-five-rep means, receipts on an append-only volume. This chapter is about
-everything wrapped *around* that instrument — the locks, registers,
-contracts, and tags that decide when a measurement becomes a claim, who is
-allowed to say it, and what happens when the two disagree. Muser calls the
-whole assembly the **evidence culture**, and its constitution is one sentence
-from the working agreements:
+five-rep means, receipts on an append-only volume. But an instrument only
+tells you what happened. The questions that come immediately after are the
+ones this chapter answers: when does a measurement earn the right to be
+called a claim, who is allowed to say it out loud, and what happens when the
+number and the sentence disagree?
+
+Everything wrapped *around* the instrument exists to answer exactly that —
+the locks, registers, contracts, and tags. Muser calls the whole assembly the
+**evidence culture**, and its constitution is one sentence from the working
+agreements:
 
 > "Never weaken a fail-closed check to make a run pass. If a gate rejects
 > your evidence, the evidence is wrong until proven otherwise."
@@ -26,15 +30,33 @@ That sentence inverts the ordinary debugging instinct. The ordinary instinct,
 when a gate rejects your run, is that the gate is too strict. Here the
 default is the opposite: the gate is presumed right, your evidence is
 presumed wrong, and the burden sits exactly there until an audit moves it.
-Every mechanism in this chapter is that sentence rendered in JSON.
+
+Read it a second way, because the first reading undersells it. The rule does
+not claim that gates are always correct — gates have bugs like everything
+else. It claims something narrower and more useful: the cost of being wrong
+is deliberately loaded onto the person holding the failing run, never onto
+the check. Loosening a threshold is cheap and quiet; producing an audit that
+moves the burden is expensive and loud. The culture makes the honest move the
+cheap one by making the dishonest move impossible to do silently. Every
+mechanism in the rest of this chapter is that sentence rendered in JSON, and
+we will walk them in the order a claim itself walks them: refusal, lock,
+register, release path, wording, live tag, evidence volume, audit.
 
 ## 39.2 Fail-closed, defined and mechanized
+
+Start with the primitive everything else is built from, and start with the
+question it answers: what should a system do at the moment it cannot prove it
+is in a good state? There are only two families of answer, and the choice
+between them decides how much a whole program's evidence is worth.
 
 **Fail-closed** means: when a check cannot prove the good state, the system
 stops, and it stops *before* the unproven state can be mistaken for a proven
 one. A fail-*open* system degrades to permissive under uncertainty; a
-fail-closed system degrades to refusal. You have already met a dozen
-instances without the word:
+fail-closed system degrades to refusal. Put the difference in terms of what
+survives a bad day: a fail-open system's worst outcome is a number that looks
+fine and is not, which you may never catch; a fail-closed system's worst
+outcome is a stopped run, which you catch immediately by definition. You have
+already met a dozen instances without the word:
 
 - The producer exits with status 75 on any engine-touched error, and a bare
   `docker restart` is not enough — stale startup receipts, RoPE caches, and
@@ -60,8 +82,12 @@ documented, testable boundary, not a mysterious crash.
 
 ## 39.3 The release lock — one file that outruns everyone
 
-At the center of the culture sits a single small file,
-`release/release-lock.json`. As of the pinned tree its actual state is
+Suppose every measurement in this book came back gold tomorrow: every lane
+exact, every gate green, every receipt retained. What stops that from
+becoming a release the same afternoon? The answer is deliberately
+unimpressive. At the center of the culture sits a single small file,
+`release/release-lock.json`, short enough to read in a minute and blunt
+enough that nobody can misread it. As of the pinned tree its actual state is
 (Figure 39.1):
 
 ```json
@@ -92,35 +118,60 @@ marker, and only after an explicit operator go.*
 What "authoritative" means here is literal: **while the lock is in
 containment, no seals, tags, or release candidates may be created, no matter
 how strong the evidence is** `[AGENTS.md]`. Every ledger entry from the
-2026-08 campaigns carries the reminder — "no entry is a readiness receipt,
-seal, tag, candidate, or publication" `[ledger, preamble]` — and every
-chapter of this book inherits the constraint: the numbers you have read are
-*unsealed engineering evidence*, every one `seal_eligible: false`
-`[ledger "Synthetic spec matrix deep-cell restatement"]`. In this campaign's
-vocabulary that is the distinction between **notarial** evidence (a sealed,
-independently reproducible release artifact) and **non-notarial** evidence
-(everything retained so far). "Measured," in this program, means measured on
-Muser, on this hardware, under a retained receipt — never "measured once, on
-any hardware, ever" `[docs/launch-claims.md §Ground rules]`.
+2026-08 campaigns repeats the reminder in its own preamble — "no entry is a
+readiness receipt, seal, tag, candidate, or publication" `[ledger, preamble]`
+— and every chapter of this book inherits the constraint. The numbers you
+have read are *unsealed engineering evidence*, every one of them, and the
+ledger stamps the fact onto each restatement as `seal_eligible: false`
+`[ledger "Synthetic spec matrix deep-cell restatement"]`.
 
-The lock is tracked, not advisory: commit `11119bd` is listed in
-`blocked_commits`, and the feature contract independently declares it the
-non-releasable source baseline `[release/feature-contract-v1.json,
-"source_baseline"]`. Deleting or editing the lock to make a release happen is
+That is the distinction the campaign calls **notarial** versus
+**non-notarial** evidence: notarial evidence is a sealed, independently
+reproducible release artifact; non-notarial evidence is everything retained
+so far. Say it once more in the negative, because the word invites the wrong
+reading. Non-notarial does not mean sloppy, preliminary, or unreproducible —
+a non-notarial number can be measured exactly and rerun on our bench all
+afternoon. What it lacks is the seal that would let a stranger reproduce it
+without us in the room. "Measured" carries a similarly narrow meaning here:
+measured on Muser, on this hardware, under a retained receipt — never
+"measured once, on any hardware, ever"
+`[docs/launch-claims.md §Ground rules]`.
+
+The objection writes itself: the lock is a file in the repo, so what stops
+anyone from editing it? Two things, and only the second one is durable. The
+lock is tracked rather than advisory — commit `11119bd` is listed in
+`blocked_commits`, and the feature contract independently declares that same
+commit the non-releasable source baseline
+`[release/feature-contract-v1.json,
+"source_baseline"]`, so a quiet edit to one file contradicts the other and
+the contradiction shows up in review. More importantly, the unlock has a
+prescribed shape. Deleting or relaxing the lock to make a release happen is
 not a move anyone has; the only permitted unlock is "a narrowly scoped,
 reviewed change setting `sealing_enabled` true for this exact
-readiness-authorized campaign" `[docs/private-release.md §3]`.
+readiness-authorized campaign" `[docs/private-release.md §3]`. An escape
+hatch that has to be argued for in the open is not much of an escape hatch,
+which is the point.
 
 ## 39.4 Findings and the feature contract — the campaign's identity
 
-Two more files complete the constitutional set, and the working agreements
-warn explicitly: "changes to them change the campaign identity"
-`[AGENTS.md]`.
+The lock answers *when*, and its answer is "not yet." Two further files
+answer *what*: what the release would consist of, and what still stands
+between it and existing. Together with the lock they complete the
+constitutional set, and the working agreements warn about them in the same
+breath — "changes to them change the campaign identity" `[AGENTS.md]`.
+Editing one of these files is not maintenance. It is starting a different
+campaign, under a different identity, whose earlier evidence no longer
+applies.
 
-**`release/findings-v1.json`** is the defect register. Its policy line
-forbids the two classic escapes: `{"waivers_allowed": false,
-"release_requires_zero_open": true}` `[release/findings-v1.json]`. Each
-finding has id, severity, area, title, status, and resolution; the register
+**`release/findings-v1.json`** is the defect register, and its policy line
+only has to close two doors: `{"waivers_allowed": false,
+"release_requires_zero_open": true}` `[release/findings-v1.json]`. Those are
+the two escapes a defect register is normally asked for — *ship with the
+defect and note it* (the waiver), and *ship with it still open and fix it
+next cycle* (the deferral). Neither exists here, which means the register's
+open-row count is a gate rather than a status report.
+
+Each finding has id, severity, area, title, status, and resolution; the register
 spans 44 rows from REL-001 (the blocked commit) through security
 (`SEC-001`–`SEC-005`: TLS, CORS, CSRF, WebSocket tickets, CA workflow),
 enrollment, replay-ledger durability (`REP-001`: "generation reservation
@@ -132,7 +183,11 @@ by enumerating the retained verdict-grade evidence — the six-depth plain
 matrix, the fixed-window spec ratios, the funded-fix 131,008 wall parity,
 the disaggregated TTFT/link/determinism/soak gates — and its closure text
 still bounds the claim: "Scope remains exactly the measured synthetic and
-single-producer lanes" `[release/findings-v1.json, PERF-001]`.
+single-producer lanes" `[release/findings-v1.json, PERF-001]`. Notice the
+shape of that closure. It does not say "fixed." It is a list of retained runs
+plus a fence drawn around what those runs cover — a closure in this register
+is itself a piece of evidence, which is why closing PERF-001 took a campaign
+rather than a commit.
 
 **`release/feature-contract-v1.json`** fixes what the release *is*: the
 hardware contract (one M3 Ultra 96 GB decode host, four slots at 131,072
@@ -164,8 +219,12 @@ living document.
 
 ## 39.5 The release path — freeze, run, readiness, seal
 
-The one permitted path from "lots of evidence" to "a release" is a fixed
-sequence (Figure 39.3) `[docs/private-release.md]`:
+Grant, for a moment, that the lock does open. What happens then is not "cut a
+release." It is a fixed sequence with a stop at every junction, and the
+sequence is worth studying even though it has never run to completion,
+because its shape is a list of the things the culture is afraid of. The one
+permitted path from "lots of evidence" to "a release" runs like this
+(Figure 39.3) `[docs/private-release.md]`:
 
 ```mermaid
 flowchart TD
@@ -191,7 +250,17 @@ wrong-identity, or unsealed=false report is a failure. There are no waivers"
 sealed matrix is measured after readiness, not assembled from remembered
 numbers — into a hidden sibling directory, fsyncing everything, exposing the
 bundle with one rename; "failure exposes nothing" `[docs/private-release.md
-§4]`. Even the candidate verifiers are structural: a second clean-room
+§4]`.
+
+That last phrase is the atomic-seal idea in one image, and it is worth
+holding onto. Anyone reading the evidence directory sees either no bundle at
+all or a complete one; there is no window in which they can catch the
+campaign mid-sentence and mistake a partial run for a result. A crash
+halfway through leaves nothing but a hidden directory of garbage — which is
+the correct outcome of a failed release, and the reason the rename comes
+last.
+
+Even the candidate verifiers are structural: a second clean-room
 verifier "must extract the source archive, perform the offline locked build,
 re-hash the resulting binary … and run the loopback smoke request on an
 externally offline host" `[docs/private-release.md §5]`, under the
@@ -203,9 +272,15 @@ that this fact is *checkable from one file* rather than folklore.
 
 ## 39.6 The launch-claims register — copy never outruns the receipt
 
-`docs/launch-claims.md` is the interface between measurements and words.
-It is a table — seventeen numbered rows at the pin — where every row carries
-its current evidence (with receipt paths), its conditionally approved
+Evidence decides what is true. Words decide what a reader ends up believing
+you said. Most technical dishonesty lives in the gap between the two — not in
+the numbers, which are usually fine, but in the sentence built on top of
+them, one adjective wider than the measurement supports. So the question this
+section answers is: where does that gap get closed, and by whom?
+
+`docs/launch-claims.md` is the answer — the interface between measurements
+and words. It is a table — seventeen numbered rows at the pin — where every
+row carries its current evidence (with receipt paths), its conditionally approved
 wording, and, where wording exists but the owner has not approved it, the
 banner **OPERATOR REVIEW REQUIRED**. The register's ground rules are the
 culture's most quotable sentences; four verbatim:
@@ -228,6 +303,10 @@ culture's most quotable sentences; four verbatim:
 > "When evidence and wording conflict, evidence wins and the wording row
 > gets corrected — copy is never allowed to outrun the receipt."
 > `[docs/launch-claims.md §Ground rules]`
+
+Three of those rules govern what a number is allowed to become; the fourth
+governs what happens when a sentence has already got ahead of its number, and
+its direction is not negotiable — the wording moves, the evidence does not.
 
 The **OPERATOR REVIEW tier** is the register's subtlest device. Rows #2, #6,
 #11, #12, #15, #16, and #17 carry evidence-backed *proposed* wording that
@@ -255,8 +334,12 @@ listing what a reader might reasonably assume you have.
 
 ## 39.7 Honesty tags — the metrics schema
 
-The same discipline reaches into the live server payload. Every field in the
-telemetry snapshot carries an honesty tag, and the legend is enforced in
+The same discipline reaches into the live server payload, and it gets there
+by way of a small design question with a load-bearing answer: what should a
+dashboard show for a quantity nobody has measured? The tempting answer is
+zero. Zero renders cleanly, keeps the layout intact, and is a lie shaped
+exactly like data. Muser's answer instead is that every field in the
+telemetry snapshot carries an honesty tag, with the legend enforced in both
 prose and code `[docs/metrics-schema.md]`:
 
 - **`measured`** — "a live counter, duration, or verified loaded-model
@@ -267,10 +350,13 @@ prose and code `[docs/metrics-schema.md]`:
 
 The register's copy legend extends the same idea with five tags for claims —
 `[measured]` / `[precedent-7B-ferrite]` / `[target]` / `[roadmap]` /
-`[mock]` `[docs/launch-claims.md, preamble]`. (The two legends serve two
-surfaces: three tags for live telemetry, five for launch copy; the
-`[precedent-7B-ferrite]` tag exists specifically to keep ancestor-lab
-numbers quarantined.)
+`[mock]` `[docs/launch-claims.md, preamble]`. The two legends look redundant
+until you notice they cover different surfaces: three tags for a live
+telemetry payload, five for launch copy, which has to make one distinction
+telemetry never faces. That extra distinction is `[precedent-7B-ferrite]`,
+and the reason it matters to every chapter of this book is that it keeps
+ancestor-lab numbers quarantined where no reader can mistake them for Muser
+measurements.
 
 The mock rule has one canonical application. The dashboard's `nodes[]`
 array — M3/GX10 utilization, memory, power, temperature — "is currently
@@ -289,6 +375,11 @@ may never dress up as an observation `[docs/metrics-schema.md, preamble]`.
 
 ## 39.8 Evidence volume discipline — where truth is allowed to live
 
+Two questions sound like one question here, and telling them apart took a
+measured failure. Where is a receipt allowed to live? And what *else* is
+allowed to live beside it? The first has a short answer; the second we got
+wrong first.
+
 Retained evidence lives on `muser-receipt://` and is
 **append-only** `[AGENTS.md]`. The wrapper's mechanics make the append-only
 property physical: receipts are created through exclusive temp-file +
@@ -297,12 +388,27 @@ refuse if the target exists — "refusing to replace result receipt"
 `[scripts/accelerator_safe.py:202-203]`; the run journal is opened
 `O_APPEND` and fsynced per record `[scripts/accelerator_safe.py:190-197]`.
 
-The 2026-08-18 durability lesson (fully told in
-[Ch 31](31-the-wire-discipline.md)) is the volume discipline's other half:
-**operational state — replay ledgers, sockets, locks — belongs on the
-internal disk**, because the evidence volume's directory-fsync tail produced
-bimodal ~1 s stalls in the commit path `[AGENTS.md]`. The receiver now
-*probes* for this: `check_ledger_volume` measures the reserve-pattern tail
+That property invites an obvious generalization, and we took it. If the
+evidence volume is *the* durable place — exclusive create, fsync, rename,
+refuse-on-exists — why maintain two storage stories? Put the operational
+state there as well: replay ledgers, sockets, locks, all on the disk built to
+never lose a write. We expected the volume's guarantees to carry over intact.
+
+They did not carry over. The 2026-08-18 durability investigation (fully told
+in [Ch 31](31-the-wire-discipline.md)) found that the evidence volume's
+directory-fsync tail produced bimodal ~1 s stalls in the commit path
+`[AGENTS.md]`: a ledger commit that should have been imperceptible would
+instead, some of the time, freeze the lane. Nothing was wrong with the
+durability. What we had never tested was its *latency distribution* — a
+different property of the very same fsync. That is the lesson worth carrying
+out of the episode: a volume tuned so that writes can never be lost is not
+thereby a volume on which writes are always quick, and the two properties
+have to be measured separately because only one of them was ever on trial.
+
+So the decision went the other way. **Operational state — replay ledgers,
+sockets, locks — belongs on the internal disk**, and because a lesson that
+lives only in a document decays, the receiver now *probes* rather than
+trusts: `check_ledger_volume` measures the reserve-pattern tail
 latency and refuses a slow volume before any handoff
 `[crates/muser-cluster/src/receiver.rs:108-150]`, with
 `scripts/gx10/durable_fsync_probe.py` as the standalone probe (exit 1 past
@@ -311,9 +417,15 @@ operations are separated not by convention but by measured failure mode.
 
 ## 39.9 The documentation truth pass — auditing claims against receipts
 
-Documents drift; code moves; receipts stay. A **documentation truth pass**
-is the genre of audit that re-reads every claim-bearing document against
-implementation and retained evidence. Muser's 2026-08-15 pass checked README
+Documents drift; code moves; receipts stay. Which raises the question this
+section exists to answer: how do you catch a claim that was true on the day
+it was written and quietly stopped being true while nobody was watching it?
+Nothing in the machinery so far catches that one, because nothing so far
+re-reads old sentences. You have to go looking, deliberately. A
+**documentation truth pass** is the genre of audit that re-reads every
+claim-bearing document against implementation and retained evidence.
+
+Muser's 2026-08-15 pass checked README
 and CLI help against `cli.rs`, security text against the Axum authorization
 policy, architecture against the slot pool and GGUF geometry, dashboard
 copy against `MetricsSnapshot`, performance claims against the retained
@@ -372,9 +484,11 @@ inside the very row that replaced it.
 
 ## 39.10 Red-teaming the record
 
-The truth pass audits documents against implementation. One step further
-out, the campaign **red-teamed itself before asking an external reviewer
-anything**: a review document produced by "seven independent auditors
+The truth pass audits documents against implementation. That leaves the
+uncomfortable question one step further out — who audits the people doing the
+auditing, before an outsider ever sees the file? The campaign's answer was to
+**red-team itself before asking an external reviewer anything**: a review
+document produced by "seven independent auditors
 (ledger forensics, raw-receipt recompute, Phase-4 packet forensics,
 engine-code attribution audit, statistics, framing/honesty,
 completeness), plus direct spot-verification of every load-bearing claim.
@@ -399,6 +513,10 @@ possible.
 
 ## 39.11 What the culture costs and what it buys
 
+Every discipline sends a bill, and a culture whose costs go unnamed is the
+kind that gets quietly abandoned the first time it is inconvenient. So here
+is the ledger, both columns.
+
 - **Cost: latency on every claim.** An OPERATOR REVIEW row cannot ship even
   with perfect evidence; a release cannot seal while the lock says
   containment; a finding closure needs enumerated receipts, not a
@@ -415,12 +533,27 @@ possible.
   question resolves to one lock file. The red-team review could verify
   "no fabrication and no result-shopping" because the evidence chain never
   breaks `[docs/redteam-review-campaign-brief-20260820.md §Verdict]`.
-- **Buys: safety under error.** Fail-closed meant the 65536 warm-hit
-  `outputs_match: false` cell was *retracted as an infrastructure timeout*
-  after investigation rather than argued with — "the 65,536 warm-hit
-  result was an infrastructure timeout, not a cache-correctness failure"
-  `[ledger "CORRECTION — the 65536 warm-hit result", 2026-08-21]` — and the
-  valid cell is the one that then passed its gate.
+
+The last entry in the buys column is a story rather than a line item, and it
+is the episode we would point at if the whole apparatus had to justify itself
+once. **Fail-closed buys safety under error.** A matrix cell came back with
+`outputs_match: false` at the 65536 warm hit, which for a warm-cache result
+is about the worst string the harness can print. The tempting response to a
+single red square is to argue with the square rather than with the system:
+call it noise, rerun it, move on. Fail-closed forbids exactly that move — the
+gate is presumed right and the evidence presumed wrong — so the cell was
+investigated instead of defended. The investigation found a mundane cause,
+and the correction says so plainly: "the 65,536 warm-hit result was an
+infrastructure timeout, not a cache-correctness failure"
+`[ledger "CORRECTION — the 65536 warm-hit result", 2026-08-21]`. The cell was
+*retracted as an infrastructure timeout* rather than explained away, and the
+valid cell is the one that then passed its gate.
+
+Notice that the discipline paid off in both directions at once. Had the red
+square been a real correctness bug, arguing with the gate would have shipped
+it. Because it was not, the retraction sits on the record where any reader
+can confirm which cell is being counted — the one that passed its gate on its
+own merits, not the one that happened to be convenient.
 
 There is one more register the culture keeps, and it is the grimmest one:
 the list of things measured carefully and then *rejected*. That is the last

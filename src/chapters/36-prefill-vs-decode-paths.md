@@ -27,7 +27,9 @@ chapter: decode-matvec-serial versus prefill-GEMM-parallel, in code.
 
 ## 36.1 The same model, two regimes
 
-Fix the vocabulary once more (it was introduced in
+Start with the question everything below answers: what makes a prompt a
+different *kind* of work from a token, when the weights, the layers and the
+math are identical? Fix the vocabulary once more (it was introduced in
 [Ch 10 §10.1](10-the-forward-pass-at-a-glance.md) and every performance claim
 in the book is scoped to one of these):
 
@@ -53,7 +55,9 @@ One token takes the decode route (through the one-row batch graph, as
 the prefill loop of §36.7. From that single branch, everything differs
 downstream: the projections, the attention kernels, the workspace sizes, the
 scheduler work class (`Decode` vs `Prefill` permits,
-[Ch 34](34-scheduler-and-slots.md)).
+[Ch 34](34-scheduler-and-slots.md)). Pause on how little machinery that is.
+Two regimes, two kernel families, two classes of work for the scheduler to
+arbitrate — and the thing that picks between them is the length of a slice.
 
 ## 36.2 The roofline flip, with the arithmetic shown
 
@@ -96,7 +100,15 @@ memory time) symbolically: `knee = FLOPs_ceiling / 800 GB/s`. Whatever the
 true ceiling, decode at ~3.2 FLOPs/byte sits far below any plausible knee —
 *memory-bound: halve the bytes, halve the time* — while a 512-row prefill
 chunk at ~1,619 FLOPs/byte sits far above it — *compute-bound: time tracks
-FLOPs, and extra bytes are nearly free*. This is the flip. It is why
+FLOPs, and extra bytes are nearly free*. This is the flip.
+
+Say it once more without the ratio, because it is the load-bearing idea of the
+chapter. A decode token drags the entire weight arena across the memory bus in
+order to compute a single row, and then throws that traffic away; the bus sets
+the clock. A wide prefill chunk drags the same arena across the same bus, but
+every byte that arrives is put to work by every row in the batch before it is
+discarded; now the arithmetic sets the clock. Same weights, same bus, a
+different master. That is why
 [Ch 1](01-why-inference-is-a-memory-problem.md) could cost a decode token by
 bytes alone, and why prefill wants the opposite of everything the decode path
 optimizes for: wide tiles, arithmetic-dense kernels, batches as large as
@@ -186,6 +198,10 @@ every dispatch carrying `token_count` rows instead of one
 
 ## 36.4 Projections: from matvec to GEMM
 
+What happens to a projection when the batch widens? Nothing, mathematically:
+the same weight matrix meets the same kind of input. What changes is the
+shape, and shape is the only thing a GPU kernel really has an opinion about.
+
 A [matvec](../glossary.md#matvec) computes `y = W·x` for one vector `x`: each
 output element is a dot product of one weight row with `x`
 ([Ch 13](13-the-qkv-gate-matvec-family.md)). Prefill has `T` input vectors —
@@ -210,7 +226,12 @@ if token_count == 16
 On the native NVFP4 lane, 16-row chunks with 64-aligned input widths take a
 *quantized-activation* GEMM — the W4A4 M16 route of
 [Ch 7](07-nvfp4-native-lane.md), `muser_nvfp4_w4a4_prequant_m16_n32`
-[crates/muser-engine/src/shaders/nvfp4.metal:504]. Everything else falls
+[crates/muser-engine/src/shaders/nvfp4.metal:504]. The surprise is how narrow
+the keyhole is: one exact row count, one dtype, one alignment rule, and an
+escape hatch in the environment. This is a shape-specific kernel that earns
+its place only where a chunk happens to land on it — the flavour of the whole
+prefill path, and the reason the attention story below is a tree rather than
+a kernel. Everything else falls
 through to the same projection stack decode uses, just with `token_count`
 rows. The four independent Q/K/V/gate GEMMs share one dispatch closure so a
 concurrent encoder can overlap them — with the comment: "Independent
@@ -223,10 +244,11 @@ dependencies at closure edges.
 
 ## 36.5 Prefill attention: the route tree
 
-Decode attention was a four-rung ladder selected per layer per token
-([Ch 16 §16.0](16-attention-decode-kernels.md)). Prefill attention is a
-three-route tree selected per layer per chunk, plus a fail-safe. The trunk
-predicate:
+Which attention kernel should a chunk of prompt use? Decode answered that
+question per layer per token, climbing the four-rung ladder of
+[Ch 16 §16.0](16-attention-decode-kernels.md). Prefill has to answer it per
+layer per chunk, and the answer is not one kernel: it is a three-route tree,
+plus a fail-safe. What sorts a chunk into the trunk is a single predicate:
 
 ```rust
 // crates/muser-engine/src/decode.rs:4104-4106
@@ -292,19 +314,29 @@ if !llama_fa_prefill_mask_ready {
 ```
 
 The two wrappers [crates/muser-engine/src/metal/encode/attn.rs:266-317,
-328-369] carry the contract. `encode_llama_fa_prefill_mask_blk` fills a
-causal f16 mask and runs llama's `flash_attn_ext_blk` block classifier —
-bytes that mark each 32×8 tile skip/partial/dense, "what make the pinned
+328-369] carry the contract. The first is preparation:
+`encode_llama_fa_prefill_mask_blk` fills a
+causal f16 mask and runs llama's `flash_attn_ext_blk` block classifier, which
+emits bytes marking each 32×8 tile skip/partial/dense — "what make the pinned
 kernel's causal prefill cheap on the fully-masked upper triangle"
-[attn.rs:259-265] — with one barrier after each stage and a note that "one
+[attn.rs:259-265]. That classification is why the preparation earns a
+dispatch of its own. A causal chunk's mask is mostly holes, and a kernel told
+in advance which tiles are entirely masked simply never reads them. It is
+also why the dispatch is per chunk rather than per layer: a barrier follows
+each stage, and the wrapper notes that "one
 dispatch per prefill chunk is shared by every full-attention layer in that
-chunk" [attn.rs:262-263]. `encode_llama_flash_attn_prefill_f16` is
-`kernel_flash_attn_ext_f16_dk128_dv128` from the pinned metallib, with the
+chunk" [attn.rs:262-263] — prepared once, amortised across every eligible
+layer in the chunk.
+
+The second wrapper is the attention itself.
+`encode_llama_flash_attn_prefill_f16` is
+`kernel_flash_attn_ext_f16_dk128_dv128` from the pinned metallib, run at the
 shape constants `LLAMA_FA_PREFILL_NQPTG = 8`, `LLAMA_FA_PREFILL_NCPSG = 32`,
-`LLAMA_FA_PREFILL_NSG = 4` [crates/muser-engine/src/metal/encode.rs:1069-1072]
-and strides that map Muser's token-major f32 Q onto ggml's expectations —
+`LLAMA_FA_PREFILL_NSG = 4` [crates/muser-engine/src/metal/encode.rs:1069-1072].
+The strides are where Muser's layout meets ggml's expectations —
 "Q and the output stay in Muser's token-major `[token, head, dim]` f32
-layout via explicit strides" [attn.rs:325-326].
+layout via explicit strides" [attn.rs:325-326]. No transpose pass, no copy:
+just an honest description of the memory the pinned kernel is about to read.
 
 **Route (c) — everything else: local FA2.** `flash_attn_v2`
 [crates/muser-engine/src/shaders/ferrite/flash_attn_v2.metal:59] over the
@@ -318,11 +350,13 @@ attended from, so it reads through the same f16 planes.
 
 ## 36.6 The SWA staging shadow: prefill through a wrapped ring
 
-Now the 39-group family from [Ch 35](35-ordering-hazards-and-the-dispatch-gap.md).
-Once a sliding layer's ring has wrapped (Ch 15's `origin_logical > 0`), the
-live cache is no longer a contiguous span from row zero — `flash_contiguous`
-fails, and the pinned kernels cannot walk an arbitrary physical rotation.
-The route:
+Now the 39-group family from [Ch 35](35-ordering-hazards-and-the-dispatch-gap.md),
+and the awkward case it exists to survive. Once a sliding layer's ring has
+wrapped (Ch 15's `origin_logical > 0`), the live cache is no longer a
+contiguous span from row zero — `flash_contiguous` fails, and the pinned
+kernels cannot walk an arbitrary physical rotation. Prefill still has to run
+on that layer, and it still has to produce exactly the bits a later decode
+token will attend from. The route out:
 
 ```rust
 // crates/muser-engine/src/decode.rs:4247-4252
@@ -335,17 +369,23 @@ The route:
 ```
 
 Three steps, per wrapped SWA layer, per chunk. **Stage:**
-`encode_stage_swa_prefill_f16` dispatches `muser_stage_swa_prefill_f16`
-[crates/muser-engine/src/shaders/muse_reference.metal:1240] — a
+`encode_stage_swa_prefill_f16` dispatches `muser_stage_swa_prefill_f16`, a
 `(old_len + token_count) × kv_dim` gather that rewrites the ring's retained
 logical tail into a *detached* shadow plane, in logical order, followed by
-the chunk's own K/V rows [crates/muser-engine/src/metal/encode/attn.rs:103-138].
-**Attend:** FA2 runs against the shadow — contiguous by construction, window
-masking against logical indices that now match physical layout
-[crates/muser-engine/src/decode.rs:4328-4345]. **Commit:** only then does
-`append_batch` update the live ring's metadata [crates/muser-engine/src/decode.rs:4348-4352].
-The live ring is never observed mid-rebuild — the same
-build-detached-then-swap shape as the remote KV install of
+the chunk's own K/V rows. **Attend:** FA2 runs against the shadow, which is
+contiguous by construction, so window masking against logical indices now
+matches physical layout. **Commit:** only after attention has consumed the
+whole shadow does `append_batch` update the live ring's metadata. The
+evidence trail, in step order: the stage kernel
+[crates/muser-engine/src/shaders/muse_reference.metal:1240] and its wrapper
+[crates/muser-engine/src/metal/encode/attn.rs:103-138]; the attend site
+[crates/muser-engine/src/decode.rs:4328-4345]; the commit
+[crates/muser-engine/src/decode.rs:4348-4352].
+
+Read that ordering once more, because it is the entire trick. The live ring is
+never observed mid-rebuild — not because the rebuild is fast or carefully
+interleaved, but because the thing attention reads is not the ring at all. It
+is the same build-detached-then-swap shape as the remote KV install of
 [Ch 10 §10.7](10-the-forward-pass-at-a-glance.md) and the server's staging
 generation of [Ch 34 §34.6](34-scheduler-and-slots.md), here at kernel
 granularity.
@@ -375,19 +415,32 @@ KV and full-logit equality at positions 1, 31, 32, 33, 2,047, 2,048, and
 
 ## 36.7 Chunking, and yielding to decode
 
-Prompts do not arrive pre-sliced. `forward_into`'s prefill loop
+Prompts do not arrive pre-sliced, so something has to decide how much of one
+crosses to the GPU at a time. Throughput argues for the widest possible chunk;
+but the GPU is not private, and somewhere another sequence may already be
+waiting on its next token. That tension is what this section resolves.
+
+`forward_into`'s prefill loop
 ([Ch 34 §34.2](34-scheduler-and-slots.md), quoted there) walks the prompt in
 `PREFILL_BATCH_TOKENS = 512`-row chunks — and shrinks the next boundary to
 `MAX_TEACHER_FORCED_TOKENS = 64` rows the moment any decoder is queued
 [crates/muser-engine/src/decode.rs:53-54, 2097-2113]. Each chunk acquires a
 `Prefill` permit per [Ch 34](34-scheduler-and-slots.md)'s decode-first
 scheduler, so between chunks a waiting decode always wins the accelerator.
-The chunk width is also a memory decision: the batch workspace's activation
-twins scale with rows, and ~0.99 GB of f32 batch-activation widths at the
+The chunk width is also a memory decision, and the reason that matters here
+rather than in the memory chapter is that it caps the first argument: you
+cannot widen a chunk past what its workspace costs. The batch workspace's
+activation twins scale with rows, and ~0.99 GB of f32 batch-activation widths at the
 512-position chunk are *reused*, with the explicit caveat that this "must
 not be labeled peak RSS" `[docs/memory-footprint.md]`.
 
 ## 36.8 The measured contrast — and the two latencies users feel
+
+So does the two-graph story survive a comparator? The campaign measured both
+graphs against the pinned llama build, and the three results below are best
+read as one argument rather than as three scores: the graphs hold parity
+locally, the prefill graph is the one worth moving off the machine, and the
+two of them are what a user actually feels as two different waits.
 
 **Local parity, both regimes.** The production six-depth plain matrix
 (2,048 → 131,008 positions, five exact-token reps per depth, llama ÷ muser
@@ -400,9 +453,13 @@ cell [Ch 38](38-measuring-against-llama-cpp.md).
 
 **Disaggregation, the prefill-side lever.** When prefill moves to the GX10,
 TTFT — time to first token, almost pure prefill plus wire — improves
-**4.26×** at 2,048 tokens (Phase-4 matrix, five reps) and **4.149×** at
-130,815 tokens (remote 137.405 s median vs local 570.122 s mean, EEE-off
-arm)
+**4.26×** at 2,048 tokens, a figure the Phase-4 context matrix produced over
+five reps per cell. The deep end of the band behaves the same way: **4.149×**
+at 130,815 tokens, where a remote 137.405 s median stands against a local
+570.122 s mean on the EEE-off arm. Three records sit behind that pair of
+numbers — the claim that fixes what the speedup does and does not cover, the
+ledger matrix the shallow cell came from, and the A/B run that settled the
+deep one — and we kept all three
 `[claims #6; ledger "Phase 4 disaggregated GX10→Mac context matrix"; ledger
 "EEE A/B at 130815"]`. The full depth band and its caveats are
 [Ch 27](27-why-disaggregate.md)'s subject — this chapter only claims the
@@ -410,47 +467,69 @@ regime split that makes the lever coherent.
 
 **TTFT and TPOT are the user-facing twins of this chapter's two graphs.**
 Time-to-first-token is prefill-dominated; time-per-output-token is decode-
-dominated. Every serving optimization in this book attacks exactly one of
-them: disaggregation and kvpack warm reuse ([Ch 25](25-warm-reuse.md))
+dominated. That one sentence sorts nearly every serving optimization in this
+book into two piles: disaggregation and kvpack warm reuse
+([Ch 25](25-warm-reuse.md))
 attack TTFT; DFlash speculation ([Ch 33](33-speculation-and-the-distributed-verdict.md))
-attacks TPOT (the kquant spec bar 107.9 tok/s; current synthetic restatement
-decode ratio 1.23692 at 2,048, five of five exact reps `[claims #15]`). The
+attacks TPOT. The speculation numbers belong to that lane's own chapter, but
+the scope they carry belongs here — the kquant spec bar 107.9 tok/s, and a
+current synthetic restatement
+decode ratio 1.23692 at 2,048, five of five exact reps `[claims #15]`. Even
+the tuning traces back to this split: the
 frozen serving verify-length 7 came from exactly this matrix's natural-text
-cells `[ledger, "Spec re-measurement at the fixed window"]`. And the
+cells `[ledger, "Spec re-measurement at the fixed window"]`. And when both
+graphs are measured *together*, what comes out is the
 131,008-depth wall-parity cell — end-to-end 1.02536× with prefill 1.02460×,
-the first 131k-class result above parity — is the two graphs measured
-*together* `[claims #16]`.
+the first 131k-class result above parity `[claims #16]`.
 
 ## 36.9 Tradeoffs
 
-**Three attention routes instead of one.** The route tree costs complexity
-(predicates on chunk shape, alignment, layer class, lane) and buys exactness
-plus regime-appropriate kernels: pinned vec for short chunks and parity-
-critical reads, pinned non-vec for aligned NoPE chunks, local FA2 for
-everything else. The measured basis for preferring pinned kernels where
-eligible is the comment's own history — the local FA2 path "was
-mathematically close but diverged sharply after four positions across 52
-layers" [crates/muser-engine/src/decode.rs:4121-4124] — plus the parity
-matrices above, run with the pinned routes in place. No isolated A/B of
-route (b) versus route (c) throughput exists in the campaign evidence
+**Three attention routes instead of one.** The obvious design is one route.
+Muser owns a perfectly good flash-attention kernel of its own; point every
+prefill layer at it and the tree collapses into a straight line. That is how
+the graph ran. The expectation was mild — the local kernel and the pinned one
+compute the same attention over the same cache, so their outputs should agree
+to within floating-point noise, and nothing a client can observe through a
+public embedding or logprob endpoint should be able to tell them apart. It
+could. The source still carries the note of what went wrong: the local FA2
+path "was mathematically close but diverged sharply after four positions
+across 52 layers" [crates/muser-engine/src/decode.rs:4121-4124]. The lesson
+is the one this book keeps relearning from a different angle each time —
+agreeing on the algebra is not agreeing on the reduction order, and a parity
+contract is written in bits. So the tree stayed, and each route is a
+concession to that: pinned vec for short chunks and parity-critical reads,
+pinned non-vec for aligned NoPE chunks, local FA2 for everything the pinned
+kernels cannot legally walk. What it costs is complexity — predicates on
+chunk shape, alignment, layer class, lane. What justifies the cost is the
+divergence above, plus the parity matrices above, run with the pinned routes
+in place. What we never ran is an isolated A/B of route (b) versus route (c)
+on throughput alone, so no such number exists in the campaign evidence
 [unverified].
 
-**Stage-then-attend versus a ring-aware kernel.** The staging shadow pays 39
-closure groups per wrapped token diagnostic [docs/decode-dispatch-gap-20260815.md]
-plus shadow-plane memory (two 131,072-row staging planes in the batch
-workspace, [Ch 10 §10.8](10-the-forward-pass-at-a-glance.md)). The
-alternative — an attention kernel addressing the rotated ring natively —
-exists on the decode side (the splitk rung of
-[Ch 16](16-attention-decode-kernels.md)) but would need a bit-exactness proof
+**Stage-then-attend versus a ring-aware kernel.** This is a fork we left
+standing rather than closed, and the price of leaving it open is visible in
+the diagnostics. The staging shadow pays 39 closure groups per wrapped token
+diagnostic [docs/decode-dispatch-gap-20260815.md] plus shadow-plane memory
+(two 131,072-row staging planes in the batch workspace,
+[Ch 10 §10.8](10-the-forward-pass-at-a-glance.md)). The alternative — an
+attention kernel that addresses the rotated ring natively, with no copy at
+all — is not hypothetical: it already exists on the decode side, as the
+splitk rung of [Ch 16](16-attention-decode-kernels.md). What keeps it out of
+the prefill path is not doubt about the kernel. It is the proof obligation
+attached to it, bit-exactness
 at seven named boundary positions before it could replace the pinned-lane
 staging route [docs/decode-dispatch-gap-20260815.md §Ranked remaining exact
-work].
+work]. Until someone does that work, copying rows is the cheaper mistake to
+be making.
 
-**512/64 adaptive chunks.** Wide chunks maximize GEMM intensity (Figure
-36.1); the shrink-to-64 rule trades that intensity away precisely when a
-decode is waiting, capping decode's worst-case queue-behind interval
-[crates/muser-engine/src/decode.rs:2098-2101]. The prefill-throughput cost
-under concurrent load was not isolated as a measurement [unverified]; the
+**512/64 adaptive chunks.** This tradeoff is deliberately lopsided, and
+worth naming as such. Wide chunks maximize GEMM intensity (Figure
+36.1); the shrink-to-64 rule throws that intensity away precisely when a
+decode is waiting, buying a cap on decode's worst-case queue-behind interval
+[crates/muser-engine/src/decode.rs:2098-2101]. In other words, prefill is
+made slower on purpose so that somebody else's stream does not stutter. What
+we cannot tell you is how much slower: the prefill-throughput cost
+under concurrent load was never isolated as a measurement [unverified]. The
 benefit side is the bounded decode-latency argument, and the constants are
 in source.
 

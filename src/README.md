@@ -23,7 +23,21 @@ of LLM inference, the *Metal* that makes it fast on Apple Silicon, the
 *precision discipline* that makes remote prefill trustworthy, and the
 *evidence culture* that keeps all of it honest.
 
+We wrote it the way we worked. When a chapter reaches a real decision, it does
+not hand you the winning answer and move on. It sets up the fork, tells you
+what we tried and what we expected, lets the attempt fail on the page, names
+what the failure taught us — and only then shows what shipped. Put the other
+way round: the dead ends are not confessions tucked into an appendix, they are
+where the reasoning is visible, and they are the whole reason the shipped
+answer deserves your trust instead of merely your patience. Wherever we tell
+you one of those stories, the run that proved it is retained and cited, so you
+can go and check us.
+
 ## How to read this book
+
+You are holding eight parts, and they are not all the same kind of reading.
+Which order, then, and how much do you have to swallow before you are allowed
+to skip around?
 
 **Linearly, the first time.** The chapters build on each other:
 
@@ -48,6 +62,11 @@ once you have read Part I.
 
 ## The measured reality
 
+A book about performance is worth exactly as much as its numbers, so the fair
+question to ask before reading another sentence is: which machine made them,
+under what load, and can anyone else check? We would rather answer that here,
+at the front, than have you wonder about it for eight parts.
+
 All Muser numbers in this book come from the retained evidence of the 2026-08
 campaigns — five-repetition synthetic matrices, the kvpack ladder, the pacing
 ladder, and the qualification wizard runs — recorded in the campaign ledger
@@ -64,6 +83,15 @@ at the pin `[docs/muser-architecture.md]`:
 | kquant/reference | Reference path | kquant, 35.440 tok/s | 107.9 tok/s | Speculative + reference lock |
 | Exact NVFP4 flag | Integer-dot verification producer | Mac NVFP4 | Verification only | Deterministic anchor |
 
+Read that table for its gaps as much as for its throughputs. Only the
+kquant lane carries a speculative number; the fast product lane's speculative
+cell says *rejected (fail-closed)*, which is this engine's way of saying that
+we tried the combination, it did not hold, and the code now refuses it outright
+rather than quietly serving you something weaker under the same name. That
+refusal has a chapter of its own. It is the shape of most stories in this
+book: an attempt we believed in, a measurement that disagreed, and a piece of
+machinery that now says no on purpose.
+
 **The book's recurring question:** *what does one token cost, where does the
 time go, and what may be moved — into a draft model, into a cache, or across
 the wire — without breaking the exactness contract?* Every kernel chapter
@@ -73,6 +101,10 @@ parity-within-noise while rejecting fusions that would change logprobs
 what the evidence actually permits us to believe.
 
 ## The pinned source of truth
+
+Every book written against living code goes stale. The only choice an author
+has is whether it goes stale visibly or invisibly, and a book whose line
+numbers drift silently is worse than no book at all. So we pinned it.
 
 This book is written against one pinned revision of Muser (see
 [PINNED.md](PINNED.md)). When the book and the code disagree, **the code
@@ -101,7 +133,17 @@ zero-to-hero, define-everything-on-first-use, cite-everything — and rebuilds
 the content for Muser's model, lanes, and measured reality. Where a Ferrite
 lesson survives on Muser's live path, the book says so and cites it.
 
+The reason that genealogy matters while you read, rather than only in the
+credits: the ancestor ran a far smaller model on a phone-class chip. Its
+numbers describe a different machine and do not transfer to this one. So when
+an A18 Pro figure appears in these pages it is labelled as ancestry, never as a
+Muser result, and the two never share an unmarked sentence.
+
 ## What this book is *not*
+
+Some promises are easiest to keep as prohibitions. Each of the three below is a
+genre this book could have slid into without anyone noticing, so we named them
+early and held each other to them.
 
 - It is **not** marketing. Every number states what was measured and under
   what scope — device, model, quantization, reps — and cites its receipt.
@@ -109,7 +151,11 @@ lesson survives on Muser's live path, the book says so and cites it.
 - It is **not** a survey of dead ends for their own sake. Rejected designs
   (the linear distributed-speculative lane, native NVFP4 speculative decode
   under Fallback B, the ANE route for v0.1) appear where their *failure*
-  teaches a tradeoff that survives.
+  teaches a tradeoff that survives. When one does appear, it is told as what
+  it was — a fork we walked down, an expectation we were holding, the
+  measurement that ended the argument — and not as a verdict in a list, because
+  a list of verdicts teaches nobody how to make the next decision. The path is
+  as important as the destination.
 - It is **not** speculation. Where a "why" cannot be cited from source or a
   measurement, it is marked **`[unverified]`** rather than smoothed over.
 
@@ -117,7 +163,10 @@ lesson survives on Muser's live path, the book says so and cites it.
 
 Each chapter ends with a **References** section of its own, because a reader
 finishing one kernel chapter should not have to hunt the back of the book.
-Citation tags:
+You will usually meet these tags at the end of a paragraph, or gathered in a
+section's evidence trail, rather than wedged into the middle of a sentence: the
+evidence is not optional, but neither is being readable, and a claim you cannot
+follow is no better cited than one you cannot check. Citation tags:
 
 - `[crates/.../file.rs:LINE]` — Muser source, pinned revision.
 - `[docs/<file>.md]` — Muser engineering documents.
@@ -134,7 +183,9 @@ Citation tags:
 
 ## Status of each chapter
 
-Chapters carry a status line at the top:
+The book is written in passes, and we would rather admit which pass a chapter
+is in than let you assume it has been checked. So every chapter declares itself
+before it says anything else — a status line at the top:
 
 - **`status: polished`** — reviewed, citable, ready to read.
 - **`status: draft`** — written, not yet through review passes.
@@ -150,3 +201,8 @@ installed, `mdbook build` and `mdbook serve` work out of the box
 built without the repository's `_research/` working artifacts, which sit
 outside `src/` by design). GitHub Pages deploys on every push to `main`
 via `.github/workflows/pages.yml`.
+
+That is the apparatus — the scope, the machines, the pin, the tags. The rest of
+the book is the walk itself, and Part I starts where the work started: with the
+question of where a token's time actually goes, and the discovery that the
+answer has almost nothing to do with arithmetic.

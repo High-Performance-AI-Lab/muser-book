@@ -31,12 +31,20 @@ obey one rule stated once and enforced everywhere: the receiver must hold
 
 ## 26.2 The shallow cell: half-cached, half the bytes
 
-The first measured delta cell was shallow and almost arithmetic-pure: hold
-a 1,024-token prefix, request 2,048. The wire moved **49.98 %** of the
-full-handoff bytes and the decode was bit-exact `[ledger T-series
+Before trusting a delta anywhere deep, we wanted a cell small enough to
+check by hand — one where the arithmetic predicts the answer in advance, so
+that a surprise in the measurement would be a real surprise and not a
+mystery of scale. The first delta cell was therefore deliberately shallow:
+hold a 1,024-token prefix, request 2,048. The question put to it was blunt.
+How much of the wire does a half-cached prompt actually save, and does what
+comes out of the machine change?
+
+The wire moved **49.98 %** of the full-handoff bytes and the decode was
+bit-exact. We kept the run that proved it `[ledger T-series
 "Delta-only prefill (W3)"; receipt nvfp4-pacing8g-20260818/delta-wrapper7/]`,
-carried in the claims register as "the original half-cached 2,048-token
-cell moved 49.98% of full bytes and decoded bit-exactly" `[claims #12]`.
+and the claims register carries the sentence it became: "the original
+half-cached 2,048-token cell moved 49.98% of full bytes and decoded
+bit-exactly" `[claims #12]`.
 
 Why 49.98 and not the naive 50.0 %? Derive it with [Ch 22](22-the-price-of-context.md)'s
 formula, remembering one convention from [Ch 23](23-the-swa-ring-and-the-growing-cache.md):
@@ -48,9 +56,20 @@ that changes) — and the payload is the suffix's NoPE rows plus the suffix's
 SWA rows, one token short: 49.98 %, the suffix share at that geometry
 `[measured-numbers §1d]`. The cell's value is not the number, which
 arithmetic predicts; it is the *bit-exact decode* — proof that skipping
-1,024 tokens of prefill on the wire changes nothing downstream.
+1,024 tokens of prefill on the wire changes nothing downstream. Said the
+other way round: a receiver handed only the suffix emitted, token for token,
+what a receiver handed the whole cache would have emitted. Half the bytes
+bought the same answer.
 
 ## 26.3 The deep cell: 32,768 of 65,536, measured to the byte
+
+The shallow cell proved the mechanism. It could not prove the mechanism
+survives depth, and there were two ways it might not. The saving could decay
+once the suffix grows longer than the sliding window, where a delta stops
+being a clean suffix and starts overlapping state the receiver already holds
+a version of. And bit-exactness could rot quietly over a context long enough
+that a single stale row would change a token far downstream. Both risks
+needed a witness deep enough to expose them, judged against a control.
 
 Stage 6 of the kvpack ladder ran the deep witness: hold a 32,768-token
 prefix, request 65,536, and compare a delta handoff against a full-handoff
@@ -90,9 +109,14 @@ delta:
                                                           total 517,983,232 B  ✓
 ```
 
-Now the detail that makes the deep cell interesting rather than trivial:
-the delta (517,983,232 B) is *larger* than `full − prefix` (436,194,304 B)
-— by exactly one SWA window, 81,788,928 B. The held prefix's rings contain
+Here is where the arithmetic we walked in with turned out to be wrong. If a
+delta ships "the part the receiver does not already have," then its payload
+should weigh `full − prefix`, and that is what we expected the table to say.
+It does not. The delta (517,983,232 B) is *larger* than that difference
+(436,194,304 B) — by exactly one SWA window, 81,788,928 B, far too round a
+discrepancy to be noise.
+
+The reason is positional. The held prefix's rings contain
 the window at the *prefix's* tail, positions [30,720, 32,768); the finished
 context needs the window at [63,488, 65,536) — different tokens, and on
 RoPE layers different bytes ([Ch 23 §23.5](23-the-swa-ring-and-the-growing-cache.md):
@@ -102,6 +126,13 @@ when the suffix exceeds it" `[docs/kvpack-merge-handoff §6]`. So at this
 geometry the delta ships a *full new window* plus the NoPE suffix, which
 happens to land within 13,312 B (one NoPE token) of the prefix arm's size —
 a coincidence of the 50 %-cut geometry, not a law.
+
+The lesson we took from the miss is worth stating on its own, because it is
+the idea in this chapter most likely to be mis-generalized: a delta is not a
+subtraction. It is a *re-derivation* of the span the finished context needs,
+and whenever the suffix outruns the sliding window, the window is part of
+that span again — freshly rotated, freshly shipped, no matter how much of it
+the receiver appears to hold already.
 
 And the register's caveat, carried verbatim in substance because it is the
 difference between an engineering fact and a product claim: **"Do not
@@ -114,10 +145,17 @@ unsealed engineering evidence, like everything in this book
 
 ## 26.4 Arming a delta: the ladder decides, admission enforces
 
-The runtime path from "a prompt arrives on the remote lane" to "delta" has
-two halves: the reuse ladder classifies the hit, then the handoff admission
-verifies the cut. The ladder's classifier is small enough to read whole —
-note the boundary-token convention and the alignment rule:
+Bytes on a wire were the easy half. The harder question is asked at request
+time, in the moment before anything is skipped: is this delta *legal*? What
+breaks if the answer is wrong is not a slow request — it is a fast and
+plausible one, a session decoding against a prefix that is not the prefix it
+believes it holds, with nothing anywhere raising a hand about it.
+
+Muser answers the question twice, deliberately. The runtime path from "a
+prompt arrives on the remote lane" to "delta" has two halves: the reuse
+ladder classifies the hit, then the handoff admission verifies the cut. The
+ladder's classifier is small enough to read whole — note the boundary-token
+convention and the alignment rule:
 
 ```rust
 // crates/muser-kvpack/src/reuse.rs:25
@@ -186,23 +224,41 @@ fn validate_prefix_cut(&self, manifest: &BeginManifestV2) -> kvpack_handoff::Res
 "Admission remains fail-closed on exact held identity, aligned nonempty
 suffix, and span schedule" `[claims #12]` — the held tokens are compared
 element-by-element against the manifest's prompt; a one-token disagreement
-refuses. The span schedule itself is derived, not negotiated:
+refuses.
+
+That two-step is the point, so it is worth saying in the other vocabulary as
+well. Arming is a *proposal*: the ladder looks at what the session appears
+to hold and says this could be a delta. Admission is the *proof*: it makes
+the proposal earn the skip against the actual token ids. Because the check
+lives at admission rather than at arming, a wrong guess upstream costs a
+full transfer — the expensive outcome — instead of a wrong answer, the
+unrecoverable one.
+
+The span schedule itself is derived, not negotiated:
 `muse_schedule_span_for` (`schedule.rs:91-130`) computes the NoPE tiles
 over `[prefix_cut, position)` in 512-token steps and places the SWA span at
 `position − 2,048` clamped to the cut — the exact decomposition §26.3
-reconciled to the byte. One more honest wart from the format audit: the
-typed `BeginManifestV2` still drops `prefix_cut`, so it travels as raw JSON
-lifted at the frame boundary (`transport.rs:35-46`) and "delta handoff
+reconciled to the byte.
+
+One more honest wart from the format audit, and it earns its place here
+because it decides who is allowed to originate a delta at all: the typed
+`BeginManifestV2` still drops `prefix_cut`, so the field travels as raw JSON
+lifted at the frame boundary (`transport.rs:35-46`), and "delta handoff
 (`ArmDelta`, 256-aligned cuts) has a Python-only producer"
-`[docs/kvpack-merge-handoff §3 F1]` — cross-verification paying its
-maintenance tax.
+`[docs/kvpack-merge-handoff §3 F1]`. Keeping two implementations honest
+about one format is what makes the format trustworthy; this is the
+maintenance tax that cross-verification charges for it.
 
 ## 26.5 Session migration: moving the whole asset, two-phase
 
 Delta handoff moves the *new* part of a cache. Migration moves the *whole*
 session — target KV, DFlash state, sampler/RNG, replay messages, vision
-rows, revision — between machines, and it is specified in the architecture
-doc in five sentences that are effectively the protocol:
+rows, revision — between machines. Ask of it the question the last section
+asked of arming: what breaks if this goes wrong? Not throughput. The failure
+that matters is a session that ends up existing twice, or not at all,
+because a machine died in the window between "sent" and "kept". Everything
+below is shaped by that one crash, and the architecture doc lays out the
+protocol in five sentences:
 
 > Migration is two phase. Decode-node copy/move uses authenticated HTTPS
 > between identically qualified Muser decoders; storage-tier copy/move uses
@@ -248,9 +304,16 @@ server.logical_sessions.update_transfer(transfer_id, "destination_committed", No
 model, tokenizer, template, layout-ABI, DFlash, and vision digests
 (`InternalTransferPrepare`, `:3979-3997`; `session_identity` at `:4318-4343`),
 the same identity family [Ch 24](24-kvpack-the-format.md) sealed into every
-pack. A destination that cannot match them refuses. And the ambiguity rule
-is explicit in code: if the upload or commit errors, the source *reconciles
-by querying the destination's transfer status* and accepts a
+pack. A destination that cannot match them refuses.
+
+Now the crash the whole design is built around. Suppose the payload uploads
+and the commit reply never comes back. From the source's side, "it never
+landed" and "it landed and the acknowledgement was lost" look identical, and
+each of the two guesses destroys something: assume failure and you may keep
+a session that now lives on two machines, assume success and you may delete
+the only copy. So the source is not allowed to guess. The ambiguity rule is
+explicit in code: if the upload or commit errors, the source *reconciles by
+querying the destination's transfer status* and accepts a
 `"committed"` verdict from there (`:4480-4491`, via
 `GET {destination}/v1/session-transfers/{id}`, `:4380-4392`); failures
 record status `"ambiguous"` unless the record already shows
@@ -259,8 +322,11 @@ record status `"ambiguous"` unless the record already shows
 end, idempotently (`session_transfer_get`, `:3960-3977`) — after an
 ambiguous failure, the answer to "did it land?" is a lookup, not a guess.
 
-**Storage tier.** The destination is an *enrolled* node, and enrollment is
-verified before anything moves: the registry entry must be healthy under
+**Storage tier.** The same crash, against a weaker partner: the destination
+here is not a peer running the transfer protocol but a filesystem on an
+enrolled node, reached through pinned shell fragments. Everything therefore
+has to be recoverable by re-running it. The destination is an *enrolled*
+node, and enrollment is verified before anything moves: the registry entry must be healthy under
 enrollment v2 with a live HMAC epoch (`enrolled_storage_node`,
 `:4540-4559`). The remote side runs pinned shell fragments — prepare
 (mkdir, chmod 700, sync), commit (verify byte count and SHA-256, then
@@ -291,10 +357,12 @@ to receive a decode session `[docs/muser-architecture.md]`.
 
 **Delta vs full handoff.** Measured: 54.2851 % of full bytes at the deep
 cell with exactly-equal output SHA, 49.98 % at the shallow cell
-`[claims #12; ledger stage 6]`. Unmeasured and unbought: resumability —
-the format has "no offset/resume/retry vocabulary … the only partial-work
-mechanism is `prefix_cut` at BEGIN," so a dropped 1.82 GB transfer restarts
-from zero `[docs/kvpack-merge-handoff §3 F3]`. The register's caveat stands
+`[claims #12; ledger stage 6]`. Unmeasured and unbought: resumability.
+Ask what happens when a deep transfer drops most of the way through, and the
+format has no answer to give — it carries "no offset/resume/retry vocabulary
+… the only partial-work mechanism is `prefix_cut` at BEGIN," so a dropped
+1.82 GB transfer restarts from zero `[docs/kvpack-merge-handoff §3 F3]`. The
+cut is a place to begin, never a place to resume. The register's caveat stands
 guard on the interpretation: wire savings are proven, producer-compute
 savings are not `[claims #12]`.
 

@@ -12,13 +12,21 @@
 
 ## 16.0 First: which kernel actually runs — the route ladder
 
-There is no single attention kernel on Muser's decode path. There are four
-routes, selected **per layer, per token** by predicates computed after the
-ring `append` of [Ch 15](15-kv-store-and-the-ring.md). Presenting any one
-of them as *the* decode attention kernel would be this book's fastest way
-to lie to you — the ancestor book made exactly that mistake once and
-corrected it in public `[ferrite-book Ch 15]`. Here is the selection code,
-verbatim, from the middle of `encode_token`:
+The previous chapter left the keys and values sitting in the cache:
+appended, addressable through explicit origins, and so far unread. This
+chapter is where something finally reads them back. The natural way to
+write it would be to open the engine, find the attention kernel, and walk
+you through it line by line.
+
+That is the one thing we cannot honestly do. There is no single attention
+kernel on Muser's decode path. There are four routes, selected **per
+layer, per token** by predicates computed after the ring `append` of
+[Ch 15](15-kv-store-and-the-ring.md). Presenting any one of them as *the*
+decode attention kernel would be this book's fastest way to lie to you,
+and it is a lie with precedent: the ancestor book made exactly that
+mistake once and had to correct it in public `[ferrite-book Ch 15]`. So
+we start where the engine starts — with the code that chooses. Here is
+the selection, verbatim, from the middle of `encode_token`:
 
 ```rust
 // crates/muser-engine/src/decode.rs:5643
@@ -86,7 +94,16 @@ mathematically equivalent compact permutation"
 narrates reads the ring directly. Two graphs, two answers to the same
 question — the recurring Part IV pattern.
 
+It is worth flagging that distinction now, before a single kernel: the
+gap between *the same answer* and *the same floating-point answer* is the
+hinge every route decision in this chapter turns on. Keep it in view; it
+comes back as the sharpest tradeoff at the end.
+
 ## 16.1 What attention computes — from zero
+
+We have just watched four routes argue with each other without saying
+what any of them computes. They all compute the same thing, so it is
+worth building that thing from nothing before we look at a kernel again.
 
 Everything else in the transformer operates on **one** token's vector.
 [Attention](../glossary.md#attention) is the one operation that reaches
@@ -162,8 +179,13 @@ numerator and denominator) and numerically mandatory — `exp(200)` is
 
 ## 16.2 Online softmax — the running-max table
 
-Materializing all `visible` scores and then doing softmax in a second pass
-(the ancestor's score-buffer design) costs a buffer sized by context. The
+The formula we just wrote has an inconvenient property: its denominator
+sums over *every* score, so no weight can be finalized until the last
+token has been seen. What does a kernel do about that? The literal answer
+is to keep everything. Materializing all `visible` scores and then doing
+softmax in a second pass (the ancestor's score-buffer design) costs a
+buffer sized by context — comfortable at short depth, and a cost that
+grows with exactly the thing you want to grow. The
 flash/online formulation instead keeps three running quantities per worker
 — max `M`, denominator `S`, accumulator `O` — and folds each new score in:
 
@@ -200,6 +222,16 @@ one multiply.* Two workers each running this over half the tokens merge
 the same way — each is a "token" whose `(M, S, O)` combines with the
 other's — which is how the split across SIMD groups and workgroups below
 stays exact.
+
+Say that the other way round, because it is the load-bearing idea of the
+whole chapter. The triple `(M, S, O)` is a *complete summary* of every
+token a worker has looked at; nothing else about those tokens is ever
+needed again. So attention can be cut into arbitrary pieces, chewed in
+any order, on any number of workers, and reassembled with no
+approximation anywhere. That single property is what lets three different
+kernels share one mathematics while disagreeing about nearly everything
+else — and, as we will see, it is also what makes them disagree in the
+last bits of the result.
 
 ## 16.3 GQA 32:2 — sixteen query heads per KV head
 
@@ -252,11 +284,22 @@ address.)
 
 ## 16.5 The kernels — three rungs, one math
 
+The rungs come in teaching order here, not in the order the predicates
+test them. Muser's own splitk pair goes first, because its source is in
+the tree and it wears the online-softmax table on its sleeve. Then the
+pinned llama kernel that outranks it wherever bit-parity is the contract.
+Then the ferrite-lineage pair that catches NoPE layers when the metallib
+is missing. Read the first rung as the reference implementation and the
+other two as departures from it: everything that differs between them —
+who owns the reduction order, who reads the current token, who can
+address a wrapped ring — falls out of the situation each was built for.
+
 ### 16.5.1 The Muser splitk producer + reducer (SWA fallback)
 
-The default SWA route whenever the pinned vec path is not eligible, and
-the clearest exhibit of §16.1–16.2 in code. The producer — grid
-`(n_heads, n_workgroups)`, threadgroup `(32, n_simdgroups)`:
+This is the default SWA route whenever the pinned vec path is not
+eligible, and the clearest exhibit of §16.1–16.2 in code. The producer's
+grid is `(n_heads, n_workgroups)` and its threadgroup is
+`(32, n_simdgroups)`:
 
 ```metal
 // crates/muser-engine/src/shaders/muse_reference.metal:1052
@@ -358,10 +401,16 @@ Figure 16.2 merge.)* The anatomy:
 - **Partials `[max, sum, weighted-V]`** — one per (head, workgroup),
   stride `2 + 128` floats (`attn.rs:742-743`).
 
-The geometry comes from `splitk_geometry` (`attn.rs:888-896`): blocks of
-32 visible tokens, workgroups capped at
+Where do the workgroup and SIMD-group counts come from, and why cap them
+at all? `splitk_geometry` (`attn.rs:888-896`) answers the first half:
+blocks of 32 visible tokens, workgroups capped at
 `MAX_DECODE_SPLIT_WORKGROUPS = 32`, SIMD groups growing 1→4 as visibility
-demands — and the cap's comment is measured honesty about its cost:
+demands. The second half is a fork we lost. The geometry inherited from
+Ferrite put occupancy first and capped workgroups far above llama's fixed
+launch, on the reasonable theory that more resident work hides more
+latency. On the deep, growing planes it did the opposite: the extra
+workgroups arrived with too little to chew on. The comment on the
+constant records the result in the codebase's own words:
 
 ```rust
 // crates/muser-engine/src/decode.rs:41
@@ -373,16 +422,35 @@ demands — and the cap's comment is measured honesty about its cost:
 pub(crate) const MAX_DECODE_SPLIT_WORKGROUPS: usize = 32;
 ```
 
-The reducer then merges the workgroup partials with the same
-`(M, S, O)` combine — `correction = exp(part[0] − global_max)`,
-`global_sum += part[1] * correction`, accumulate the weighted values,
-divide once (`muser_attention_decode_splitk_reduce_f16`'s sibling
-`muser_attention_decode_splitk_reduce_f32`,
-`muse_reference.metal:1169-1201`, dispatched at `attn.rs:776-783` with a
-barrier scoped to the partials buffer alone — "instead of stalling every
-buffer used by the 52-layer command buffer", `attn.rs:771-773`).
+Read that comment twice. One half is the setting we shipped and the
+llama launch rule it now matches. The other half is a confession: the
+earlier cap oversubscribed the deep planes, and what we still lose to
+llama as context grows is named out loud, in the source, as rent. Nobody
+had to write that second half down — a tidier codebase would have left it
+in a commit message nobody reads. Muser's house style is that the deficit
+lives next to the constant that causes it.
+
+The reducer then finishes the job the producer deliberately left open.
+Each workgroup handed up a partial, and the reducer merges those partials
+with exactly the combine the producer used inside its own blocks:
+`correction = exp(part[0] − global_max)`, then
+`global_sum += part[1] * correction`, then accumulate the weighted
+values, then divide — once, at the very end. That final single divide is
+why the producer normalized nothing along the way: an early
+normalization would only have to be undone. The code is
+`muser_attention_decode_splitk_reduce_f32`, sibling of
+`muser_attention_decode_splitk_reduce_f16`
+(`muse_reference.metal:1169-1201`), dispatched at `attn.rs:776-783`. One
+detail there is worth stealing for your own encoders: the barrier before
+it is scoped to the partials buffer alone, "instead of stalling every
+buffer used by the 52-layer command buffer" (`attn.rs:771-773`).
 
 ### 16.5.2 The pinned llama vec kernel — `kernel_flash_attn_ext_vec_f16_dk128_dv128`
+
+Why would an engine that has a perfectly good attention kernel of its own
+hand two of its four routes to somebody else's binary? Park the question
+through the bullets; the answer arrives at the end of the section, and it
+is not about speed.
 
 The vec-eligible routes dispatch llama.cpp's own flash-attention decode
 kernel from the pinned metallib. Like [Ch 13](13-the-qkv-gate-matvec-family.md)'s
@@ -405,30 +473,44 @@ quoted here — and what Muser owns is a meticulously shaped dispatch
   predicate avoids needing on the token-major plane, where llama's pad
   kernel "would read past" the wrong-shaped row (`decode.rs:5654-5657`).
 
-The pinned-vs-own distinction here is not performance vanity: the parity
-ledger's Stage A close-out records that llama's vec kernel "uses an
+Now the parked question. The pinned-vs-own distinction is not performance
+vanity — nobody clocked llama's kernel as faster and surrendered. It is
+arithmetic identity. The parity ledger's Stage A close-out records two
+findings that close the door together: llama's vec kernel "uses an
 intentionally different reduction DAG" than any Muser/Ferrite kernel, and
-that "no untried llama scheduling transplant [was] compatible with the
-fixed production hash" `[ledger, Stage A close-out]`. Matching llama's
-bits meant adopting llama's kernels on the routes where llama runs them.
+"no untried llama scheduling transplant [was] compatible with the fixed
+production hash" `[ledger, Stage A close-out]`. Read them side by side —
+you cannot reschedule your way to llama's bits, and the hash that defines
+production will not move to meet you. Matching llama's bits meant
+adopting llama's kernels on the routes where llama runs them.
 
 ### 16.5.3 The ferrite interleaved fallback (NoPE)
 
-When the vec route is not eligible on a NoPE layer, the ladder falls to
-the ferrite-lineage pair `flash_attn_decode_vec_f16_gqa_interleaved`
-(`shaders/ferrite/flash_attn_decode_vec_contiguous_f16.metal:494`) +
-`flash_attn_decode_reduce_v2`
-(`shaders/ferrite/flash_attn_decode_reduce_v2.metal:4`) — "Exact Ferrite
+The last rung catches the case neither of the others can: a NoPE layer
+with no eligible vec route. Here the ladder falls to a ferrite-lineage
+pair kept deliberately unmodified — the producer
+`flash_attn_decode_vec_f16_gqa_interleaved`
+(`shaders/ferrite/flash_attn_decode_vec_contiguous_f16.metal:494`) and
+the reducer `flash_attn_decode_reduce_v2`
+(`shaders/ferrite/flash_attn_decode_reduce_v2.metal:4`). The wrapper
+states the terms of that inheritance in one line: "Exact Ferrite
 a85048a90 cache-interleaved producer + LSE reducer for the growing NoPE
 planes. These planes are head-major and never wrap; SWA rings remain on
-Muser's explicit-origin kernel" (`attn.rs:185-187`). Its signature is the
-prelude ABI (function constants bake `head_dim = 128` and the SIMD-group
-count at PSO build, `encode.rs:798-835`); its grid is
-`(n_heads, n_workgroups)` with *sibling* Q heads launch-adjacent — the
-"schedule-only interleaved sibling" of its own header
-(`…contiguous_f16.metal:487-493`) — and each workgroup merges its
-SIMD groups into one legacy `[M, S, O]` partial that `reduce_v2` combines
-with the same `precise::exp(p[0] − global_max)` correction of §16.2. (The
+Muser's explicit-origin kernel" (`attn.rs:185-187`). That is a division
+of labour, not a preference: the ferrite pair is trusted exactly where
+the plane's shape matches the assumption it was written under, and
+nowhere else.
+
+Its signature is the prelude ABI — function constants bake
+`head_dim = 128` and the SIMD-group count into the pipeline at PSO build
+(`encode.rs:798-835`). Its grid is `(n_heads, n_workgroups)`, launched so
+that *sibling* Q heads land adjacent; its own header calls this a
+"schedule-only interleaved sibling" (`…contiguous_f16.metal:487-493`),
+and "schedule-only" is the load-bearing half of that phrase — the
+interleaving changes which head runs beside which, never what any of them
+computes. Each workgroup then merges its SIMD groups into one legacy
+`[M, S, O]` partial, and `reduce_v2` combines those with the same
+`precise::exp(p[0] − global_max)` correction of §16.2. (The
 "LSE" in that quoted header is log-sum-exp — the `(M, S, O)` statistics of
 §16.2 under their textbook name.)
 
@@ -446,7 +528,11 @@ the engine.
 
 ## 16.6 The Rust dispatch — the ladder in one table
 
-From `encode_token`, the four call sites the predicates choose between:
+Everything above lands in four call sites in `encode_token`, one per
+rung. Read the table as the ladder seen from the encoder — and read the
+last column first, because that is where the previous chapter's store and
+this chapter's read have to be ordered against each other, and each route
+answers that differently:
 
 | route | wrappers (file:line) | kernels | barrier between store and attention? |
 |---|---|---|---|
@@ -455,12 +541,23 @@ From `encode_token`, the four call sites the predicates choose between:
 | NoPE vec | `encode_kv_store_batch_f16` `attn.rs:787` + vec wrapper | `muser_kv_store_batch_f16` → pinned vec + reduce | yes (`decode.rs:5746-5747`) |
 | NoPE fallback | `encode_ferrite_attention_decode_interleaved_f16` `attn.rs:189` | ferrite interleaved (fused store) → `reduce_v2` | fused (`…contiguous_f16.metal:534-543`) |
 
+That last column is the fused-versus-staged argument compressed into four
+cells. Three routes store the row and then read it back, so they need an
+ordering guarantee — a full barrier, or the narrow one scoped to the
+partials. The ferrite rung needs neither, because the value never leaves
+the kernel that produced it.
+
 The vec wrapper call itself carries the whole story in its argument list —
 `visible`, `capacity`, `origin_physical`, `head_major`, the pad and
 partials scratch — `decode.rs:5671-5692` (SWA, `head_major = false`) and
 `decode.rs:5748-5769` (NoPE, `head_major = true`).
 
 ## 16.7 The access pattern — when attention starts to matter
+
+Now the question this chapter owes the bandwidth story: at what context
+length does attention stop being a rounding error and become the thing
+that costs? The derivation is short enough to do in full, so do it in
+full rather than trusting anyone's intuition about it.
 
 Per token per layer, the attention read is the visible window's KV:
 `visible × n_kv_heads × 2 planes × head_dim × 2 B = visible × 1,024 B`
@@ -492,21 +589,36 @@ the byte budget.
 
 ## 16.8 Tradeoffs
 
-**A ladder, not a kernel — and the evidence for each rung.** The
-ancestor's position ladder was ground-truthed by route logging and then
-corrected once `[ferrite-book Ch 15]`; Muser's ladder predicates are in
-source, and the campaign's evidence for the pinned rung is the J-series
-itself: transplanting llama's attention DAG bit-exactly was what moved
-decode from 0.781× (single-sample, 2026-08-14) toward the six-depth
-matrix above parity `[ledger, Arc 1]`. The one-query GQA FA2
-specialization measured 28.290 tok/s median vs llama's 33.428
-(0.8463×) on the streamed diagnostic while the route question was open
-`[docs/decode-dispatch-gap-20260815.md §Landed and rejected reductions]`
-— banked as evidence, not shipped as a claim. The ladder exists because
-*each rung is the exact kernel for its situation*: llama's for
-parity-critical contiguous reads, Muser's splitk for wrapped rings the
-pinned kernel cannot address, ferrite's for the growing head-major planes
-without the metallib.
+**A ladder, not a kernel — and the evidence for each rung.** The ancestor
+faced this same question and got it wrong first: its position ladder was
+ground-truthed by route logging and then corrected once
+`[ferrite-book Ch 15]`. Muser's ladder is at least legible, since the
+predicates are in source and quoted at the top of this chapter. Legible
+is not the same as justified, though, so here is how the rungs earned
+their places.
+
+The fork came while the route question was still open and attention was
+the prime suspect for the decode gap. The attractive move was to
+*specialize*. Decode issues exactly one query, so a one-query GQA FA2
+kernel ought to beat a general flash-attention kernel that is still
+carrying prefill's machinery around with it. We wrote that kernel
+and ran it on the streamed diagnostic, fully expecting the specialist to
+win. It came in at 28.290 tok/s median against llama's 33.428 — a ratio
+of 0.8463×, the specialist losing to the generalist it was built to
+beat. We kept the measurement: it sits in the landed-and-rejected table
+`[docs/decode-dispatch-gap-20260815.md §Landed and rejected reductions]`,
+banked as evidence rather than shipped as a claim.
+
+What the loss taught is that the kernel's *shape* was never the lever.
+The lever was the reduction order — and the only way to get llama's
+reduction order is to run llama's kernel. Transplanting the attention DAG
+bit-exactly is what moved decode from 0.781× (single-sample, 2026-08-14)
+toward the six-depth matrix above parity `[ledger, Arc 1]`. So the ladder
+is neither a hedge nor an accident of history. It exists because *each
+rung is the exact kernel for its situation*: llama's for parity-critical
+contiguous reads, Muser's splitk for wrapped rings the pinned kernel
+cannot address, ferrite's for the growing head-major planes without the
+metallib.
 
 **Wrapped-ring vec read vs staging — mathematical validity vs bit-parity.**
 §16.0's full-ring clause is sound mathematics (permutation-invariant
@@ -518,7 +630,9 @@ groups that decision costs live in the gap accounting (§16.9). This is
 the book's exactness-vs-equivalence distinction at its purest: two
 routes with identical softmax outputs in exact arithmetic, one of which
 reproduces llama's floating-point reduction order and one of which does
-not.
+not. Put plainly, serving pays dispatch groups for an answer it already
+had — because it needs that answer to arrive in llama's order, not
+merely to be correct.
 
 **Splitk's own kernel vs pinned-everything.** Why keep a Muser-owned
 attention kernel at all when the metallib is loaded? Because the pinned
@@ -542,9 +656,11 @@ codebase's house style; the rent itself is the kind of measured deficit
 
 ## 16.9 Where the gap lives
 
-Two families again, plus one experiment. The **52 KV-publication splits**
-— store dispatch + attention dispatch as separate closures in production —
-are "session/publication structure; Keep" `[docs/decode-dispatch-gap-20260815.md]`:
+Which of this chapter's dispatches actually show up in the decode-gap
+accounting, and could any of them be removed? Two families again, plus
+one experiment. The **52 KV-publication splits** — store dispatch +
+attention dispatch as separate closures in production — are
+"session/publication structure; Keep" `[docs/decode-dispatch-gap-20260815.md]`:
 combining the closures would not remove either kernel's math, and the
 splits are what make the pinned-kernel-per-route discipline auditable.
 The **39 SWA staging groups** are this chapter's wrapped-ring story —

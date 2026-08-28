@@ -28,16 +28,20 @@ client as ordinary HTTP).
 
 ## 37.1 The public serving surface
 
-The active router is one Axum `Router` construction
-[crates/muser-server/src/axum_httpd.rs:487-559], and the architecture
+Before the route list, the question the route list answers: what can a client
+ask this process to do, and which of those asks are dangerous? Muser keeps
+that answer in one place. The active router is a single Axum `Router`
+construction [crates/muser-server/src/axum_httpd.rs:487-559] — the entire
+reachable surface written down in one span of one file, which is itself the
+chapter's first design decision. The architecture
 document describes it as "the frozen llama-compatible completion, chat,
 tokenizer/template, embedding, slot, model/property, and health routes; the
 Ollama-compatible `/api/generate` and `/generate` aliases; logical session
 and migration routes; `/snapshot` JSON; `/metrics` Prometheus text;
 authenticated `/stream` WebSocket telemetry; and temporary `/telemetry` SSE
-keyframes" `[docs/muser-architecture.md §Public serving surface]`. Enumerated
-with one-line purposes, grouped by role, paths exactly as routed
-(Table 37.1):
+keyframes" `[docs/muser-architecture.md §Public serving surface]`. Table 37.1
+enumerates it with one-line purposes, grouped by role, paths exactly as
+routed:
 
 | Routes | Purpose |
 |---|---|
@@ -74,15 +78,27 @@ router alone gets `DefaultBodyLimit::disable()`, a one-hour body timeout, and
 `ConcurrencyLimitLayer::new(4)` [crates/muser-server/src/axum_httpd.rs:544-554].
 Unbounded bodies exist only on the migration lane, four at a time.
 
+Why split the router rather than simply raise the limit? Because a session
+bundle can legitimately be enormous while a chat request never is, and a
+single ceiling generous enough for the first is an invitation on the second.
+Splitting the router lets the dangerous lane be dangerous in isolation: its
+own body policy, its own timeout, its own concurrency, and — because it is a
+different router — no way for an ordinary request to wander onto it.
+
 ## 37.2 Strict framing: unknown fields are errors
 
-Every request DTO in the server carries `#[serde(deny_unknown_fields)]` —
-`SlotSnapshot` [crates/muser-server/src/state.rs:504-510],
-`CreateSessionRequest` [crates/muser-server/src/axum_httpd.rs:3606-3610],
-`SlotActionRequest` [axum_httpd.rs:1074-1080], `OllamaOptions`
-[axum_httpd.rs:2324-2326], and the rest. A misspelled field is a 400, not a
-silently ignored value. Content types are likewise exact — the check is
-literal string equality:
+What should a server do with a field it does not recognize? The permissive
+answer — ignore it, keep going — is the one most JSON APIs give, and it is
+how a client ships a typo into production and runs it for a year without
+anyone noticing. Muser gives the other answer. Every request DTO in the
+server carries `#[serde(deny_unknown_fields)]`, so a misspelled field is a
+400, not a silently ignored value. The receipts are spread across the DTO
+definitions themselves: `SlotSnapshot`
+[crates/muser-server/src/state.rs:504-510], `CreateSessionRequest`
+[crates/muser-server/src/axum_httpd.rs:3606-3610], `SlotActionRequest`
+[axum_httpd.rs:1074-1080], `OllamaOptions` [axum_httpd.rs:2324-2326], and the
+rest. Content types are likewise exact — the check is literal string
+equality:
 
 ```rust
 // crates/muser-server/src/axum_httpd.rs:4838-4843
@@ -100,12 +116,24 @@ contract" `[docs/muser-architecture.md §Public serving surface]`. This is
 fail-closed parsing — the same instinct as the engine refusing an unknown
 producer recipe at enrollment — applied to JSON.
 
+The trade is worth stating in the other direction too, because it is the
+whole argument for strictness anywhere. A rejected request is a bug report
+delivered instantly, to the person who can still fix it, while the request is
+still in their hands. An ignored field is the same bug report delivered
+months later by someone whose output was quietly wrong the entire time and
+who now has to work out which of the two systems lied.
+
 ## 37.3 Stateful generation: the 409 protocol
 
-Chat completions can be *stateless* (the full conversation rides every
-request) or *stateful* (the server keeps the frontier). Stateful generation
-is opt-in by supplying three things together — and the "together" is
-enforced:
+Now the harder question, and the one that decides whether a server can be
+trusted with a conversation at all: where does the conversation live? Chat
+completions can be *stateless* (the full conversation rides every request) or
+*stateful* (the server keeps the frontier). Statefulness buys you not
+resending the transcript on every turn. It costs you the entire problem of
+concurrent writers — two clients, or one client and its own retry, both
+believing they are the next turn — and the rest of this section is Muser
+paying that bill in full. Stateful generation is opt-in by supplying three
+things together, and the "together" is enforced:
 
 ```rust
 // crates/muser-server/src/openai.rs:1413-1428
@@ -128,10 +156,13 @@ let stateful = match (
 };
 ```
 
-A **session ID**, an **expected revision** (a monotone counter), and an
-**Idempotency-Key** (plus a canonical SHA-256 of the request body, computed
-by the handler [crates/muser-server/src/axum_httpd.rs:3179-3186]). Any one
-without the others is a bad request. Then the store's `begin` runs the
+Three things: a **session ID**, an **expected revision** (a monotone
+counter), and an **Idempotency-Key**. A fourth rides along that the client
+never sends — a canonical SHA-256 of the request body, which the handler
+computes for itself rather than trusting a client to describe its own request
+[crates/muser-server/src/axum_httpd.rs:3179-3186]. Any one of them without
+the others is a bad request; there is no half-stateful mode to slip into by
+accident. Then the store's `begin` runs the
 admission logic, and every failure mode in it is a **409 Conflict**
 (`ChatError::Conflict` maps to 409 [crates/muser-server/src/openai.rs:656,
 668]):
@@ -169,18 +200,27 @@ key with a *different* request is refused; a key is a commitment.
 **Busy**: one mutation per session at a time. **Revision**: an
 optimistic-concurrency compare — the client must state which revision it
 believes it is extending, and a mismatch is a conflict, never a merge.
-`commit` then atomically advances `revision = expected_revision + 1` under
-the registry lock and files the idempotency record
-[crates/muser-server/src/session_store.rs:385-409] (the per-session
-idempotency map is bounded at 64 entries, cleared wholesale on overflow —
-bounded everything, again). At most **64 logical sessions** are tracked
-(`MAX_LOGICAL_SESSIONS` [crates/muser-server/src/session_store.rs:14];
-`[docs/muser-architecture.md §Context and sessions]`).
+Only after all three guards pass does the mutation happen: `commit`
+atomically advances `revision = expected_revision + 1` under the registry
+lock and files the idempotency record
+[crates/muser-server/src/session_store.rs:385-409].
+
+Two ceilings sit on top of this machinery, and neither is an accident. The
+per-session idempotency map is bounded at 64 entries and cleared wholesale
+on overflow — a memory of retries, not a permanent log. And at most **64
+logical sessions** are tracked at once (`MAX_LOGICAL_SESSIONS`
+[crates/muser-server/src/session_store.rs:14];
+`[docs/muser-architecture.md §Context and sessions]`). Bounded everything,
+again; the rest of the bounds are swept into one table later in the chapter.
 
 ## 37.4 The session bundle: identities welded to state
 
-What does a session *contain*? The `SessionBundle` — and its field list is
-the chapter's thesis in one type:
+A session is only worth saving if what comes back is the *same* session —
+not a plausible reconstruction of one, and not a conversation replayed
+through a slightly different machine. That requirement drives the whole
+design, so it is worth asking the concrete version first: what does a session
+*contain*? The `SessionBundle` — and its field list is the chapter's thesis
+in one type:
 
 ```rust
 // crates/muser-server/src/session_store.rs:18-31
@@ -225,6 +265,13 @@ applies when creating a new frontier, never midway through one"
 likewise a conflict [crates/muser-server/src/openai.rs:1494-1498]. There is
 no "restore anyway."
 
+Say it once more in different words, because this is the idea the chapter
+turns on. A bundle does not store a conversation. It stores a conversation
+*together with the exact machine that could have produced it*, and on the way
+back in the two are checked separately. Half the fields in that struct are
+not state at all — they are digests, and every one of them is a way for the
+restore to say no.
+
 On disk, the bundle is encrypted and authenticated: serialized with
 Postcard, sealed with **XChaCha20Poly1305** under a key held beside the
 store, written with a magic `MUSER-SESSION-V3` envelope, a 0700-mode
@@ -238,6 +285,11 @@ role the HMAC seal plays on the wire in [Ch 30](30-handoff-v2-transport.md),
 played locally for state at rest.
 
 ## 37.5 Migration: two-phase, destination first
+
+Migration is where systems lose data, and almost always for one reason:
+something deleted the source before the destination was certain. So hold a
+narrow question while reading this section — what has to be true for a
+session to move without ever existing in two places, or in none?
 
 Sessions move — between decode nodes (authenticated HTTPS between
 "identically qualified Muser decoders") or to storage tiers (enrolled kvpack
@@ -266,14 +318,26 @@ commits before a move may delete the source.* The journal's own status
 vocabulary records the near-miss — a failed post-commit delete leaves the
 transfer in `destination_committed_source_retained`, never in a state that
 implies the source is gone [crates/muser-server/src/session_store.rs:303-316].
+That identifier is ugly on purpose. It names the exact awkward half-state the
+world can be left in — copied, committed, and not cleaned up — so an operator
+reading the journal after an ambiguous failure is told what actually happened
+rather than what was intended. A vocabulary that cannot express the near-miss
+is a vocabulary that will report it as success.
+
 And one boundary is absolute: "GX10 is not a decode destination"
 `[docs/muser-architecture.md §Context and sessions]` — the producer prefills;
 it never holds sessions.
 
 ## 37.6 The security boundary, taught as a design
 
-Here is the chapter's design study. Muser's authorization is *asymmetric on
-purpose*, and the architecture document states the whole ladder at once:
+Here is the chapter's design study, and it starts with a question every
+security design answers whether or not it admits to it: who is the attacker?
+Most systems answer once, globally, and then spend their lives being either
+too annoying on a laptop or too trusting on a network. Muser answers twice —
+one answer for a process on the same machine as you, another for anything
+arriving over a wire — and every rule below falls out of that single split.
+Its authorization is *asymmetric on purpose*, and the architecture document
+states the whole ladder at once:
 
 > Authorization is deliberately asymmetric:
 > - loopback inference is keyless;
@@ -328,9 +392,14 @@ cannot expose this server to the network by forgetting a flag: exposure
 requires a certificate, a locked-down key, and a locked-down API-key file,
 or the process refuses to listen.
 
-**WebSockets never carry long-lived keys in URLs.** The telemetry socket
-accepts either a dashboard cookie (with Origin enforced) or a ticket, and
-the comment states the threat: "Browser WebSockets are not protected by
+**WebSockets never carry long-lived keys in URLs.** There is an obvious
+shortcut at this fork, and naming it is the fastest way to see why the rule
+exists: put the API key in the socket's query string. It works on the first
+try, every client library supports it, and it writes a long-lived secret into
+every proxy log, browser history, and referrer header the connection passes
+through — places that keep things far longer than a session does. Muser
+refuses the shortcut. The telemetry socket accepts either a dashboard cookie
+(with Origin enforced) or a ticket, and the comment states the threat: "Browser WebSockets are not protected by
 fetch's same-origin response rules. A dashboard cookie therefore requires an
 explicit Origin match; long-lived bearer auth must first be exchanged for a
 single-use ticket" [crates/muser-server/src/axum_httpd.rs:4734-4737]. The
@@ -360,9 +429,11 @@ appear in URLs where logs and history collect them.
 
 ## 37.7 Bounded everything
 
-Collected in one place, because the bounds are the server's whole
-resource story (each was met earlier in its natural habitat; Table 37.2
-is the inventory):
+Every section so far has dropped a ceiling on the floor and walked on. Here
+they are swept up, because collected they answer a question no single one of
+them answers alone: what does this server do when the world sends it more
+than it expected? The answer is never "find out at run time." Each bound was
+met earlier in its natural habitat; Table 37.2 is the inventory:
 
 | Bound | Value | Where |
 |---|---|---|
@@ -382,11 +453,20 @@ is the inventory):
 nothing waits forever, and each overflow is a defined HTTP status, not a
 hang.*
 
+The lesson to carry out of the table is not any individual ceiling — those
+are tuning, and tuning changes. It is that each one has a name, a home in the
+source, and a defined thing that happens when it is hit. An unbounded queue
+is a hang waiting for a bad afternoon; a bounded one is an error code the
+client already knows how to read.
+
 ## 37.8 The unhealthy latch: fail-closed as an HTTP status
 
 [Ch 34 §34.4](34-scheduler-and-slots.md) showed the `SlotPool` latching
-itself unhealthy when a lease is poisoned. Here is the client-visible half.
-`/health` reports the latch directly:
+itself unhealthy when a lease is poisoned. That was the engine's half of the
+decision. The half that decides whether anyone can *operate* the thing is
+this one: when the latch trips, what does a client see, and what does a load
+balancer in front of it do? Here is the client-visible half. `/health`
+reports the latch directly:
 
 ```rust
 // crates/muser-server/src/axum_httpd.rs:738-754
@@ -420,6 +500,12 @@ client sees an ordinary, cache-unfriendly 503, and load balancers do the
 right thing without knowing why.
 
 ## 37.9 Tradeoffs
+
+Each of the decisions below is a fork with a cheaper road visibly leading off
+it, and in every case the cheaper road is the one most servers take. They are
+collected here because the shape of the choice repeats: Muser takes the road
+that makes a whole class of wrong outcome impossible to represent, and pays
+for it in friction somewhere a human can feel.
 
 **Framing strictness vs compatibility reach.** `deny_unknown_fields` plus
 exact content types means a client sending an unknown field or

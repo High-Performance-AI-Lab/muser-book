@@ -13,6 +13,11 @@
 
 ## 20.1 What it computes
 
+Every chapter of the decode walk so far has handed the residual stream back
+to itself, one layer richer. This one spends it. The question we are finally
+answering is easy to ask and expensive to compute: given the model's final
+thought, what score does it assign to every word it knows?
+
 After layer 51's tail, the [residual stream](../glossary.md#residual-stream-hidden-state)
 is one 6,656-vector: the model's final thought. Three operations turn it
 into a prediction:
@@ -61,13 +66,19 @@ dot product can score 50, 100, or more, and training with such outliers is
 unstable (huge gradients through the softmax). A soft cap squashes the
 tails smoothly: `20·tanh(x/20)` is ≈ `x` for small `x` and approaches ±20
 asymptotically, so ordinary scores pass nearly unchanged while outliers are
-bent into the bound. The mechanism is Gemma-2-lineage; that it is *why Muse
-Glimmer's* authors adopted it is not in the Muser tree — **[unverified]**.
-What is verifiable is the wiring and the constants: the engine reads both
-from the checkpoint (`config.rs:190-197`), llama.cpp defaults the softcap
-to 30.0 when the key is absent, and this checkpoint carries
-`final_logit_softcapping = 20` with `logit_scale = 0.196116`
-[docs/release-provenance.md:822-823].
+bent into the bound. Said another way: near the origin the cap is invisible,
+the identity map to within a rounding error, and it only becomes a real
+transformation once a score is large enough that its exact magnitude was
+never trustworthy anyway.
+
+Where the idea came from is a question we can only half-answer. The mechanism is
+Gemma-2-lineage; that it is *why Muse Glimmer's* authors adopted it is not in
+the Muser tree — **[unverified]**, and we would rather say so than invent a
+motive for a checkpoint we did not train. What we *can* verify is the wiring
+and the constants. The engine reads both from the checkpoint
+(`config.rs:190-197`); llama.cpp defaults the softcap to 30.0 when the key is
+absent; this checkpoint carries `final_logit_softcapping = 20` with
+`logit_scale = 0.196116` [docs/release-provenance.md:822-823].
 
 One property matters enormously downstream and costs one line to prove:
 **the transform is strictly increasing.** `x ↦ 20·tanh((x·s)/20)` with
@@ -78,6 +89,11 @@ the cap changes is the *gaps* (§20.7), and gaps are exactly what logprob
 comparisons consume.
 
 ## 20.3 The matrix operation — the largest matvec, by hand
+
+Where does the time in this stage go? Almost all of it goes into dragging one
+matrix off memory, so before anything else we want that matrix's size in
+bytes — derived rather than asserted, so you can re-derive it yourself and
+catch us if we are wrong.
 
 The shapes, verified from the artifact's verify-shape table
 (`lm_head 6656->202048 q5k`, `crates/muser-bench/src/m16.rs:195-197`):
@@ -124,6 +140,10 @@ Figure 20.1 shows the stage end to end.
 924.6 MB weight stream is the work.*
 
 ## 20.4 The Metal kernel — `muser_scale_softcap_inplace`, and what actually runs
+
+Two kernels in this tree compute the soft cap, and the one that reads best is
+not the one that runs. Start with the readable one, because it is also the
+definition.
 
 The fused kernel, verbatim — it is the whole soft-cap formula in eight
 lines:
@@ -174,16 +194,27 @@ if softcap > 0.0 {
 }
 ```
 
-Four dispatches — `×scale`, `×(1/20)`, `tanh`, `×20` — with a memory
-barrier between each, using the comparator's own `kernel_…_unary` PSOs
-(registered as ggml unary ops 10 = scale and 100 = tanh,
-`encode.rs:288-289`). Metal's `tanh` and the fused expression tree round
-differently from llama's node-per-op graph; "equal pre-softcap logits did
-not yield equal public bytes" is the measured reason four dispatches beat
-one. The fused kernel survives as the fallback when the metallib is absent
-or the count is not a multiple of four (`lmhead.rs:230-241`, `:261-266`),
-and a strict cross-vendor split (scale / barrier / scale / barrier / tanh
-/ barrier / scale) exists for CUDA-parity lanes (`lmhead.rs:197-228`).
+Read that comment for what it is: a retracted attempt, kept in the source
+where it can still teach. The fused kernel above was the obvious engineering
+answer — one dispatch, one pass over the buffer, algebraically identical to
+the step-by-step form. We shipped it, expecting byte-identical logits out of
+it, because the arithmetic is the same arithmetic. The bytes disagreed.
+Metal's `tanh` and the fused expression tree round differently from llama's
+node-per-op graph, and the failure surfaced exactly where it costs the most:
+"equal pre-softcap logits did not yield equal public bytes." The lesson is
+one this book keeps relearning in new costumes — algebraic identity is not
+floating-point identity, and a comparator that gates on published bytes will
+find every place the two come apart.
+
+So the serving route decomposes instead. Four dispatches — `×scale`,
+`×(1/20)`, `tanh`, `×20` — with a memory barrier between each, using the
+comparator's own `kernel_…_unary` PSOs: not kernels that behave like
+llama.cpp's, but llama.cpp's own, registered as ggml unary ops 10 = scale
+and 100 = tanh (`encode.rs:288-289`). The fused kernel is not deleted, it is
+demoted: it still runs when the metallib is absent or the count is not a
+multiple of four (`lmhead.rs:230-241`, `:261-266`), and a strict cross-vendor
+split — scale / barrier / scale / barrier / tanh / barrier / scale — exists
+for CUDA-parity lanes (`lmhead.rs:197-228`).
 
 The CPU oracle states the reference semantics — same formula, scalar
 order (`crates/muser-engine/src/reference.rs:559-569`):
@@ -204,6 +235,11 @@ if cfg.final_logit_softcap > 0.0 {
 ```
 
 ## 20.5 The Rust dispatch
+
+What does it take to launch the largest matvec in the model? Less than you
+would guess, and that is the point worth carrying away: the head goes through
+the same wrapper as the smallest projection in the layer loop, with nothing
+special-cased for its size.
 
 The head itself is the stock projection wrapper —
 `self.project(command, &self.output, &self.activations.hidden,
@@ -257,6 +293,10 @@ book cites the metadata; nothing else is claimed.
 
 ## 20.6 The access pattern
 
+Two questions to hold while reading the byte bill below. What does this stage
+cost in traffic? And what did the parity decision of the previous section
+actually charge us for it?
+
 ```
   LM head:
     read  W_lm (Q5_K)   202,048 × 4,576 B      = 924,571,648 B  ≈ 924.6 MB
@@ -297,21 +337,30 @@ map: gaps between large logits shrink. Worked by hand at the 20 cap:
            20·tanh(1.0) = 15.232             gap = 4.049  (−80 %)
 ```
 
-Two consequences. For *probability* math — softmax over capped logits,
-logprobs — the transform is not a no-op: probabilities are flatter than an
-uncapped engine would produce from the same hidden state, and any
-cross-engine comparison of logprobs or bounded-logit deltas is only
+Two consequences follow, one local and one that reaches across the book.
+
+The local one is about probabilities. For softmax over capped logits, and for
+logprobs, the transform is emphatically not a no-op: probabilities come out
+flatter than an uncapped engine would produce from the same hidden state, and
+any cross-engine comparison of logprobs or bounded-logit deltas is only
 meaningful if both engines apply the same scale-and-cap in the same order.
-This is why Muser's parity work pins the *post-softcap public bytes*
-(`reference.rs`'s `result_output` capture, and the four-node decomposition
-of §20.4), and it foreshadows [Ch 32](32-precision-across-the-handoff.md):
-the disaggregated lane's "declared bounded-logit policies" — acceptance
-rules of the form *max delta < 11, mean < 1.25* — are measured on exactly
-these capped logits (the wizard's native-lane rule
-[nvfp4-fast-lane-evidence-20260817 §Determinism; ledger wizard attempt 9]),
-so the cap is part of the contract's units, not a cosmetic tail step.
-Without the cap the same deltas would be much larger and the tolerance
-would have to be re-derived.
+That is why Muser's parity work pins the *post-softcap public bytes* rather
+than anything upstream of the cap — the `reference.rs` `result_output`
+capture and the four-node decomposition of §20.4 both aim at that same pinned
+surface.
+
+The far-reaching one is about units, and the reason it matters for the
+handoff is this: a tolerance is meaningless until you know which numbers it
+was measured on. The disaggregated lane of
+[Ch 32](32-precision-across-the-handoff.md) accepts or rejects a remote
+engine's work through "declared bounded-logit policies" — acceptance rules of
+the form *max delta < 11, mean < 1.25*. Those thresholds were measured on
+exactly these capped logits, and we kept the run that produced them: the
+wizard's native-lane rule
+[nvfp4-fast-lane-evidence-20260817 §Determinism; ledger wizard attempt 9].
+So the cap is part of the contract's units, not a cosmetic tail step. Without
+it the same deltas would be much larger and the tolerance would have to be
+re-derived.
 
 **Q5_K for the head — 5.5 bits on the score-setter.** The head is the one
 tensor that decides, by small margins, which token wins; the artifact
@@ -324,14 +373,14 @@ rationale, inherited from the quantized artifact, not re-measured here
 **[unverified]** — the same honesty note as the ancestor's Q6_K LM head
 [ferrite-book Ch 19].
 
-**Four unary nodes vs one fused kernel.** Priced in §20.6: ~4.6 MiB/token
-plus three extra dispatches and barriers, bought to make the public bytes
-match llama.cpp's. The alternative was measured and rejected in the
-direction that matters — the fused kernel's different `tanh` and
-expression tree meant "equal pre-softcap logits did not yield equal public
-bytes" (`lmhead.rs:243-246`). Under the J0 anchor — llama's own bytes as
-the gate [ledger Stage A; see [Ch 38](38-measuring-against-llama-cpp.md)]
-— that settles it: parity outranks dispatch count.
+**Four unary nodes vs one fused kernel.** The war story is told above; here
+is only its price tag, from §20.6: ~4.6 MiB/token plus three extra dispatches
+and barriers, bought to make the public bytes match llama.cpp's. The
+receipt for the rejected direction stays where a future maintainer will trip
+over it, in the source comment itself (`lmhead.rs:243-246`). Under the J0
+anchor — llama's own bytes as the gate
+[ledger Stage A; see [Ch 38](38-measuring-against-llama-cpp.md)] — the
+ranking is not close: parity outranks dispatch count.
 
 **Why not vocab-block or resident layouts?** The ancestor book explored
 vocab-blocked LM-head layouts [ferrite-book Ch 19]; Muser's engine keeps
@@ -348,13 +397,19 @@ one-token closure accounting, the LM head and softcap sit in the "common
 math closures" family: 406 production vs 406 legacy, delta 0
 [docs/decode-dispatch-gap-20260815.md]. The serving route's four-node
 softcap even *adds* work relative to the fused legacy form and stays:
-exactness is the constraint, dispatch count is not. The lesson attached:
-the same investigation's first act was correcting its own instrument — the
-retained baseline's "production labels omitted `lm_head`, so its time was
-attributed to the following `softcap` label" [same doc, Instrumentation
-correction]. A 924.6 MB stage is exactly the kind of thing a label defect
-hides in plain sight; measure the instrument before the engine
-([Ch 38](38-measuring-against-llama-cpp.md) formalizes this culture).
+exactness is the constraint, dispatch count is not.
+
+The lesson is in how that verdict was reached. We went into the gap
+investigation expecting to read the head's cost straight off the retained
+baseline, and the first thing the baseline told us was false: "production
+labels omitted `lm_head`, so its time was attributed to the following
+`softcap` label" [same doc, Instrumentation correction]. The head's time was
+never missing — it was wearing the next stage's name, which is the worst way
+for a measurement to be wrong, because the total still adds up. A 924.6 MB
+stage is exactly the kind of thing a label defect hides in plain sight. So
+the investigation's first act was fixing its own instrument, and only then
+did it draw a conclusion about the engine: measure the instrument before the
+engine ([Ch 38](38-measuring-against-llama-cpp.md) formalizes this culture).
 
 The logits exist — 202,048 capped scores in a buffer on the GPU. The
 model has an opinion about the next token; nothing has *chosen* one yet.

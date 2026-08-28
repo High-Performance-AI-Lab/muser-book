@@ -13,9 +13,21 @@ Chapter 10 ended where the descent begins: box ① of Figure 10.1, the
 humblest kernel in the whole graph — one integer in, one 6,656-float
 vector out. This chapter opens it.
 
+We put the smallest kernel first on purpose. Every habit the rest of Part IV
+leans on — read the shapes before the code, count the bytes before believing
+a cost, quote the dispatch instead of your memory of it — can be practised
+here, on an operation that has no arithmetic to hide behind. If a chapter
+about a table lookup feels like more scaffolding than the lookup deserves,
+that is the point: the scaffolding is what we are teaching.
+
 ---
 
 ## 11.1 What it computes
+
+The kernel answers one question: how does an integer become a vector? The
+tokenizer hands the engine a number — the id of a piece of text inside a
+fixed vocabulary — and everything downstream wants floats. Something has to
+bridge the two, and this is the something.
 
 Given one [token](../glossary.md#token) id — an integer in `0 .. vocab_size` —
 the embedding lookup produces the initial hidden vector for that token:
@@ -57,13 +69,19 @@ learned numbers of the table, not in the operation.
 
 ## 11.3 The row gather, explained from zero
 
+Two questions decide everything about this kernel. Where in memory does a
+token's row live, and how many bytes long is it? Answer both and the kernel
+more or less writes itself; get either one wrong and you will read a
+perfectly plausible row belonging to some other word entirely.
+
 An **[embedding](../glossary.md#embedding)** is a lookup table: a matrix of
 learned numbers with one row per vocabulary entry. In the GGUF the tensor is
-`token_embd.weight` with shape `[hidden_dim, vocab_size]` — enforced at load
-(`crates/muser-engine/src/config.rs:295`), and for this checkpoint the loader
-accepts only Q4_K or F16 for it (`decode.rs:1209-1214`). Memory is
-vocab-major: token `t`'s 6,656 values are contiguous (Figure 11.1), so the
-byte offset of a row is just `t × row_bytes`.
+`token_embd.weight` with shape `[hidden_dim, vocab_size]`. The loader does
+not take that shape on trust — it asserts it at load
+(`crates/muser-engine/src/config.rs:295`) — and for this checkpoint it
+accepts the table in two dtypes only, Q4_K or F16 (`decode.rs:1209-1214`).
+Memory is vocab-major: token `t`'s 6,656 values are contiguous
+(Figure 11.1), so the byte offset of a row is just `t × row_bytes`.
 
 ```
                  token_embd.weight   (vocab-major rows)
@@ -89,15 +107,28 @@ returns in every kernel chapter:
   table total      = 202,048 × 3,744    = 756,467,712 B ≈ 756 MB
 ```
 
-(The `row_bytes` formula is itself in the dispatch,
-`crates/muser-engine/src/metal/encode/qkv.rs:361`.) The whole table is
-~756 MB of the 16,756,681,056-byte pinned artifact
+That multiply is not ours to invent, incidentally — the dispatch computes
+`row_bytes` with the same expression
+(`crates/muser-engine/src/metal/encode/qkv.rs:361`).
+
+The whole table is ~756 MB of the 16,756,681,056-byte pinned artifact
 (`crates/muser-engine/src/lib.rs:14`) — about 4.5 % of the model — but only
 **one 3,744-byte row of it is read per token**. Large in memory, trivial in
-bandwidth; both facts are true simultaneously, and [Ch 1](01-why-inference-is-a-memory-problem.md)
-hangs its whole budget on that distinction.
+bandwidth; both facts are true simultaneously. Put the other way, because the
+whole book rests on the distinction: a tensor's size tells you what it costs
+to *hold*, and tells you nothing whatever about what it costs to *use*. The
+embedding table is the cleanest illustration in the model — three quarters of
+a gigabyte resident, under four kilobytes touched per token — and
+[Ch 1](01-why-inference-is-a-memory-problem.md) hangs its whole budget on
+exactly that gap.
 
 ## 11.4 The Metal kernel
+
+Now the code. Read it holding one question: which line is the actual gather?
+There is exactly one, a pointer expression, and it is outnumbered about a
+dozen to one by nibble bookkeeping. That ratio is not a defect of this
+kernel. It is what quantization costs at every kernel in this book, visible
+here only because there is nothing else going on to hide it.
 
 Here is the kernel, complete, with the dequant helper it calls:
 
@@ -164,6 +195,14 @@ Line by line:
   the worst case, all served from L2 (the GPU's shared on-chip cache) after the first lane touches them —
   fine for a kernel that runs once per token.
 
+Said the other way round, because this is the part that trips people up: an
+element index is really a four-level address — which super-block, which
+sub-block inside it, which byte inside that, and which half of that byte. The
+kernel stores none of those levels. No lookup table, no precomputed offsets:
+it re-derives all four from a single integer using divisions and masks,
+independently, in every thread. Quantized formats trade memory for address
+arithmetic, and this helper is that trade with the lid off.
+
 ### A worked example: one element of one row
 
 Take token id `t = 42`, element `e = 300`, and a made-up super-block whose
@@ -200,6 +239,12 @@ output shape (`dispatch_1d(hidden_dim × tokens)`); the gather is one
 pointer computation per thread.*
 
 ## 11.5 The Rust dispatch
+
+The kernel says what to compute. It does not say how many threads run it,
+where the weight bytes come from, or what should happen if the buffer you
+bound turns out to be the wrong size. That is the wrapper's job. It is the
+layer where a mistake is expensive and silent, which is why it is also the
+layer carrying the assertions.
 
 The wrapper is `encode_embedding_q4k`:
 
@@ -249,13 +294,15 @@ dispatch(command, |encoder| {
 });
 ```
 
-Three details matter. First, `self.embedding.view(&self.mapped_weights)` —
-the table is a view into the single mmap'd GGUF buffer mapped onto the GPU
-(`decode.rs:1201`), so the "upload" of 756 MB of embedding is a no-op
-([Ch 3](03-unified-memory-and-buffers.md)). Second, the token id arrives as
-`token_view` — four bytes in a small staging buffer the CPU wrote before the
-command buffer existed (`decode.rs:5433-5438`), so the GPU never waits on the
-host. Third, the grid: `dispatch_1d(hidden_dim × tokens)`
+Three details matter, and each one is a cost that isn't there. First,
+`self.embedding.view(&self.mapped_weights)`: the table is a view into the
+single mmap'd GGUF buffer already mapped onto the GPU (`decode.rs:1201`), so
+the "upload" of 756 MB of embedding is a no-op — the zero-copy promise of
+[Ch 3](03-unified-memory-and-buffers.md), collecting for the first time.
+Second, the token id arrives as `token_view` — four bytes in a small staging
+buffer the CPU wrote before the command buffer existed
+(`decode.rs:5433-5438`), so the GPU never waits on the host. Third, the grid:
+`dispatch_1d(hidden_dim × tokens)`
 (`encode.rs:1337-1343`) uses `dispatch_threads` with a threadgroup width of
 at most 256 — for one token, 6,656 threads in 26+ threadgroups of 256. The
 GPU, not the CPU, sizes the launch.
@@ -266,6 +313,11 @@ that is the variant the 512-row prefill chunks use, and the reason one kernel
 serves both regimes.
 
 ## 11.6 The access pattern
+
+Every kernel chapter reaches this point and asks the same question: where
+does the time go? For the embedding the honest answer is "nowhere," and it is
+worth seeing precisely how nowhere, because the shape of the accounting is
+the one we will reuse on kernels where the answer is not so comfortable.
 
 Per token:
 
@@ -299,12 +351,17 @@ one norm, four matvecs, …) stays fixed.
 
 ## 11.7 Tradeoffs
 
-**GPU gather vs CPU lookup — Muser inverts the ancestor's choice.** The
-Ferrite book did the embedding on the CPU (one quantized row dequantized into
-a unified-memory buffer, no dispatch at all) and argued the work was too
-small to amortize a GPU dispatch over `[ferrite-book Ch 9]`. Muser runs it on
-the GPU anyway. Why the difference? Two structural facts, visible in the
-code rather than in any A/B ledger:
+**GPU gather vs CPU lookup — Muser inverts the ancestor's choice.** We
+inherited a decision here, and then we reversed it. The Ferrite book did the
+embedding on the CPU — one quantized row dequantized into a unified-memory
+buffer, no dispatch at all — and argued the work was too small to amortize a
+GPU dispatch over `[ferrite-book Ch 9]`. That argument is sound on its own
+terms, and going in we expected to keep the CPU path: it is less code, and
+none of the arithmetic had changed.
+
+What had changed was everything around the arithmetic. Muser runs the lookup
+on the GPU anyway. Two structural facts, visible in the code rather than in
+any A/B ledger, turn the cheap-looking CPU path into the expensive one:
 
 1. **The token id is already a GPU buffer.** Muser's decode graph is one
    command buffer from embedding to softcap (`decode.rs:5448-5460`), fed by
@@ -321,6 +378,12 @@ There is no measured A/B of CPU-vs-GPU embedding in the campaign ledger
 `[unverified]` — the choice is justified structurally, and at ~30 KB of
 traffic either side would be invisible against the per-token budget.
 
+The lesson we took from the reversal is worth carrying into the rest of the
+kernel chapters: a dispatch's cost is not a property of the dispatch. It is a
+property of what is already queued beside it. An argument that held for an
+engine recording a handful of command buffers stops holding for one that
+records the entire token graph as a single buffer.
+
 **Q4_K table vs an f32 table.** Pre-dequantizing the table to f32 at load
 would cost `202,048 × 6,656 × 4 ≈ 5.4 GB` of resident memory — about a third
 of the whole artifact again — to save 3,744 bytes of dequant work per token.
@@ -329,13 +392,18 @@ artifact carries (Q4_K or F16, `decode.rs:1209-1214`) and dequantizes one row
 on demand. The same trade the ancestor book described, at 7× the scale
 `[ferrite-book Ch 9]`.
 
-**The clamp instead of a fail.** An out-of-range id silently maps to the last
-row rather than erroring (`muse_reference.metal:973`). The CPU-side session
-validates token ids before the graph is ever built (`Session::decode`,
-`crates/muser-engine/src/api.rs:696-741`), so the kernel-side clamp is a
-second line of defense, not the correctness gate. Whether defense-in-depth
-or an accidental silent path is the right description of the clamp's intent
-is `[unverified]` from the tree alone.
+**The clamp instead of a fail.** A Metal kernel has no way to raise an error.
+A thread handed a bad index simply reads whatever those bytes happen to be.
+So what *should* a shader do with a token id that is out of range? Muser's
+answer is the `min` on the pointer line: an out-of-range id silently maps to
+the last row rather than erroring (`muse_reference.metal:973`). It is not the
+correctness gate — the CPU-side session validates token ids before the graph
+is ever built (`Session::decode`,
+`crates/muser-engine/src/api.rs:696-741`), so by the time a thread reaches the
+clamp a bad id should already be impossible. That makes the clamp a second
+line of defense. It also makes it a silent one, and a silent defense is a
+defense you never learn has fired. Which of those two descriptions the clamp
+was actually written for is `[unverified]` from the tree alone.
 
 ### The untied twin at the other end of the model
 
@@ -355,6 +423,10 @@ bandwidth. The LM head gets its own chapter,
 quiet one.
 
 ## 11.8 Where the gap lives
+
+Every kernel chapter closes by facing the same suspicion: is this the one
+eating the decode time? Here the answer is a flat no, and the accounting is
+specific enough to say exactly why.
 
 **This kernel is not the gap.** The dispatch-gap accounting of
 `[docs/decode-dispatch-gap-20260815.md]` reconciles the production-vs-legacy

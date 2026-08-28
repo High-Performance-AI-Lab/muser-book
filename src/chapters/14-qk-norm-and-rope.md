@@ -13,8 +13,12 @@
 
 Chapter 13 ended with Q, K, V, and gate holding raw projection outputs —
 un-normalized, un-rotated, positionless. This chapter is what happens to
-Q and K next. Two operations run between the projections and the KV store,
-and a third deliberately does not:
+Q and K next, and it turns on a question that sounds trivial until you try
+to answer it inside a kernel: how does a machine built entirely out of dot
+products know which token came first? Muse Glimmer answers that question
+twice, differently, in the same forward pass — and the second answer is
+the one the rest of the book keeps cashing in. Two operations run between
+the projections and the KV store, and a third deliberately does not:
 
 1. **Per-head QK-norm** — an RMSNorm applied to *each attention head's*
    128-wide slice of Q and K separately (`rms_norm_per_head` family; the
@@ -81,8 +85,14 @@ implement each layer's choice exactly.
 
 ## 14.3 QK-norm first — the parameterless cousin
 
-Immediately after the projections, before any rotation, each head of Q and
-K is RMSNormed across its own 128 dimensions:
+Before anything spins, a smaller question has to be settled: are all the
+heads speaking at the same volume? Attention's softmax is a competition,
+and a head whose Q and K happen to leave the projection with a large
+magnitude wins that competition for reasons that have nothing to do with
+meaning. QK-norm is the answer to that, and on this model it is a strange
+one — a normalization with no learned parameters, wearing a learned
+parameter's clothes. Immediately after the projections, before any
+rotation, each head of Q and K is RMSNormed across its own 128 dimensions:
 
 ```rust
 // crates/muser-engine/src/decode.rs:5599
@@ -123,15 +133,29 @@ The Muse-specific wrinkle is the γ. The upstream checkpoint has *no
 learned* q/k norm weights; the GGUF converter materializes
 `full(qk_scale_factor)` for `attn_q_norm.weight` and `ones(...)` for
 `attn_k_norm.weight` so llama.cpp's weighted-RMSNorm op can carry a scalar
-(`config.rs:383-395`). Muser does not trust that — the loader *proves* it:
+(`config.rs:383-395`).
 
-- `QkNormProbe` fails the load unless both tensors are the constant
-  broadcasts the converter emits (`config.rs:397-403`); a genuinely learned
-  per-channel norm would change the math and aborts startup
-  (`loader.rs:28-37`).
-- The probe's measured facts: `qk_scale_factor ≈ 3.87`, `k_norm = 1.0`
-  (`config.rs:139-141`; the arithmetic companion test at `config.rs:426-430`
-  checks `3.87 × 1/√128 ≈ 0.342`).
+That leaves a fork at load time, and it is worth walking both branches.
+The comfortable one is to shrug and multiply: the tensors are present, the
+norm kernel already takes a weight vector, so read whatever is in the file
+and move on. The uncomfortable one is to ask what happens the day the file
+stops being what we assume — the day a converter writes a genuinely
+learned per-channel norm into those same two slots. Nothing would crash.
+The kernel would happily consume a vector where we expected a broadcast,
+the math would quietly become a different model's math, and the output
+would stay fluent. That is the failure mode this book keeps meeting:
+plausible text is not evidence of a correct engine.
+
+Muser takes the uncomfortable branch and *proves* the assumption instead
+of holding it. `QkNormProbe` fails the load unless both tensors are exactly
+the constant broadcasts the converter emits (`config.rs:397-403`), so a
+learned per-channel norm aborts startup instead of silently redefining the
+attention scores (`loader.rs:28-37`). The same probe pins the values it
+accepts: `qk_scale_factor ≈ 3.87` and `k_norm = 1.0` (`config.rs:139-141`),
+with an arithmetic companion test at `config.rs:426-430` checking
+`3.87 × 1/√128 ≈ 0.342`. The lesson outlives this one tensor: when a number
+reaches the engine from a converter rather than from training, the only
+safe way to depend on it is to assert it at the boundary.
 
 So Q's norm is "normalize, then scale by ≈3.87" and K's is a plain
 normalize. And note what the scale is **in addition to**: the attention
@@ -139,9 +163,11 @@ softmax scale is still `1/√128 ≈ 0.0883883` (`config.rs:277-281`),
 independent of the folded-in 3.87 — two different scales living at two
 different points of the graph, easy to conflate, asserted apart by test.
 
-Why per-head normalization exists at all: it stabilizes the score
-distribution per head before the dot product, so one hot-headed head
-cannot dominate the softmax. On this model the "learned" part of that
+Back to the question this section opened with, now that the machinery is
+on the page. Per-head normalization exists to stabilize the score
+distribution *within* each head before the dot product, so that one
+hot-headed head cannot dominate the softmax on the strength of its
+magnitude alone. On this model the "learned" part of that
 stabilization was folded into a single scalar by training upstream
 `[unverified]` for the quality rationale — what is verified is the probe,
 the values, and where they are applied.
@@ -149,6 +175,12 @@ the values, and where they are applied.
 ## 14.4 RoPE from zero
 
 ### 14.4.1 Pair up, rotate, at a per-pair frequency
+
+So how do you tell a dot product where a token sits, without adding a
+parameter and without touching the attention kernel? You spin the vector.
+The mechanism is easier than RoPE's reputation suggests; what ruins engines
+is never the rotation itself but the bookkeeping around it, so build the
+mechanism first and meet the bookkeeping immediately after.
 
 Take one head's 128-wide vector and split it into 64 pairs. Muse Glimmer
 uses the **interleaved** convention — pair `i` is the *adjacent* couple
@@ -176,6 +208,9 @@ worth quoting whole:
 Read the warning twice: rotating with the wrong pairing **still runs and
 still produces fluent text** — with silently wrong positions. There is no
 crash to catch; only a parity gate against pinned llama.cpp can see it.
+A bug with no symptom cannot be found in production, so it has to be made
+unrepresentable at build time instead — the defense the tradeoffs section
+at the end of this chapter returns to.
 
 Pair `i` has a fixed frequency, set once at load:
 
@@ -259,12 +294,25 @@ q_rot · k_rot  =  (q₀k₀ + q₁k₁)·cos((m−n)θᵢ)
 
 Every `m` and `n` appears only as the difference `m − n`. Absolute
 positions have vanished; relative position falls out for free, with zero
-extra parameters and no change inside the attention kernel. That single
-identity is why RoPE is the decode-era default — and, in this book, it has
-a second life in §14.6: it is *also* the reason NoPE's cache bytes are
-relocatable and RoPE's are not.
+extra parameters and no change inside the attention kernel.
+
+Worth restating in different words, because this is the idea the whole
+chapter hangs on: RoPE never tells attention where a token *is*. It
+arranges matters so that attention cannot ask anything else but how far
+apart two tokens are. The absolute coordinates go in, cancel against each
+other on the way through the dot product, and only the gap comes out.
+
+That single identity is why RoPE is the decode-era default — and, in this
+book, it has a second life in §14.6: it is *also* the reason NoPE's cache
+bytes are relocatable and RoPE's are not.
 
 ## 14.5 The Metal kernel and the SWA-only dispatch
+
+That is the theory; here is all of it in hardware. The kernel's job is
+narrower than the derivation makes it sound — for this token, which floats
+get spun, and by how much? — and everything interesting in the listing is
+about answering that cheaply enough for the work to be invisible against
+the weight stream.
 
 ```metal
 // crates/muser-engine/src/shaders/ferrite/rope.metal:624
@@ -333,20 +381,29 @@ One thread per pair, in-place on Q and K:
   back.
 
 The dispatch (`metal/encode/rope.rs:139-151`) launches
-`ceil(total_pairs/32) × batch` threadgroups of 32. One thread per pair,
-with `total_pairs = (32 + 2) × 64 = 2,176` for Muse Glimmer — 68
-threadgroups of 32 threads, once per sliding layer, per token. And when
-the pinned metallib is loaded, the wrapper first tries llama's own
-`kernel_rope_norm_f32` with a packed `GgmlMetalKargsRope`
-(`rope.rs:88-138`) — same convention, llama's bits — falling back to this
-kernel otherwise; under the cross-vendor flags it routes instead to the
-no-fast-math NCO table route with explicit per-token positions
-(`rope.rs:62-86`), the seam [Ch 32](32-precision-across-the-handoff.md)
-needs.
+`ceil(total_pairs/32) × batch` threadgroups of 32 — one thread per pair,
+and with `total_pairs = (32 + 2) × 64 = 2,176` for Muse Glimmer that comes
+to 68 threadgroups of 32 threads, once per sliding layer, per token.
+
+The wrapper has more to decide than a grid size, though. The same rotation
+exists three times in the tree, and the copies are not interchangeable —
+same math, different provenance for the bits, and provenance is precisely
+the kind of difference the convention warning above says never surfaces
+in the output. When the pinned metallib is loaded, the wrapper prefers
+llama's own `kernel_rope_norm_f32` with a packed `GgmlMetalKargsRope`:
+same convention, llama's own arithmetic, no daylight between the engine
+and the comparator it is scored against (`rope.rs:88-138`). Without that
+metallib, the ferrite kernel quoted above is the fallback. Under the
+cross-vendor flags the choice changes once more, to the no-fast-math NCO
+table route with explicit per-token positions (`rope.rs:62-86`) — the
+seam [Ch 32](32-precision-across-the-handoff.md) needs when the tensors
+on the other side of the handoff were produced by somebody else's
+hardware.
 
 ### The dispatch condition — SWA only
 
-The entire position apparatus is behind one predicate in the token graph:
+Which layers actually pay for all this? Not most of them — and the whole
+position apparatus hangs off a single predicate in the token graph:
 
 ```rust
 // crates/muser-engine/src/decode.rs:5621
@@ -384,7 +441,12 @@ flow from QK-norm straight to the KV store, positionless by design. The
 layer-kind partition itself is fail-closed: the loader panics rather than
 guess if the `sliding_window_pattern` key is missing, because "an
 all-full model runs and emits plausible text while being wrong"
-(`config.rs:378-380`).
+(`config.rs:378-380`). Notice what kind of defense that is. The loader is
+not saving itself from a crash — it is saving us from the *absence* of
+one, which is the same reason the QK-norm probe earlier in this chapter
+exists. Two different keys, two different tensors, one shared conviction:
+on this engine a missing assumption must stop the process, because the
+model will never complain on its own.
 
 ## 14.6 NoPE and relocatable KV — the consequence
 
@@ -416,6 +478,11 @@ this section is the reason NoPE bytes move freely and SWA bytes move as
 logical tails with explicit origins.
 
 ## 14.7 Tradeoffs
+
+Four decisions in this chapter could plausibly have gone the other way,
+and they share a family resemblance: in every one of them the wrong branch
+still runs, still returns floats, and still reads like language. That is
+what makes them worth walking rather than tabulating.
 
 **Interleaved vs half-split — a convention you must match, not choose.**
 Same rotation math, different pairing (Figure 14.2). The checkpoint was
@@ -467,6 +534,10 @@ more example of the book's recurring rule: exactness is always exactness
 *against a specific anchor*.
 
 ## 14.8 Where the gap lives
+
+Every kernel chapter owes the same accounting answer: does this work show
+up in the decode gap, or does it disappear into the noise of the layers
+around it? Here the arithmetic settles it quickly.
 
 **This kernel is not the gap.** Bytes per token: Q 4,096×4 + K 256×4 read
 and written in place, ≈ 17.4 KB in and the same out, ×39 sliding layers ≈

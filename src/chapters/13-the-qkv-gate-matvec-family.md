@@ -15,7 +15,9 @@
 ## 13.1 What it computes
 
 Chapter 12 left the stream normalized in `activations.post_norm`, ready
-for the four weight matrices that read it. This chapter is the family
+for the four weight matrices that read it. Before any code appears, ask
+the question this chapter exists to answer: when a token spends its time,
+where does the time go? Overwhelmingly, it goes here. This is the family
 those matvecs belong to — and the place where the token's bandwidth bill
 is actually incurred. A **matrix–vector multiply** — [matvec](../glossary.md#matvec), or GEMV — is:
 
@@ -47,10 +49,16 @@ dispatch set, all reading the same normed input (`decode.rs:5569-5598`):
 | `attn_v.weight` | 6,656 × 256 | the 2 KV heads' values |
 | `attn_gate.weight` | 6,656 × 4,096 | the sigmoid attention gate ([Ch 17](17-sigmoid-gate-and-oproj.md)) |
 
-(The shapes follow from `hidden = 6,656`, `n_heads × head_dim = 32 × 128 =
-4,096`, `n_kv_heads × head_dim = 2 × 128 = 256`
-`[crates/muser-engine/tests/muse_golden.rs:96-100]`;
-`config.rs:300-307` asserts the tensor shapes at load.) Muse Glimmer is
+Those shapes are not arbitrary; they fall out of the geometry the
+architecture chapter fixed. `hidden = 6,656` sets every
+matrix's input side. `n_heads × head_dim = 32 × 128 = 4,096` sets the
+output side of Q and of the gate. `n_kv_heads × head_dim = 2 × 128 = 256`
+sets K's and V's, narrow because grouped-query attention shares each KV
+head across many query heads. We read those extents off the golden test,
+which is where the anchor is kept
+`[crates/muser-engine/tests/muse_golden.rs:96-100]`, and
+`config.rs:300-307` asserts them again at load, so a checkpoint whose
+tensors disagree fails before it can produce a wrong number. Muse Glimmer is
 *not* a fused-QKV architecture: there is no single `[6,656 × 4,608]` QKV
 matrix. There are four independent tensors, dispatched as four independent
 matvecs that share one read-only input and write disjoint outputs — "one
@@ -140,6 +148,8 @@ kernels from three libraries. All three meet in this chapter's dispatch.
 
 ### 13.4.1 The pinned ggml matvec — `kernel_mul_mv_q*_K_f32`
 
+Start with the question that decides everything else in this section:
+whose code actually runs when Muse Glimmer projects a token? Not ours.
 The primary decode matvec is **llama.cpp's own kernel**, loaded from the
 metallib pinned by `MUSER_GGML_METALLIB`
 (`crates/muser-engine/src/metal/context.rs:122-131`) at llama.cpp commit
@@ -202,20 +212,41 @@ For the Q projection: `n_out = 4,096`, `rows_per_group = 2` →
 `4,096 / 4 = 1,024` threadgroups of 64 threads. For K and V: `n_out = 256`
 → 64 threadgroups each. For the gate: 1,024 again.
 
-Why dispatch llama's kernels instead of writing better ones? Because the
-campaign's gate is *exactness against pinned llama.cpp*, and the cheapest
-way to match a reference's floating-point behavior — reduction order,
-rounding points, accumulation tree and all — is to run the reference's own
-compiled code. The ancestor book learned the complementary lesson on
-different hardware: its hand-written Q4_K GEMV beat llama's kernel by 6–10 %
-in isolated A/B with bit-identical output `[ferrite-book Ch 11]` — a
-Ferrite-lineage measurement on A18 Pro, never a Muser result — and even
-there, the inner loop was proven *not* to be the engine's gap. Muser's
-constraint is stricter than Ferrite's was: full-logit and logprob parity,
-not token parity. Under that constraint "pin the kernel" dominates "beat
-the kernel."
+Why dispatch llama's kernels instead of writing better ones? We arrived at
+this fork holding evidence for the other branch. The ancestor line had
+written its own Q4_K GEMV and measured it: it beat llama's kernel by 6–10 %
+in isolated A/B, with bit-identical output
+`[ferrite-book Ch 11]` — a Ferrite-lineage measurement on A18 Pro, never a
+Muser result. The expectation we carried into Muser was that the same trick
+would transfer, and that owning the inner loop would be strictly better
+than borrowing one.
+
+That expectation did not survive contact with Muser's gate, and the reason
+has nothing to do with speed. Muser's
+gate is stricter than Ferrite's was: full-logit and logprob parity against
+a pinned comparator, not token parity. Put plainly, matching the reference
+is not a property of the answer, it is a property of the *route to* the
+answer — reduction order, rounding points, accumulation tree and all. A
+hand-written kernel must therefore prove bitwise equality with llama's
+route, and "bit-identical" is a claim you re-earn at every shape, every
+dtype, every batch width, forever. That is the lesson: the cheapest way to
+match a reference's floating-point behavior is to run the reference's own
+compiled code.
+
+It helps that the prize was small anyway. Even in the ancestor's own
+telling, the inner loop was proven *not* to be the engine's gap — the win
+we would have been defending was never the one that mattered. Under Muser's
+constraint, "pin the kernel" dominates "beat the kernel."
 
 ### 13.4.2 The standalone fallbacks — `muser_matvec_q4k_4r2s` and friends
+
+What if the pinned metallib is not on the machine at all? Muser does not
+refuse to run — it falls back to kernels it owns. That fallback is also the
+only member of this family whose source we can open on the page, which
+makes it the place to learn what the pinned kernel is doing behind its
+compiled wall. Keep one thing in reserve while you read it, though: the
+tradeoffs section returns to argue that "falls back" and "runs the same
+computation" are not the same sentence.
 
 When the metallib is absent, the same wrapper falls back to Muser-owned
 kernels (`qkv.rs:451-474`): Q4_K routes to `muser_matvec_q4k_4r2s`
@@ -303,15 +334,22 @@ The anatomy, in the order the kernel uses it:
 - **`simd_sum` per row, lane 0 writes** — the 32 lanes each covered 32 of
   every 256 elements; one hardware instruction per row recombines them.
 
-This is the *pre-decoded-scales* design point
-`[ferrite-book Ch 12]`; the ancestor's sibling v4 kernel chose
-*deferred scaling* instead (accumulate raw nibble products, apply scales
-once per sub-block at the end). Both are valid; they trade multiply count
-against inner-loop simplicity. Muser's fallback keeps the pre-decoded
-shape, and — because it is a fallback — its rounding differs from the
-pinned kernel's, which is one more reason serving pins the metallib
-(`encode.rs:370-385` goes further: Q6_K has *no* standalone fallback at
-all, "so its math and dispatch remain comparator-exact").
+There was a genuine fork inside that inner loop, and the ancestor line
+took both branches. What you just read is the *pre-decoded-scales* design
+point `[ferrite-book Ch 12]`: unpack every scale up front, then run a loop
+with nothing in it but loads and multiply-adds. The sibling v4 kernel chose
+*deferred scaling* instead — accumulate the raw nibble products and apply
+the scales once per sub-block at the end, spending fewer multiplies for a
+more tangled loop. Neither branch is wrong. They are two ways to spend the
+same arithmetic, and on their own terms both are correct.
+
+The reason to care is downstream of correctness. Fold the scales in early
+and you round early; defer them and you round late. Same function, same
+inputs, different last bit. So the Muser fallback is not a slower copy of
+the pinned kernel — it is a *different* kernel that happens to agree to
+within a rounding step. The tree makes that policy explicit rather than
+letting it happen quietly: `encode.rs:370-385` gives Q6_K *no* standalone
+fallback at all, "so its math and dispatch remain comparator-exact."
 
 ### 13.4.3 The other two libraries, briefly
 
@@ -327,9 +365,11 @@ inner-loop kernels change.
 
 ## 13.5 The Rust dispatch — one concurrent set of four
 
-`encode_token` records the four projections inside a single `dispatch`
-closure, so the GPU may overlap them; the comment at the call site is the
-design statement:
+Four matvecs read the same vector. Do they have to take turns? Nothing in
+the math says so, and nothing in the encode says so either — the permission
+to overlap is expressed by *where the calls sit*, not by a scheduler.
+`encode_token` records all four projections inside a single `dispatch`
+closure. The comment at the call site is the design statement:
 
 ```rust
 // crates/muser-engine/src/decode.rs:5566
@@ -359,17 +399,26 @@ dispatch(command, |encoder| {
 `encode_projection` (`decode.rs:6044-6089`) is the dtype router: F16 →
 `encode_f16_matmul`, NVFP4 → `encode_nvfp4_matmul`, kquant →
 `encode_quantized_matmul` of §13.4. Each of the four calls lands on the
-same 26,624-byte read of `post_norm` (L2-resident after the first) and on
-its own disjoint weight span and output buffer. One closure, four kernel
-dispatches — which is exactly why the gap-instrumentation note warns that
-its "closures" are not kernel counts (`decode-dispatch-gap-20260815.md`
-§Instrumentation correction: "the `qkvg` closure encodes four kernel
-dispatches but contributes one profiler count").
+same 26,624-byte read of `post_norm` — cheap after the first, because by
+then it is L2-resident — and on its own disjoint weight span and its own
+output buffer. That disjointness is the whole permission slip: no kernel
+here writes anywhere another kernel reads, so none of them needs to wait.
+
+One closure, four kernel dispatches. That asymmetry matters beyond this
+page, because it is the kind of thing that quietly corrupts a measurement.
+Count closures in a profile, call the count "dispatches," and you are
+wrong by a factor on exactly this line — and the QKV line is one of the
+biggest in the layer, so the error does not stay small. The gap note says
+it in its own words, and we kept the correction:
+`decode-dispatch-gap-20260815.md` §Instrumentation correction — "the
+`qkvg` closure encodes four kernel dispatches but contributes one profiler
+count".
 
 ## 13.6 The access pattern — the budget, itemized
 
-This is where the bandwidth story lives. Per layer, per token, the four
-matvecs read:
+This is where the bandwidth story lives. The question is blunt: what does
+one token cost in bytes, and how much of that bill do these four matvecs
+sign? Per layer, per token, the four matvecs read:
 
 ```
   q    : 6,656 × 4,096 = 27,262,976 params
@@ -380,16 +429,22 @@ matvecs read:
   attention projections total = 57,933,824 ≈ 57.9 M params
 ```
 
-At Q4_K's 0.5625 bytes/param that is ≈ 32.6 MB per layer — but note
-carefully: *which tensors ship at which dtype is a property of the loaded
-GGUF* (the loader reads dtype per tensor, `decode.rs:1294-1310`; the one
-in-tree anchor is that the release artifact's FFN gate/up are Q4_K,
-`decode.rs:5820-5821`). Parametrize instead: at Q4_K bitrate the four
+At Q4_K's 0.5625 bytes/param that is ≈ 32.6 MB per layer. Resist writing
+that figure down as *the* number, though, because it is not a property of
+the architecture: which tensors ship at which dtype is a property of the
+loaded GGUF. The loader reads a dtype per tensor as it maps the file, and
+the only anchor the tree gives us is that the release artifact's FFN
+gate/up are Q4_K. Both receipts are retained — `decode.rs:1294-1310` for
+the per-tensor read, `decode.rs:5820-5821` for the anchor.
+
+So parametrize rather than assert. At Q4_K bitrate the four
 matvecs are ~32.6 MB/layer; at Q5_K (0.6875 B/param) ~39.8 MB; at Q6_K
-(0.8203 B/param) ~47.5 MB. Put the same layer's other matvecs beside
-them — o_proj (27.3 M params), FFN gate/up/down (3 × 132.9 M params) —
-and the attention set is ≈ 12 % of the layer's ~483.8 M projection
-parameters, the FFN ≈ 82 %, o_proj ≈ 6 %. Scale by 52 layers and add the
+(0.8203 B/param) ~47.5 MB. Now put the same layer's other matvecs beside
+them — o_proj (27.3 M params), FFN gate/up/down (3 × 132.9 M params).
+Against the layer's ~483.8 M projection parameters the attention set is
+≈ 12 %, o_proj ≈ 6 %, and the FFN ≈ 82 %: the family this chapter is about
+is the *smaller* share of the layer's traffic, which is worth knowing
+before you spend a week optimizing it. Scale by 52 layers and add the
 ~1.34 B-parameter embedding and LM head each, and the per-token stream is
 the artifact's 16,756,681,056 bytes (`lib.rs:14`) — the number
 [Ch 1](01-why-inference-is-a-memory-problem.md) turned into a token-time
@@ -427,16 +482,28 @@ serves decode at all:
 // parity.
 ```
 
-Fusion is not free even when it is numerically exact in isolation: it must
-be exact *against the pinned comparator*, per kernel, and the legacy fused
-kernels were not. Serving therefore routes single tokens through the
-one-row **batch** graph (`forward_batch`, `decode.rs:2092`) — the same op
-sequence with the pinned kernels — while the legacy `encode_token` graph
-this book narrates survives for teacher-forced harnesses and phase
-profiling (`decode.rs:2124-2182`, gated by `MUSER_METAL_PHASE_PROFILE`).
-The tradeoff is paid in engineering discipline, not tokens: Muser keeps
-two graphs precisely so the cheap one can be held out of serving until it
-proves parity.
+Read that comment as the war story it is. We had the fused kernels
+already — the Ferrite-lineage fused residual/norm and gate-up path, fewer
+dispatch boundaries per layer, exactly the win the fused-QKV argument above
+is reaching for. We expected a free speedup, on the intuition that fusing
+two exact operations ought to stay exact. It was not free. The fused
+rounding diverged from the source-pinned llama Metal graph by enough to
+breach public logprob tolerance: no bug, no lost precision anyone could
+point at, just a different order of operations arriving at a different
+last bit.
+
+The lesson is the one this chapter keeps re-teaching in new words. Fusion
+is not free even when it is numerically exact in isolation, because the
+standard here is not "exact" — it is "exact *against the pinned
+comparator*, per kernel." A fused kernel that is more accurate than the
+reference still fails. So serving routes single tokens through the one-row
+**batch** graph (`forward_batch`, `decode.rs:2092`) — the same op sequence,
+running the pinned kernels — while the legacy `encode_token` graph this
+book narrates survives for teacher-forced harnesses and phase profiling
+(`decode.rs:2124-2182`, gated by `MUSER_METAL_PHASE_PROFILE`). The cost is
+paid in engineering discipline, not in tokens: Muser keeps two graphs
+precisely so the cheap one can be held out of serving until it proves
+parity.
 
 **Batch-width boundaries are numerical boundaries.** For multi-token
 inputs the same wrapper switches kernels by token count, and the switch
@@ -451,6 +518,11 @@ comment is the campaign in one paragraph:
 // substituting repeated decode GEMVs here breaks embedding/logprob
 // numerical parity even when every other layer is identical.
 ```
+
+Decode never leaves the single-token rung, so it is fair to ask why the
+rest of the ladder belongs in a decode chapter. It belongs because parity
+is not a decode-only property: the verify path and the prefill path enter
+through this same wrapper, and every rung of it is a different arithmetic.
 
 At `tokens` 4..=8 the pinned `kernel_mul_mv_ext_{q4,q5,q6}_K_f32_r1_{2..5}`
 pipelines run (`encode.rs:959-1003`); at 16 rows the M16 n32 tiles; at
@@ -481,19 +553,29 @@ explicit rather than accidental.
 
 ## 13.8 Where the gap lives
 
-Two answers, and the distinction matters. In the **closure accounting** of
-`[docs/decode-dispatch-gap-20260815.md]`, these four matvecs sit in the
-*common math* row — 406 closures, production delta 0, "required math /
-Keep" — they are not one of the +196 families (104 norm boundaries, 39 SWA
-staging, 52 KV-publication splits, 1 copy). No repeated matvec closure
-doing identical arithmetic exists to remove. In the **byte accounting** of
-[Ch 1](01-why-inference-is-a-memory-problem.md), however, this family *is*
-the bulk of the budget — the token's time is the time to stream 16.76 GB
-through kernels like these, and how close they sit to the machine's
-bandwidth ceiling is the recurring question the book returns to at
-[Ch 38](38-measuring-against-llama-cpp.md). The reconciliation of those two
-framings — closures vs bytes — is exactly the epistemics the gap note
-exists to enforce.
+Does this family contribute to the decode gap? There are two answers, and
+holding them apart is the whole point of the section.
+
+In the **closure accounting** of `[docs/decode-dispatch-gap-20260815.md]`,
+the answer is no. These four matvecs sit in the *common math* row — 406
+closures, production delta 0, "required math / Keep." They are not among
+the +196 closure families the note calls out (104 norm boundaries, 39 SWA
+staging, 52 KV-publication splits, 1 copy). There is nothing here to
+delete: no repeated matvec closure doing identical arithmetic exists to
+remove.
+
+In the **byte accounting** of
+[Ch 1](01-why-inference-is-a-memory-problem.md), the answer is yes, and
+emphatically so — this family is the bulk of the budget. The token's time
+is the time to stream 16.76 GB through kernels like these, and how close
+they sit to the machine's bandwidth ceiling is the recurring question the
+book returns to at [Ch 38](38-measuring-against-llama-cpp.md).
+
+Both answers are correct, because they answer different questions. "Is
+there wasted work here?" is a closure question, and the closures say no.
+"Is this where the time goes?" is a byte question, and the bytes say yes.
+Keeping those two framings from contaminating each other is exactly the
+epistemics the gap note exists to enforce.
 
 ## 13.9 What comes next
 

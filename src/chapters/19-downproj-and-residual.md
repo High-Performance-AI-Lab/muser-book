@@ -15,8 +15,12 @@
 ## 19.1 What it computes
 
 [Ch 18](18-swiglu-ffn.md) left a `[19,968]` vector in
-`activations.ffn_gate` — the gated, activated FFN intermediate. Two
-operations finish the layer:
+`activations.ffn_gate` — the gated, activated FFN intermediate. It is the
+widest thing a layer ever holds, and it is the wrong shape to hand back to
+the loop. So the closing question of every layer is a plumbing question:
+how does that wide intermediate get folded back into the narrow residual
+stream, and who prepares the stream for the layer that comes next? Two
+operations answer it:
 
 ```
 1.  projected = W_down · ffn_mid                W_down : [6656 × 19968]
@@ -68,8 +72,14 @@ TAIL#2.*
 
 ## 19.3 The matrix operation — and the Q6_K wrinkle that is real here
 
-The matvec is mechanically the family you know: 6,656 output rows, each a
-dot product over 19,968 inputs. What distinguishes it is the *dtype mix*.
+Start with the question we actually wanted answered here: how many bytes
+does this matvec read? The mechanism is the family you already know —
+6,656 output rows, each a dot product over 19,968 inputs — so we expected
+to multiply one row size by one row count and be done in a paragraph. The
+artifact would not give a single answer. What distinguishes this
+projection is its *dtype mix*: it is the one weight in the layer that is
+not stored in a single format.
+
 On the kquant release artifact, `ffn_down` tensors come in **both Q4_K and
 Q6_K** — the verify-shape table lists `ffn_down-q4k 19968->6656 q4k` and
 `ffn_down-q6k 19968->6656 q6k` side by side
@@ -97,12 +107,21 @@ down 109.03) against a Q4_K-down layer's 224.3 MB. The ancestor book's
 Q4_K_M mix table [ferrite-book Ch 18] taught exactly this device — spend
 extra bits on the projection whose output lands directly in the residual
 stream — and Muse Glimmer's artifact realizes the same idea with its own
-(per-layer, GGUF-internal) split. Whether the *quality* payoff justifies the
-+45.8 % on the layers that take it is the checkpoint author's call, inherited
-not measured **[unverified]**.
+(per-layer, GGUF-internal) split. The intuition is worth saying twice,
+because it is the entire reason a mixed-format checkpoint exists at all:
+an error made anywhere else in the layer is consumed and largely forgotten
+inside that layer, but an error made in `ffn_down` is *added into the
+residual stream*, and every remaining layer carries it forward. Bits spent
+on this projection buy quiet downstream. Whether the *quality* payoff
+justifies the +45.8 % on the layers that take it is the checkpoint
+author's call, inherited not measured **[unverified]**.
 
-A hand-sized worked example of operation 2, since the tail is this chapter's
-kernel. Take `n = 4`, `residual = [1, 2, 3, 4]`, `projected = [4, 0, 0, 0]`,
+The tail is this chapter's kernel, so operation 2, the layer's real exit,
+deserves a worked example small enough to check by hand. Watch what the two
+epsilons actually do to a vector: the first normalization shrinks the
+*delta* before it lands, the second renormalizes the *sum* after it has
+landed. Take `n = 4`, `residual = [1, 2, 3, 4]`,
+`projected = [4, 0, 0, 0]`,
 `post_weight = [1,1,1,1]`, `next_weight = [1,1,1,1]`, both eps tiny:
 
 ```
@@ -117,7 +136,11 @@ One kernel, two normalizations, one add — with a device-memory publication
 
 ## 19.4 The Metal kernel — `muser_fused_norm_residual_rms_norm_32sg`
 
-The tail kernel, verbatim. It is the decode-only member of the sandwich
+What does one kernel have to do to be simultaneously a layer's exit and the
+next layer's entrance? It has to normalize with one epsilon, add, and
+normalize again with a different epsilon — and it has to do all of that
+without ever letting the two reductions see each other's rounding. Here is
+the tail kernel, verbatim. It is the decode-only member of the sandwich
 family [Ch 12](12-rmsnorm-and-the-dual-eps-sandwich.md) introduced; read it
 here as the layer-exit machine:
 
@@ -191,10 +214,7 @@ Three passes, two barriers apiece:
   `float4`s (`i += 1024`); each of the 32 SIMD groups reduces with
   `simd_sum`, writes one partial to `shared[sgitg]`; thread 0 sums the 32
   partials **in order** and posts `rsqrt(mean + eps1)` to `shared[32]`.
-  This 32-partial, fixed-order reduction is the pinned llama.cpp shape —
-  the dispatch-gap investigation found the earlier four-SIMD-group `rsqrt`
-  variant "not exact" and replaced it with precisely this
-  [docs/decode-dispatch-gap-20260815.md, "The corrected fusion"].
+  This 32-partial, fixed-order reduction is the pinned llama.cpp shape.
 - **Pass 2 (the residual add — the in-place mutation).** Each thread
   computes `value = hidden + src·inv_src·weight1`, writes it **back into
   `hidden`**, and accumulates `dot(value, value)` for the second norm. This
@@ -205,28 +225,54 @@ Three passes, two barriers apiece:
   `post_ffw_norm`; `weight2` is the *next* layer's `attn_norm` (or the
   final `output_norm` after layer 51) — chosen by the caller (§19.5).
 
+That "in order" in the first pass looks like pedantry, and it is the part
+of the kernel we got wrong first. The fork was how to fold a threadgroup's
+partial sums: an earlier version of the tail reduced across four SIMD
+groups rather than the full complement, gathering fewer partials in
+whatever order they arrived. Same summands, same mean, same `rsqrt` — we
+expected the same bits out. We did not get them. The dispatch-gap
+investigation found that earlier four-SIMD-group `rsqrt` variant "not
+exact" and replaced it with precisely the shape quoted above
+[docs/decode-dispatch-gap-20260815.md, "The corrected fusion"]. The lesson
+is one this chapter keeps circling back to: when a kernel's job is to match
+another engine bit for bit, the *order* of a floating-point reduction is
+part of the interface, not an implementation detail. Add the same numbers
+in a different sequence and you get a different number.
+
 Safety of the in-place add, in full: **one threadgroup owns one row**
 (grid = rows), and within the threadgroup each thread owns a disjoint
 strided set of `float4` slots — no two threads touch the same `i` in any
 pass, so no in-dispatch race on `hidden`. The barriers order the *shared*
 `rsqrt` handoffs, not the data writes (each thread's pass-3 reads the same
-slots it wrote in pass 2). Across dispatches, the consumer of `hidden`/
+slots it wrote in pass 2). Put it plainly: the kernel is allowed to
+scribble on the residual stream in place because, for the duration of the
+dispatch, nothing else is looking at it — no other thread, no other
+threadgroup. Across dispatches, the consumer of `hidden`/
 `output` is the next layer's first kernel, sequenced by the tracked-buffer
-ordering of the single-encoder token graph ([Ch 17](17-sigmoid-gate-and-oproj.md)
-§17.7; the taxonomy formalizes in [Ch 35](35-ordering-hazards-and-the-dispatch-gap.md)).
-And the geometry note in the wrapper: 32 SIMD groups keep "the 6,656-wide
-Muse tail resident" — 1,024 threads, one row per threadgroup
+ordering of the single-encoder token graph that
+[Ch 17](17-sigmoid-gate-and-oproj.md) §17.7 introduced;
+[Ch 35](35-ordering-hazards-and-the-dispatch-gap.md) formalizes that
+taxonomy.
+
+One geometry note from the wrapper, because it explains the kernel's odd
+proportions: 32 SIMD groups keep "the 6,656-wide Muse tail resident" —
+1,024 threads, one row per threadgroup
 (`crates/muser-engine/src/metal/encode/norm.rs:236-240`), with 33 floats of
 threadgroup memory padded to 144 bytes for alignment.
 
 ## 19.5 The Rust dispatch — the layer exit in source
 
-The down projection is the stock `project` wrapper — same pinned ggml
-matvec, dtype routed automatically (Q4_K **or** Q6_K `ffn_down` both land
-on `kernel_mul_mv_q{4,6}_K_f32`, `qkv.rs:429-450` with the
-`(144, 2)/(210, 2)` rows-per-group table of [Ch 13](13-the-qkv-gate-matvec-family.md)).
+Two dispatches close the layer, and only one of them is interesting. The
+down projection is the stock `project` wrapper — the same pinned ggml
+matvec the rest of the layer uses, with the dtype routed automatically.
+Q4_K **or** Q6_K `ffn_down` both land on `kernel_mul_mv_q{4,6}_K_f32`, and
+the rows-per-group table that picks the launch geometry — the
+`(144, 2)/(210, 2)` rows [Ch 13](13-the-qkv-gate-matvec-family.md) walked
+through — is read out of `qkv.rs:429-450`. The mixed dtype we made so much
+of above costs the dispatch code nothing at all; it is a table lookup.
+
 The interesting dispatch is what follows — the tail and its `next_norm`
-selection:
+selection, which is where the layer decides who it is handing off to:
 
 ```rust
 // crates/muser-engine/src/decode.rs:5863
@@ -284,7 +330,10 @@ boundaries.
 
 ## 19.6 The access pattern
 
-Down projection per layer:
+Where does the time go in this pair of dispatches? The answer is lopsided
+enough to be worth stating before the arithmetic: one of the two operations
+moves essentially all of the bytes, and the other is free. Down projection
+per layer:
 
 ```
   Q4_K: read W_down 74,760,192 B   read ffn_mid 79,872 B   write projected 26,624 B
@@ -307,6 +356,14 @@ of which the down projection is a third to 42 %. Across 52 layers the FFN
 family is the plurality of the 16.76 GB artifact — the arithmetic of
 [Ch 18](18-swiglu-ffn.md) §18.7 plus this chapter's down numbers.
 
+Turn that around and it says something uncomfortable about the shape of
+this chapter. The tail kernel — three passes, two reductions, an in-place
+mutation, the longest section here — moves less traffic than a rounding
+error on the matvec that precedes it. Expensive and interesting are not
+the same property. The matvec is where the bytes are; the tail is where
+the *boundary* is, and boundaries are what the rest of the chapter is
+about.
+
 ## 19.7 Tradeoffs
 
 **Q6_K vs Q4_K on the down projection — +45.8 % bytes on the layers that
@@ -315,12 +372,22 @@ deliberate precision spend on the last projection before the residual — the
 same reasoning the ancestor's Q4_K_M mix table documented for Qwen
 [ferrite-book Ch 18], realized differently here. Both engines pay it
 equally (both read the same GGUF through equivalent pinned kernels), so it
-is a quality-vs-bytes decision, not a parity hazard. The M16 verify-shape
-bench measured the two side by side in its candidate sweep — Q4_K ffn_down
+is a quality-vs-bytes decision, not a parity hazard.
+
+What we did not know going in was whether it was also a *speed* hazard. A
+wider quant means a fatter block to decode — more shifts, more scale
+unpacking per weight — so we expected the six-bit path to be slower per
+dispatch by something more than its byte ratio, and we went looking for
+that penalty. The M16 verify-shape bench measured the two side by side in
+its candidate sweep, and the penalty was not there: Q4_K ffn_down
 0.891 → 0.533 ms and Q6_K ffn_down 0.897 → 0.539 ms per dispatch under the
-winning n32 tile [ledger Stage B close-out, L0 "Winner (n32)"] — which also
-tells you the two formats cost nearly the same *time* per byte on this
-GPU; the +45.8 % is a byte bill, not a kernel-efficiency bill.
+winning n32 tile. The ledger keeps that sweep
+[ledger Stage B close-out, L0 "Winner (n32)"]. Read the two rows next to
+each other and the conclusion is hard to miss: the formats cost nearly the
+same *time* per byte on this GPU, so the +45.8 % is a byte bill, not a
+kernel-efficiency bill. That is a comfortable result — it means the
+checkpoint author's precision choice can be argued about purely in terms
+of bandwidth, with no hidden decode tax to price in.
 
 **One fused tail vs three separate kernels.** Unfused, the layer exit is:
 norm the projection (1e-8), add into the residual, norm the residual
@@ -333,7 +400,12 @@ boundary**" — pass 2 writes `hidden` to device memory and pass 3 reads it
 back, exactly where llama.cpp's graph publishes between nodes. It is a
 fusion of *dispatches*, not of *arithmetic boundaries*; that restraint is
 why it can be exact at all, and the diagnostic split route survives behind
-`MUSER_NO_FUSED_PREFILL_DUAL_NORM` (`decode.rs:1331`) as the control.
+`MUSER_NO_FUSED_PREFILL_DUAL_NORM` (`decode.rs:1331`) as the control. State
+it as the rule the next section tests to destruction: a fusion may delete
+*dispatches*, but it may not delete *rounding points*. Wherever the
+reference graph writes a float to memory and reads it back, a value gets
+truncated to storage precision — and that truncation is part of the
+answer, not an artifact standing in front of it.
 
 **The 104-group question — fusion rejected where it would matter most.**
 This is the tradeoff this chapter exists for; §19.8 gives it its own
@@ -341,8 +413,17 @@ section with the numbers.
 
 ## 19.8 Where the gap lives — the 104 norm-boundary groups
 
-The one-token dispatch-gap investigation reconciled the production
-(serving) graph's 760 profiling closures against the legacy fused route's
+Every kernel chapter in this part ends by asking where its kernel sits in
+the decode gap. This one has a real answer, and it is the least comfortable
+answer in the book: the layer boundary — the thing the previous sections
+spent their length building — is the largest single identified block of
+extra dispatch work in the serving graph, and the obvious way to remove it
+is the one thing we are not allowed to do. Here is how we found that out,
+and what we took instead.
+
+Start with the census. The one-token dispatch-gap investigation reconciled
+the production (serving) graph's 760 profiling closures against the legacy
+fused route's
 564 — a difference of +196 — into four families plus one copy
 [docs/decode-dispatch-gap-20260815.md, "Corrected closure-count diff at
 position 2,048"]:
@@ -366,32 +447,55 @@ route has one `post_attn_ffn_norm`, and `layer.*.post_ffn_norm` +
 `output_norm` where legacy has `post_ffn_next_norm`
 [docs/decode-dispatch-gap-20260815.md, label table].
 
-**The fusion that would remove those 104 groups exists and was rejected
-because it changes logprobs beyond contract.** The hybrid postmortem is
-exact about how far beyond: reusing a retained-activation schedule with
-fast fused boundaries preserved the greedy token but produced a full-logit
-maximum absolute error of `4.6300888e-4`, a normalized-logprob maximum
-error of `3.197146176834309e-4` against the **`1e-4` contract** — with
+So we tried to take them. The fork is the one any reader of that table
+would take: the tail kernel we just read is proof that a dual-eps boundary
+*can* be fused exactly, the serving graph keeps those same boundaries
+separated, so fuse them there and the largest rejectable family in the
+diff simply goes away. We built the hybrid and we expected it to come out
+bit-identical — the corrected fusion had already come out bit-identical,
+on the same arithmetic, in the same kernel family.
+
+It did not. **The fusion that would remove those 104 groups exists and was
+rejected because it changes logprobs beyond contract.** The seductive part
+is that the greedy token survived: reusing a retained-activation schedule
+with fast fused boundaries picked the same word, so a casual sample of the
+model looks identical to the baseline. The logits did not survive, and the
+hybrid postmortem is exact about how far beyond contract they went — a
+full-logit maximum absolute error of `4.6300888e-4`, a normalized-logprob
+maximum error of `3.197146176834309e-4` against the **`1e-4` contract**, with
 201,970 of 202,048 logits differing and the first KV divergence in *layer
-1*, value plane element 524,115, one f16 ULP apart (bits 39,892 vs 39,893)
+1*, value plane element 524,115, one f16 ULP apart (bits 39,892 vs 39,893).
+The runs that proved it are retained
 [docs/decode-dispatch-gap-20260815.md, "Rejected hybrid postmortem";
 receipts `muser-receipt://pinned-token-parity-20260814-v{3,4}/`].
-One rounding difference in the first layer's residual chain, amplified
-through 51 more layers, breaks a public numerical commitment. The attempt
+
+Follow that divergence back and it is a single rounding difference in the
+first layer's residual chain — one bit, in exactly the structure this
+chapter has been describing — amplified through 51 more layers until it
+breaks a public numerical commitment. That
+is the lesson, and it is why the fusion rule of the previous section is
+stated as a rule rather than a preference: the boundary you may fuse is the
+one that keeps its rounding points, and this hybrid quietly dropped one.
+The decision followed from the lesson without much argument. The attempt
 "was removed rather than hidden behind a tolerance or shipped as an
 alternate route" — and the routing comment of [Ch 18](18-swiglu-ffn.md)
 §18.6 (`decode.rs:2085-2091`) is the standing consequence: serving decode
 takes the batch graph with the exact pinned kernels *because* the fused
 boundaries breach tolerance.
 
-What *was* taken: the one exact removal — the last-row copy, one closure
-and one 6,656-element f32 copy, worth **−0.136 ms GPU (−0.34 %) in a
+So what survived the rejection? Exactly one removal, and it is deliberately
+small: the last-row copy — one closure and one 6,656-element f32 copy,
+worth **−0.136 ms GPU (−0.34 %) in a
 single-run diagnostic**, with no wall-time claim (the +4.380 ms wall sample
 was submit/wait noise) [docs/decode-dispatch-gap-20260815.md, "Landed and
 rejected reductions"]. The corrected exact dual-norm fusion (the 32sg
 kernel's pinned-reduction form) matched the baseline's full-logit SHA-256
 but was retained as "historical self-consistency only" — useful, not
-sufficient; the five-sample streamed serving number after it was 28.290
+sufficient. The distinction is worth holding onto, because it is easy to
+mistake one for the other: matching your own previous bytes proves you have
+not broken yourself, and proves nothing about whether you agree with the
+engine you are being measured against. By that point the agreement was the
+whole game. The five-sample streamed serving number after it was 28.290
 tok/s against llama's 33.428 (ratio 0.8463), Stage A still open at that
 point [same doc]. The gap closed later only when the anchor itself changed
 — J0 made llama's own bytes the gate and J1 transplanted llama's attention

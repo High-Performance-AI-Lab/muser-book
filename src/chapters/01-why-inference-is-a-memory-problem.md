@@ -25,7 +25,10 @@ That is the whole book in one line. LLM inference — the act of a model
 producing text — looks like a computation problem. It is not. It is a
 **bandwidth** problem wearing a computation costume. This chapter derives
 that fact on the back of an envelope, from the model's own geometry, so that
-by the end you can reproduce every number yourself.
+by the end you can reproduce every number yourself. We will do the arithmetic
+together, in roughly the order we did it ourselves — including the step where
+we went looking for a number we assumed existed, did not find it, and had to
+change how we asked the question.
 
 And here is the question that recurs in every chapter after this one — the
 book's standing question:
@@ -42,7 +45,9 @@ answers as we go.
 
 ## 1.2 The cast: a few words you need first
 
-Before the arithmetic, eight one-sentence definitions. Each is expanded in
+Before the arithmetic, eight one-sentence definitions. We are about to count
+two quantities and divide them by two speeds, and every word below is
+load-bearing in one of those counts. Each is expanded in
 the [glossary](../glossary.md) and, where it matters, in a later chapter.
 
 - A **[parameter](../glossary.md#parameter)** is one learned number inside
@@ -85,10 +90,16 @@ is derived, and the ones that are measurements say so.
 
 ### Step 1 — how many parameters?
 
-Muse Glimmer's geometry is parsed fail-closed from the GGUF at load
-(`[crates/muser-engine/src/config.rs:169-181]`) and asserted against the
-pinned release artifact by a test
-(`[crates/muser-engine/tests/muse_golden.rs:97-108]`):
+The label on the box says thirty billion parameters. Labels round, and we are
+about to divide bytes by this number, so we would rather read the model's
+true shape off the artifact than off the marketing.
+
+Happily, we do not have to take anyone's word for the shape. Muse Glimmer's
+geometry is parsed fail-closed from the GGUF at load time, and a test asserts
+every parsed field against the pinned release artifact. The table below is
+therefore not a transcription from a model card — it is the geometry the
+engine refuses to start without `[crates/muser-engine/src/config.rs:169-181]`
+`[crates/muser-engine/tests/muse_golden.rs:97-108]`:
 
 | Field | Value | Source |
 |---|---:|---|
@@ -103,8 +114,10 @@ pinned release artifact by a test
 
 *Table 1.1: Muse Glimmer geometry, read from the pinned GGUF contract.*
 
-Now count parameters from the shapes (the per-tensor shape contract is
-asserted at `config.rs:294-318`). Per layer:
+Now count parameters from the shapes. The loader asserts a per-tensor shape
+contract at `config.rs:294-318`, so the dimensions multiplied out below are
+the ones the engine itself checks on the way in: a wrong figure here fails
+the load rather than quietly producing a wrong book. Per layer:
 
 ```text
 attention projections:
@@ -133,6 +146,9 @@ should be able to re-derive it.
 
 ### Step 2 — how many bytes on disk?
 
+Parameters are not bytes, and it is bytes that the memory system has to move.
+So the next question is what all those learned numbers actually weigh.
+
 Full-precision f32 would be 4 bytes each: 27.85e9 × 4 ≈ 111 GB. That does
 not fit the plan. The pinned kquant GGUF stores most weights in 4-to-6-bit
 blocks instead (Part II explains the formats), and its exact size is
@@ -143,9 +159,12 @@ blocks instead (Part II explains the formats), and its exact size is
 assert_eq!(metadata.len(), 16_756_681_056, "release GGUF byte size");
 ```
 
-The same fact is stated in the engine's crate doc
-(`[crates/muser-engine/src/lib.rs:14]`): "The pinned target artifact is
-16,756,681,056 bytes on disk."
+That assertion is not decoration. The size is written down in two independent
+places that have to agree, and the second is the engine's own crate doc,
+which states it in words: "The pinned target artifact is 16,756,681,056 bytes
+on disk." `[crates/muser-engine/src/lib.rs:14]` If a rebuild ever changed the
+artifact, the gate would fail loudly rather than let this chapter's
+arithmetic quietly drift.
 
 Units, because they will bite you otherwise:
 
@@ -169,6 +188,11 @@ used once per token, so they cannot live in any cache — caches are
 megabytes. They must be streamed, in full, out of main memory, **for every
 single token**.
 
+Say it the other way round, because this is the part that trips people up.
+The weights are not a dataset the GPU loads once and then keeps close. They
+are a river. One token is one complete pass of that river past the ALUs, and
+the next token starts the river again from the top, byte for byte the same.
+
 ```text
 1 token   → read ~16.76 GB of weights, once.
 10 tokens → ~167.6 GB.
@@ -176,6 +200,12 @@ single token**.
 ```
 
 Not because the model grows — because every token re-reads all of it.
+
+A reader who already knows what a KV cache is will be objecting by now: the
+weights are not the only thing decode reads. Quite right, and the reason it
+matters here is that our envelope is only honest if the other traffic is
+negligible — if it were comparable, every ratio in this chapter would be
+wrong. So it is worth spending a paragraph proving that it is not.
 
 The non-weight traffic exists but is small at shallow context. The KV cache
 (a per-layer memory of past tokens; [Ch 15](15-kv-store-and-the-ring.md) is
@@ -185,9 +215,15 @@ its chapter) costs 1,024 bytes per layer per cached token — the formula
 (a ~98-token context), attention reads 52 × 98 × 1,024 B ≈ 5.2 MB per token
 — 0.03 % of the weight stream. At the full 131,072-token context it grows
 to ~1.83 GB per token `[docs/memory-footprint.md]` — still 9× smaller than
-the weights; [Ch 22](22-the-price-of-context.md) cost it out properly.
+the weights; [Ch 22](22-the-price-of-context.md) costs it out properly. The
+objection is real, then, but it does not change the shape of the answer: at
+the depths this chapter reasons about, the weight stream is the traffic.
 
 ### Step 4 — how much arithmetic is that?
+
+Bytes counted. Now the other side of the comparison, the side everyone
+assumes is the expensive one: how much arithmetic does a single token
+actually demand?
 
 A matvec `y = W·x` over a matrix with *N* elements costs ~2N FLOPs — one
 multiply-add pair per element. Summing only the matrices (norms and the
@@ -206,17 +242,29 @@ multiply.) That is the entire compute budget for one token: ~53 GFLOP.
 
 ### Step 5 — what does the machine actually do?
 
-Here this book departs from the ancestor text it descends from. The Ferrite
-book, written for a small phone-class chip, could quote a measured DRAM
-ceiling for its hardware. For this M3 Ultra, no Muser document records a
-measured pure-read DRAM ceiling, so this book works the other way around: it
-**derives the effective read rate from measured decode throughput** and
-labels it as such.
+We have the bytes and we have the FLOPs. To turn either into a time we need
+the machine's own speeds — and this is where the book departs from the
+ancestor text it descends from. The fork is worth walking slowly, because
+what we chose here governs every bandwidth claim in the rest of the book.
 
-The kquant lane's headline decode number — five repetitions after warmup,
-synthetic fixture, F16 KV, 66-token prefix / 32 teacher-forced tokens
-(teacher-forced: the harness feeds known prior tokens rather than
-model-generated ones) — is:
+The Ferrite book, written for a small phone-class chip, could quote a
+measured DRAM ceiling for its hardware, and we expected to do the same: run a
+read microbenchmark, take the ceiling, divide the weight bytes by it, done.
+We could not. For this M3 Ultra, no Muser document records a measured
+pure-read DRAM ceiling. That left two roads. We could borrow a specification
+figure from a datasheet and let the reader assume it was ours — fluent,
+authoritative, and unearned. Or we could work the equation backwards from a
+number we had genuinely measured, and say plainly that it is a derivation.
+
+We took the second road, and it is the reason the number below carries a
+label everywhere it appears: this book **derives the effective read rate from
+measured decode throughput** rather than asserting a bus speed it never
+observed.
+
+The measurement we do have is the decode throughput itself. The kquant lane's
+headline decode number — five repetitions after warmup, synthetic fixture,
+F16 KV, 66-token prefix / 32 teacher-forced tokens (teacher-forced: the
+harness feeds known prior tokens rather than model-generated ones) — is:
 
 > **35.440 tok/s** (35.439527527, CV 0.037 %) — kquant plain decode
 > `[ledger P1.3]`, echoed in `[docs/benchmarks.md §1]`
@@ -256,6 +304,10 @@ That is **the entire measured token time** — 28.22 ms, from Step 5. The
 weights alone, streamed at the rate the machine actually sustains, consume
 the whole token. The 53 GFLOP of arithmetic has no room of its own; it must
 hide completely underneath the byte stream (Figure 1.1).
+
+Put in plainer words: the GPU is not slow, and it is not busy. It is waiting.
+The whole engine described in this book is an argument about what to do with
+a processor that finishes early.
 
 Sanity-check the roofline direction. The workload's
 **[arithmetic intensity](../glossary.md#arithmetic-intensity)** — FLOPs per
@@ -307,12 +359,17 @@ So only three things can make decode faster:
 
 1. **Read fewer bytes per token** — smaller weights. This is why Part II
    exists: the kquant blocks that get Muse Glimmer to 4.81 effective
-   bits/param, and the NVFP4 native lane. The measured reality keeps the
-   discipline honest: NVFP4 decode lands at 35.491 tok/s vs kquant's 35.440
-   — **parity within noise, never claimed faster** `[ledger P1.3]`
-   `[docs/benchmarks.md §1]`. At batch-1 decode both lanes read nearly the
-   same bytes at nearly the same rate; quantization's win here is
-   *capacity*, not decode speed.
+   bits/param, and the NVFP4 native lane. It is also where the argument's
+   first tempting expectation died. Fewer bits per weight ought to mean
+   fewer bytes per token, and fewer bytes per token ought to mean faster
+   decode; we ran the two lanes against each other expecting the newer
+   format to pull ahead. NVFP4 decode landed at 35.491 tok/s against
+   kquant's 35.440 — **parity within noise, never claimed faster**
+   `[ledger P1.3]` `[docs/benchmarks.md §1]`. At batch-1 decode both lanes
+   read nearly the same bytes at nearly the same rate, so the win we
+   actually bought was *capacity*, not decode speed. That distinction — a
+   lane that buys you room is not a lane that buys you time — is one this
+   book refuses to let slide, in either direction.
 2. **Read bytes faster** — a different memory system. Not a lever you have
    on a fixed Mac; the ceiling is the machine's.
 3. **Avoid re-reading** — reuse computed results. The KV cache exists so
@@ -327,13 +384,19 @@ Muser's era adds a **fourth lever** the ancestor book did not have:
 **move the work somewhere else.**
 
 - Move it *into a draft model*: DFlash speculative decoding drafts cheap
-  tokens and verifies them in one batched pass against the full model —
-  the verify matvec reintroduces weight-reuse into decode. The
-  fixed-window synthetic restatement puts current spec decode at 1.23692×
-  vs the pinned llama.cpp comparator at 2,048 depth `[claims #15]`. The
-  famous 107.9 tok/s figure survives only as the kquant spec *bar* — the
-  pre-window-fix headline 1.3273× is superseded and must not be cited as a
-  current result `[ledger "Spec-prefill funded-fix requalification"]`.
+  tokens and verifies a whole window of them in one batched pass against
+  the full model — the verify matvec reintroduces weight-reuse into a loop
+  that had none. This lever also produced the book's most instructive
+  retraction. An early headline put the speedup at 1.3273×; then the
+  measurement window itself turned out to be wrong, and requalifying
+  against the fixed window brought the honest figure down to 1.23692× vs
+  the pinned llama.cpp comparator at 2,048 depth `[claims #15]`. The old
+  headline is superseded and must not be cited as a current result, and the
+  famous 107.9 tok/s figure survives only as the kquant spec *bar*
+  `[ledger "Spec-prefill funded-fix requalification"]`. Both were kept in
+  the ledger rather than quietly deleted, which is the habit Part VIII is
+  about: a number you have to explain is worth more than a number you have
+  to trust.
 - Move it *across the wire*: disaggregated prefill runs the
   compute-friendly half of the job on a remote NVIDIA GB10 node and hands
   the KV back — 4.26× faster to first token at 2,048 depth
@@ -387,7 +450,11 @@ run out of capacity and you get nothing.
 
 ## 1.6 How to read every number in this book
 
-The variance and claim rules, stated once, obeyed everywhere:
+One thing remains before the descent: how to read a number when you meet one.
+None of the rules below is an abstract principle. Each was learned by
+watching a figure that was perfectly true of a particular run turn into a
+claim about the product, and then having to take it back. Stated once here,
+obeyed everywhere after:
 
 - **Ratios are `llama ÷ muser`** — above 1.0 means muser is faster
   `[docs/benchmarks.md §Methodology]`. Absolute tok/s drifts with machine
@@ -404,7 +471,10 @@ The variance and claim rules, stated once, obeyed everywhere:
 - **Never cite** the all-accept 110.59 tok/s control as serving
   performance, the retired 5.83× remote-prefill figure, the superseded
   1.3273× spec headline, or the barred 1.64960× decode-at-131k accounting
-  `[docs/launch-claims.md]`.
+  `[docs/launch-claims.md]`. Every figure on that list was once the true
+  result of a real run; each became misleading the moment it was quoted
+  outside the cell that produced it. They are retained, and retained
+  visibly, so nobody has to rediscover on their own why they were pulled.
 - Ferrite-lineage numbers (the ancestor lab's A18-class measurements) are
   labeled as lineage when they appear, never as Muser results.
 

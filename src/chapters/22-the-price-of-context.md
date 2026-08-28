@@ -23,16 +23,23 @@ portable, sealed artifact ([Ch 24](24-kvpack-the-format.md)), what a hit is
 worth ([Ch 25](25-warm-reuse.md)), and how to move only the part you don't
 already have ([Ch 26](26-delta-handoff-and-migration.md)).
 
-This chapter derives every number by hand, because the numbers are short
-enough to derive and because trusting a memory table you cannot re-derive is
-how a wrong figure survives into product copy. (The campaign has already
-caught one: an early "~7 GB payload" estimate for the deep handoff was wrong
-by ~4× — the measured wire payload is 1,823,184,896 B
-`[receipt phase4-disagg-20260820/130815-g900091/]`. Derive, then measure,
-then reconcile.)
+This chapter derives every number by hand. The numbers are short enough to
+derive, and a memory table you cannot re-derive is exactly how a wrong figure
+survives into product copy. We have already caught one of those. Early in the
+campaign the deep handoff was budgeted at a "~7 GB payload" — a figure that
+felt right, got repeated, and was wrong by ~4×. The measured wire payload is
+1,823,184,896 B, and the run that proved it is retained
+`[receipt phase4-disagg-20260820/130815-g900091/]`. Where that estimate came
+from is a story worth telling, and we tell it later in the chapter, once the
+arithmetic is on the table to tell it against. Derive, then measure, then
+reconcile.
 
 ## 22.2 The per-token bill, one layer at a time
 
+Where does the memory actually go, and what breaks if the answer is wrong?
+Every figure in this chapter — a slot's footprint, a machine's serving
+capacity, the size of a handoff on the wire — falls out of a handful of
+integers, so a slip in any one of them is a slip in all of them downstream.
 Start from the model's geometry, which is not a convention but a pinned
 constant of this engine:
 
@@ -82,9 +89,11 @@ It changes *how many tokens keep paying.*
 
 ## 22.3 Two regimes: one curve flattens, one doesn't
 
-Same price per token, different stopping points — so total footprint is a
-function of how far each layer class keeps paying. For a slot configured
-with context `C`, the footprint formula is
+If every token costs the same, where does the expense of a long conversation
+come from? From the stopping points, not the price tag. Same price per token,
+different stopping points — so total footprint is a function of how far each
+layer class keeps paying. For a slot configured with context `C`, the
+footprint formula is
 `[docs/memory-footprint.md §KV formula]`:
 
 ```text
@@ -104,7 +113,10 @@ Why per class:
   allocated at `max_context` capacity (`decode.rs:1348`) and fill one row per
   token until the model limit.
 
-Draw the two components as functions of context:
+Said in plainer words, because this is the sentence the rest of Part V leans
+on: the sliding layers rent one fixed room and keep re-using it, while the
+full layers buy a new shelf for every token and never sell one back. Draw the
+two components as functions of context:
 
 ```
   KV bytes
@@ -155,8 +167,9 @@ kept here because it catches transcription errors no single formula can.
 
 ## 22.4 The footprint table, derived and cross-checked
 
-Now produce the table the release contract actually uses — one slot and the
-four-slot release configuration, at three depths `[docs/memory-footprint.md]`:
+A formula is cheap. What decides a release is the number a machine has to
+hold, so the formula has to become a table: one slot and the four-slot release
+configuration, at three depths `[docs/memory-footprint.md]`:
 
 ```
   C = 8,192:
@@ -207,6 +220,9 @@ Two honesty notes the same document insists on, and this book inherits:
 
 ## 22.5 The 131,072-position limit
 
+Why does the chart stop where it stops? Not because measurement ran out of
+patience — because a rule says so, and the rule is worth knowing before you
+plan capacity around the last column of the table.
 The horizontal axis of Figure 22.1 stops at 131,072 because the model stops
 there: `MUSE_MAX_CONTEXT: usize = 131_072` (`config.rs:17`), and the
 architecture doc states the serving rule — "The model limit is 131,072
@@ -225,13 +241,14 @@ configuration's KV bill `[docs/memory-footprint.md]`.
 
 ## 22.6 Why KV — not weights — decides how many slots a 96 GB Mac serves
 
-With the per-slot bill and the 131,072 ceiling on the table, the capacity
-question can be asked. The decode host is one Apple Silicon Mac, an
+With the per-slot bill and the 131,072 ceiling on the table, we can finally
+ask the question an operator actually cares about: how many concurrent request
+slots can one machine serve? The decode host is one Apple Silicon Mac, an
 **M3 Ultra with 96 GB** of
 unified memory `[docs/memory-footprint.md §intro; docs/release-provenance.md]`.
-Ask the capacity question: how many concurrent request slots can it serve?
-The answer's shape surprises people who arrived from a weights-first
-intuition, so build it in two steps.
+The shape of the answer surprises people who arrive from a weights-first
+intuition — the model is the big thing on disk, so surely the model is the
+constraint — so we build it in two steps and let the two terms argue.
 
 **Weights are paid once and shared.** All slots run the same pinned model.
 The 16,756,681,056 B GGUF is mmap'd once; immutable weights, Metal
@@ -279,8 +296,10 @@ currency well.
 
 ## 22.7 Where the bytes go at depth: the 95.5/4.5 split
 
-The same per-class arithmetic, applied to the wire instead of the slot,
-predicts what a deep handoff must carry. The measured 130,815-token
+Does any of this arithmetic survive contact with a real transfer? It should:
+the same per-class arithmetic, applied to the wire instead of the slot,
+predicts what a deep handoff must carry, and a prediction that misses is a
+sign the model of the cache is wrong somewhere. The measured 130,815-token
 disaggregated payload is **1,823,184,896 B** (`payload_bytes` verified in
 the client receipt `[receipt phase4-disagg-20260820/130815-g900091/]`), and
 it reconciles to the byte against this chapter's formula:
@@ -303,36 +322,51 @@ bytes: "relocate = memcpy — the whole kvpack free lunch",
 `crates/muser-engine/src/lib.rs:8-10`), and it is why the entire Part VI
 wire economy is really a NoPE-plane economy.
 
-For the record, the wrong early figure — "~7 GB" for this same payload —
-came from reading the producer's `--kv-cache-memory-bytes` *allocation*
-(7–8 GB of vLLM cache memory) as if it were the payload. The correction is
-recorded in the merge-handoff audit `[docs/kvpack-merge-handoff §3 D1]` and
-in the campaign ledger's landmine list. Allocation is not traffic; traffic
-is not allocation.
+That reconciliation is the tidy ending. The first attempt was not tidy, and
+this is the war story promised at the top of the chapter. We needed a payload
+estimate before the deep cell had ever run, and the fastest number to hand sat
+in the producer's own configuration: `--kv-cache-memory-bytes`, the knob that
+tells the vLLM side how much memory to reserve for cache. It read 7–8 GB, so
+we wrote "~7 GB" for this same payload and expected the receipt to land near
+it. The receipt landed nowhere near it. What the knob describes is how much
+memory the producer *allocates* to hold cache for whatever sessions it happens
+to be serving; what crosses the wire is one session's rows, and the two
+quantities are not even the same kind of thing. The lesson is small enough to
+carry: allocation is not traffic; traffic is not allocation. It is now written
+down twice, in the merge-handoff audit `[docs/kvpack-merge-handoff §3 D1]` and
+in the campaign ledger's landmine list, so the next person to reach for a
+convenient configuration value finds the warning first.
 
 ## 22.8 Tradeoffs
 
 **Why f16 KV and not quantized, at 4 bits or 8.** Halving (or quartering)
-Table 22.1 looks tempting at 7.306 GB per four slots. It is not taken,
-and the reason is the exactness contract, not conservatism-as-a-virtue: the
+Table 22.1 looks tempting at 7.306 GB per four slots — it is the first idea
+anyone has after reading that table, and we had it too. It is not taken, and
+the reason is the exactness contract rather than conservatism-as-a-virtue. The
 parity anchor is pinned llama.cpp running F16 KV, so the live planes are
-`GpuHalfBuffer` f16 on every Metal lane (`decode.rs:182-184`), and the lane
+`GpuHalfBuffer` f16 on every Metal lane (`decode.rs:182-184`); the lane
 table's decode rows all say "FP16 KV" `[docs/muser-architecture.md]`. A
-quantized live cache would change attention inputs and therefore logits —
-the same class of change the dispatch-gap campaign rejected when a norm
-fusion moved logprobs 3.197e-4 over a 1e-4 contract
-`[docs/decode-dispatch-gap-20260815.md]`. The interchange format does carry
-both encodings (`PlaneEncoding::{F16Le, F32Le}`,
-`crates/muser-engine/src/cache.rs:13-16`) because the wire serves producers
-and archives beyond the live planes; a KIVI-style 4-bit store exists inside
+quantized live cache would change attention inputs, and changed attention
+inputs change logits. We know how little of that the contract tolerates,
+because the dispatch-gap campaign already ran the experiment on a different
+structure: a norm fusion moved logprobs 3.197e-4 against a 1e-4 contract, and
+it was rejected on that number alone
+`[docs/decode-dispatch-gap-20260815.md]`. Nothing about a quantized cache
+would miss more gently than a fused norm did.
+
+The compressed encodings are not banned everywhere, only from the hot path.
+The interchange format carries both — `PlaneEncoding::{F16Le, F32Le}`,
+`crates/muser-engine/src/cache.rs:13-16` — because the wire serves producers
+and archives beyond the live planes, and a KIVI-style 4-bit store lives inside
 kvpack as a CPU reference codec with honest error bounds, "not the hot
 path" `[docs/kvpack-merge-handoff §5]`. The measured consequence of staying
 f16 is everything in [Ch 25](25-warm-reuse.md): bit-identical warm hits.
 
-**Ring-plus-growing vs paging.** The ancestor's cache was paged — 16-token
-blocks behind a block table, a whole allocator chapter
-`[ferrite-book Ch 14]`. Muser has no page table, and the arithmetic of this
-chapter explains why the design didn't need one: the 39 SWA layers bound
+**Ring-plus-growing vs paging.** At the fork, the default was to copy the
+ancestor. Its cache was paged — 16-token blocks behind a block table, a whole
+allocator chapter `[ferrite-book Ch 14]` — and inheriting a working allocator
+is cheaper than arguing with one. Muser has no page table, and the arithmetic
+of this chapter explains why the design didn't need one: the 39 SWA layers bound
 themselves (a full ring *is* the live set; nothing to evict — 81.8 MB,
 Figure 22.1's flat line), and the 13 NoPE layers' prefix sharing is handled
 one level *above* the GPU, by kvpack's content-addressed chunks

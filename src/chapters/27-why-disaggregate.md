@@ -32,7 +32,11 @@ Part VI is about paying for that clause honestly.
 
 ## 27.2 Two regimes, stated precisely
 
-You have met the two regimes before, briefly
+Before the wire, before the second machine, one question has to be settled
+precisely, because every argument in this Part leans on it: why should a
+machine be good at one half of inference and bad at the other, when both
+halves push the same weights through the same kernels? You have met the two
+regimes before, briefly
 ([Ch 1 §1.2](01-why-inference-is-a-memory-problem.md)); here they are as the
 engineering facts the whole lane rests on.
 
@@ -134,15 +138,24 @@ cell: 570.122 s mean for a 131,008-token prompt
 ```
 
 Twelve TFLOP/s of sustained arithmetic on this machine's FP32-class
-throughput — the compute-bound regime, hit at depth, on one Mac. (The 12.2
-figure is an arithmetic derivation from the measured 570.122 s cell, not an
-instrumented compute measurement; the honest roofline conclusion survives
-the derivation's roughness by two orders of magnitude.)
+throughput — the compute-bound regime, hit at depth, on one Mac.
+
+Be careful about what that number is, though, because we were. Nobody
+instrumented the machine's arithmetic here. The 12.2 figure is what falls out of
+dividing the measured 570.122 s wall-clock cell by its token count and
+multiplying by a per-token FLOP estimate, so it is a derivation and we label it
+one rather than dressing it up as a compute measurement. We keep it because
+it does not need to be tight to carry the argument: the derivation would
+have to be wrong by two orders of magnitude before prefill stopped landing
+on the far side of the roofline from decode.
 
 Now look at what the *user* experiences in that regime. Nothing. For nine
 and a half minutes, nothing. That is the TTFT cliff.
 
 ## 27.3 The TTFT cliff at depth
+
+So put a number on that silence — and name it first, because the silence is
+the quantity this whole Part exists to shorten.
 
 **TTFT** — time to first token — is the latency from "prompt submitted" to
 "first generated token visible." At shallow depth on one Mac it is fine. At
@@ -150,9 +163,9 @@ depth it is catastrophic, and it is catastrophic *precisely because prefill
 is proportional to prompt length and compute-bound on silicon shaped for
 bandwidth-heavy decode*.
 
-The measured cliff, local lane, five exact-token reps per depth
-`[docs/benchmarks.md §3]` `[ledger "Phase 4 disaggregated GX10→Mac context
-matrix", 2026-08-20]`:
+We walked the cliff ourselves rather than model it: the local lane, five
+exact-token repetitions at every depth, the prompt growing by powers of two
+as we climbed. There is nothing subtle about the shape that came back.
 
 | Depth | Local TTFT (mean) |
 |---:|---:|
@@ -166,7 +179,11 @@ matrix", 2026-08-20]`:
 *Table 27.1: Local prefill TTFT by depth — linear growth in the prompt,
 compute-bound on one Mac `[docs/benchmarks.md §3]`.*
 
-An agent workload that refreshes a 100k-token context is not an edge case
+Every row there is a retained run `[docs/benchmarks.md §3]`
+`[ledger "Phase 4 disaggregated GX10→Mac context
+matrix", 2026-08-20]`. Read the bottom row as a person waiting rather than
+as a table cell, and the engineering problem states itself. An agent
+workload that refreshes a 100k-token context is not an edge case
 of this table; it is the table's whole reason to exist. This is the demand
 side. The supply side is the next section's question: what would it cost to
 get that KV from somewhere else?
@@ -186,31 +203,53 @@ NoPE:  13 layers × 1,024 B/token × position
 SWA:   39 layers × 1,024 B/token × 2,048 tokens (the window, not the past)
 ```
 
-At the 130,815-token cell that product is **1,823,184,896 B** (≈ 1.82 GB) —
-the measured wire payload of the deep cell, reconciled to the byte against
-this per-class arithmetic in [Ch 22 §22.7](22-the-price-of-context.md)
-`[docs/kvpack-merge-handoff-20260820.md §3 D1]` `[receipt
+At the 130,815-token cell that product is **1,823,184,896 B** (≈ 1.82 GB).
+That is not an estimate we are asking you to take on faith. It is what the
+wire actually carried, and the per-class arithmetic above reconciles to it
+byte for byte — a reconciliation [Ch 22 §22.7](22-the-price-of-context.md)
+walks through in full. Getting the two sides to agree took two conventions
+that are easy to trip over. The receiver holds back the boundary token, so
+NoPE rows ship for prompt − 1, and the last of them is decoded locally; the
+SWA rings travel as three 13-layer groups rather than as one block. Both
+conventions are written down, and the client-side record of the run that
+moved those bytes is retained:
+`[docs/kvpack-merge-handoff-20260820.md §3 D1]`, `[receipt
 phase4-disagg-20260820/130815-g900091/out-p4/
-f-p4-text-g900091-client.json]`. (Two conventions ride in that
-reconciliation: the receiver holds back the boundary token — NoPE rows ship
-for prompt − 1, decoded locally — and the SWA rings travel as three
-13-layer groups.) Note the ratio: ≈ 13.9 kB (decimal; 13.6 KiB) shipped per token
-versus ~53 GFLOP recomputed per token. The sealing plan's external-research
+f-p4-text-g900091-client.json]`.
+
+Now hold the two costs of one token side by side, because that comparison
+*is* the argument for this whole Part: ≈ 13.9 kB (decimal; 13.6 KiB) shipped
+per token versus ~53 GFLOP recomputed per token. Shipping the answer is
+absurdly cheaper than computing it again. Nor is that special pleading for
+our model. The sealing plan's external-research
 section makes the same point against the literature: ~52 KiB/token effective
 full-model footprint versus ~2.2 MB/token for DistServe's OPT-66B — a 42×
-smaller artifact class — and DéjàVu's viability rule (transfer cheaper than
-recompute) holds with room to spare `[docs/disaggregated-prefill-sealing-plan-20260818.md §4]`.
+smaller artifact class — and DéjàVu's viability rule, that a transfer must
+cost less than the recompute it replaces, holds here with room to spare
+`[docs/disaggregated-prefill-sealing-plan-20260818.md §4]`.
 
-And the wire is fast *relative to that payload*. The lab's raw reference
-ceiling is ~9.4 Gbps single-stream on the pre-migration direct 10GbE link
-`[ledger T0]` `[docs/disaggregated-prefill-sealing-plan-20260818.md §W0]`;
-after the 2026-08-23 topology migration to the switched fabric the
-re-probed product direction measured 9.256 Gbps (reverse 6.161 Gbps,
-retained as a deviation) `[ledger GX10 return 2026-08-23, attempts 3–4 + readiness entries]`. Even at the
-release floor of 3.0 Gbps installed-payload median
-(`[crates/muser-cluster/src/lib.rs:14-15]` — installed payload being the
-handoff's payload bytes over the kernel's measured send busy-time, the wire
-clock [Ch 31](31-the-wire-discipline.md) defends), the transfer floors are ~224 ms
+And the wire is fast *relative to that payload*. Our raw reference ceiling
+was taken on the direct 10GbE link the lab ran before the migration:
+~9.4 Gbps single-stream `[ledger T0]`
+`[docs/disaggregated-prefill-sealing-plan-20260818.md §W0]`. Then, on
+2026-08-23, we moved the fabric behind a switch — an improvement for
+everything except our confidence in that ceiling, which was now a
+measurement of a topology that no longer existed. So we re-probed instead of
+assuming the number travelled with us. The product direction came back at
+9.256 Gbps, close enough to call the class intact. The reverse direction
+came back at 6.161 Gbps, which was not what we wanted and is retained as a
+deviation anyway
+`[ledger GX10 return 2026-08-23, attempts 3–4 + readiness entries]`. That
+reflex — when the ground moves, re-measure, and keep the half of the result
+you did not like — is the one habit that makes the rest of this Part's
+numbers worth anything.
+
+Even at the release floor, the shape holds. That floor is a
+3.0 Gbps installed-payload median
+(`[crates/muser-cluster/src/lib.rs:14-15]`), where *installed payload* means
+the handoff's payload bytes divided by the kernel's measured send
+busy-time — the wire clock [Ch 31](31-the-wire-discipline.md) defends.
+Held to that rate, the transfer floors are ~224 ms
 at 2k, ~1.06 s at 32k, ~3.75 s at 131k `[docs/disaggregated-prefill-sealing-plan-20260818.md §4]`.
 Chapter 31 owns the full wire-discipline story (pacing, EEE, why the
 product rate sits below raw); the point *here* is the shape: **the wire
@@ -222,7 +261,11 @@ exactness contract. Everything after this section is about those two ifs.
 
 ## 27.5 The measured payoff
 
-The disaggregated lane, as qualified: a resident vLLM NVFP4 producer on one
+So much for the argument on paper. Paper is free; what decides this Part is
+whether the machines agreed with it.
+
+Here is the lane we actually built and measured, as qualified: a resident
+vLLM NVFP4 producer on one
 GX10 node prefills the prompt and hands the KV to Mac Metal decode over
 authenticated Handoff V2. The next two chapters are the producer and the
 transport; the measurement is here.
@@ -271,18 +314,34 @@ across 2,048 → 130,815 `[docs/benchmarks.md §3]`:
 local ÷ remote TTFT — note this is the one ratio family in the book that is
 not the llama ÷ muser convention.*
 
-Two honesty notes the claims register insists on, repeated here so the
-chapter cannot be quoted without them. First, an earlier **integrated
-engineering headline** — 3.881 s cold disaggregated TTFT for a 2,048-token
-prompt including 1.87 s of native producer compute, versus ~6.5 s local
-serving prefill, paced wire 3.925 Gbps — is a **dated single-cell packet**
-from 2026-08-17, "operator-accepted engineering headline, not a
+Those are the cells that survived. Two earlier numbers did not, and the
+claims register requires that they travel with the survivors — so here they
+are, in the order we lost them.
+
+The first we lost as a claim rather than as a fact. Running the integrated
+lane cold, we got a **3.881 s** disaggregated TTFT for a 2,048-token
+prompt — 1.87 s of it native producer compute — against ~6.5 s of local
+serving prefill, on a wire paced at 3.925 Gbps. We wanted that to be the
+headline for the lane. Then we tried to move it into the claims register,
+which asks of every number the one question this cell could not answer: what
+was the spread across repetitions? There had been a single run. Nothing
+about the packet is false, and it is retained; what it is not is a stability
+claim, and the register files it as exactly that — a **dated single-cell
+packet** from 2026-08-17, "operator-accepted engineering headline, not a
 five-repetition stability claim"
-`[docs/nvfp4-fast-lane-evidence-20260817.md §Measured product numbers]`.
-Second, the historical **5.83×** figure (exact Spark producer versus a 275 s
-Mac exact mirror) is **retired** and must never be cited
+`[docs/nvfp4-fast-lane-evidence-20260817.md §Measured product numbers]`. The
+lesson cost us only a headline: one cold cell is an anecdote until it
+repeats.
+
+The second we lost outright. An early comparison set the exact Spark
+producer against a 275 s Mac exact mirror and came out at **5.83×** — a much
+prettier ratio than the band above, and a different denominator than the one
+the claims row scopes. It is **retired**, and must never be cited
 `[docs/nvfp4-fast-lane-evidence-20260817.md §Measured product numbers]`
-`[claims #6]`. Both packets remain non-notarial; the release lock governs
+`[claims #6]`. We leave the retraction visible instead of quietly deleting
+the figure, because a reader who meets that ratio on an old slide deserves
+to know it was ours and that we withdrew it. Both packets remain
+non-notarial; the release lock governs
 what may be said publicly `[docs/launch-claims.md §Ground rules]`.
 
 And reuse — the Part V machinery — collapses the bill further on repeat
@@ -292,8 +351,11 @@ bit-identical text, no producer drive at all `[claims #11]`; delta handoff
 
 ## 27.6 Why v0.1 is honestly ONE Mac + ONE producer
 
-Here is a place where the architecture document is blunt, and the book will
-not soften it:
+A payoff table invites a natural question: how big is the thing that
+produced it? Readers who have met other disaggregated systems will be
+picturing a pool of prefill workers and a scheduler in front of them. That
+is not what we have. Here is a place where the architecture document is
+blunt, and the book will not soften it:
 
 > "The v0.1 topology is one Mac decoder and one Spark/GX10 producer. …
 > Multi-producer scheduling and node discovery are not implemented."
@@ -366,13 +428,19 @@ sender-side rate cap on its own sockets), a durability story (the
 replay ledger's fsync dance, [Ch 30](30-handoff-v2-transport.md)), a
 security story (mTLS + HMAC, [Ch 30](30-handoff-v2-transport.md)), and a
 precision story (trusting someone else's prefill, [Ch 32](32-precision-across-the-handoff.md)).
-Every one of those costs is a chapter in this Part because every one of
-them *bit* during the campaign — the pacing self-cap (3.9 of 9.4 Gbps was
-our own pin `[ledger T1]`), the fsync tail in our own commit path
-(`[docs/disaggregated-prefill-sealing-plan-20260818.md §W1]`), EEE's
-retransmission blackouts on our own burst schedule `[ledger "EEE link
-ruling — operator decision (2026-08-20)"]`. The lane survived them because
-it fails closed, not because it was lucky.
+Every one of those costs is a chapter in this Part, and every one of them
+earned its chapter by *biting* us during the campaign. We paced the sender
+to be kind to the link, then spent effort explaining a rate we had imposed
+ourselves: 3.9 of 9.4 Gbps was our own pin `[ledger T1]`. A latency tail we
+would gladly have blamed on the network lived in our own commit path
+instead, in the replay ledger's fsync
+(`[docs/disaggregated-prefill-sealing-plan-20260818.md §W1]`). And
+energy-efficient Ethernet's retransmission blackouts proved to be a property
+of our own burst schedule rather than of a sick link `[ledger "EEE link
+ruling — operator decision (2026-08-20)"]`. Read those three together and a
+pattern falls out that is worth carrying into the next five chapters: the
+wire was hardly ever the villain — our own defaults were. The lane survived
+them because it fails closed, not because it was lucky.
 
 ## 27.8 What comes next
 

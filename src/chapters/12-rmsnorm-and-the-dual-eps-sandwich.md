@@ -15,6 +15,12 @@ different epsilons, a llama.cpp constant the checkpoint does not carry, and
 a fused kernel that exists because fusing carelessly would change the
 model's public numbers.
 
+Normalization is the least glamorous operation in a transformer. It invents
+no information; it only puts the numbers back into a range the next matmul
+can work with. So it is a good joke on us that this is the chapter where we
+lost the most work: two of the optimizations we were most confident about
+survive here as war stories rather than as shipped code.
+
 ---
 
 ## 12.1 What it computes
@@ -29,18 +35,30 @@ rms      = √(mean(x²) + ε)                 (root-mean-square, ε-guarded)
 y_i      = x_i / rms × γ_i                 (normalize, then per-channel gain)
 ```
 
-On Muse Glimmer `n = hidden_dim = 6,656` for the stream norms
-(`crates/muser-engine/tests/muse_golden.rs:96`), `γ` is a learned
-per-channel weight (`attn_norm.weight`, `ffn_norm.weight`, …,
-`config.rs:300-314`), and — the reason this chapter exists — **ε is not one
-value but two**: `1e-5` for every norm the GGUF declares, and a hard-coded
-`1e-8` for the two "post" norms of the sandwich, a llama.cpp graph constant
-that the checkpoint does not carry at all (`config.rs:23-28`). One kernel in
-this chapter, `muser_fused_norm_residual_rms_norm_32sg`, exists precisely
-because a single-epsilon fused kernel is *not valid* for this model
+Three of the symbols in those lines are settled by the checkpoint, and one
+is not. On Muse Glimmer `n = hidden_dim = 6,656` for the
+stream norms, and `γ` is a learned per-channel weight — `attn_norm.weight`,
+`ffn_norm.weight`, and their post-norm siblings
+(`crates/muser-engine/tests/muse_golden.rs:96`, `config.rs:300-314`).
+
+Then there is ε, and ε is the reason this chapter exists: **it is not one
+value but two.** `1e-5` is the value the checkpoint carries, and it governs
+every norm the GGUF declares. `1e-8` is hard-coded for the two "post" norms
+of the sandwich — a
+llama.cpp graph constant the checkpoint does not carry at all
+(`config.rs:23-28`).
+
+Hold on to that, because it decides the shape of the code further down. A
+fused kernel that assumes a single epsilon per layer cannot serve this
+model, so one kernel in this chapter,
+`muser_fused_norm_residual_rms_norm_32sg`, exists for no other reason
 (`shaders/ferrite/rmsnorm_batch_tail.metal:142-146`).
 
 ## 12.2 Why it exists — 52 layers of multiplication drift
+
+Why spend four normalizations per layer on an operation that adds no
+information to the stream? Ask it the other way: what breaks if we leave
+them out?
 
 A transformer layer is a chain of multiplies. The [matvec](../glossary.md#matvec)
 of [Ch 13](13-the-qkv-gate-matvec-family.md), an activation, another matvec —
@@ -103,6 +121,9 @@ operation — the sense in which the two norms' scaling steps coincide.
 
 ### The two epsilons, precisely
 
+Here is the fact the whole chapter turns on. Where does each epsilon come
+from, and what happens to an engine that assumes there is only one?
+
 - `rms_eps = 1e-5` is read from the GGUF key
   `muse-glimmer.attention.layer_norm_rms_epsilon`; absence is a hard load
   error (`config.rs:184-188`). It feeds every norm this chapter dispatches
@@ -120,11 +141,17 @@ operation — the sense in which the two norms' scaling steps coincide.
 
 The ε inside the root has one job: if `x` is all zeros, `mean(x²) = 0` and
 `√0 = 0`, which would divide by zero. `+ ε` keeps the denominator strictly
-positive. Why *two different* tiny values matter numerically is harder to
+positive.
+
+Why *two different* tiny values matter numerically is harder to
 say — the difference between `√(m + 1e-5)` and `√(m + 1e-8)` is invisible
 for any `m` of real magnitude — but the exactness contract does not grade
 on "of real magnitude": it grades on bits, and llama's graph says 1e-8,
-so 1e-8 it is. The deeper motivation for the sandwich itself is a
+so 1e-8 it is. Put that another way, because it is the rule behind every
+decision in this chapter: we are not implementing normalization here, we
+are implementing *llama's* normalization. Where the two differ, the
+comparator wins — even when it has no numerical argument on its side. The
+deeper motivation for the sandwich itself is a
 model-design question this engine inherits `[unverified]`.
 
 ## 12.3 RMSNorm by hand: `x = [3, 4, 0, 0]`, ε = 1e-5
@@ -159,13 +186,19 @@ steps, at `n = 6,656`.
 
 ## 12.4 The Metal kernels
 
+That was arithmetic you could do on paper. What follows is the same
+three steps run by a thousand threads at once — and what separates the
+kernels below is not the math, which is identical in all of them, but which
+*other* implementation each one has to agree with, bit for bit.
+
 Four kernels from two lineages serve the stream norms. Read them in order of
 increasing specialization.
 
 ### 12.4.1 `rms_norm_batch` — the ferrite-lineage base kernel
 
-The unfused workhorse, byte-for-byte from the Ferrite shader pull at
-`a85048a90` (`docs/extraction-manifest.md`):
+Start with the plainest of the four: one row in, one row out, one epsilon,
+and nobody to agree with. This is the unfused workhorse, byte-for-byte from
+the Ferrite shader pull at `a85048a90` (`docs/extraction-manifest.md`):
 
 ```metal
 // crates/muser-engine/src/shaders/ferrite/rmsnorm_batch_tail.metal:1
@@ -227,6 +260,9 @@ name is load-bearing, and §12.7 comes back to it.
 
 ### 12.4.2 The pinned ggml norm — `kernel_rms_norm_mul_f32_4`
 
+So which of the four actually fires when you serve a token? Not, as a rule,
+the one you have just read.
+
 On the serving path the standalone norm almost never runs, because
 `encode_rms_norm_mul` prefers the **pinned llama.cpp metallib** kernel
 whenever the library is loaded and `n` is a multiple of 4:
@@ -264,7 +300,12 @@ picks llama's own thread count — `(dim/4).next_power_of_two().clamp(32,
 ferrite-lineage `rms_norm_batch` at 128 threads is the fallback when the
 metallib is absent. Same math, two reduction shapes — and since
 floating-point addition is not associative, the two shapes can differ in the
-last bits. On the serving route the pinned one is the point.
+last bits.
+
+Read that last clause slowly; the rest of the chapter is built on it. The
+same values, added in a different order, are not the same float. A reduction
+shape is therefore not an implementation detail we are free to choose — it
+is part of the answer. On the serving route the pinned one is the point.
 
 ### 12.4.3 The dual-eps fused tail — `muser_fused_norm_residual_rms_norm_32sg`
 
@@ -372,23 +413,34 @@ dual-epsilon model to need it.
 
 ### 12.4.4 The exact batch-graph tail — `…_batch_dual_eps`
 
-One more variant, and the distinction between the last two is the most
-important routing fact in this chapter. The serving *batch* graph uses
+If the kernel above already does the triple work with two epsilons, why is
+there a fourth? Because that kernel agrees with nobody. It is correct; it is
+not *identical* — and the distinction between these last two variants is the
+most important routing fact in this chapter.
+
+The serving *batch* graph uses
 `muser_fused_norm_residual_rms_norm_batch_dual_eps`
-(`rmsnorm_batch_tail.metal:250`), which does the same triple work but goes
-out of its way to reproduce the two **pinned ggml** reductions bit for bit —
-32-SIMD-group reduction, `1.0f / sqrt(...)` instead of `rsqrt`, llama's
-exact multiply/add expression shape, and even a forced
-`threadgroup_barrier(mem_flags::mem_device)` between the two norms to
-reproduce the f32 device-memory publication boundary of the split route
-(`rmsnorm_batch_tail.metal:277-303`). Its comment records the stakes:
-"changing any of these moved public logprobs beyond the contract in the
-rejected four-group fusion." The call sites confirm the split:
-`decode.rs:4513`/`4656` (batch graph) take the exact variant;
-`decode.rs:5807`/`5878` (the legacy one-token `encode_token` graph this
-book narrates) take the 32sg variant.
+(`rmsnorm_batch_tail.metal:250`). It does the same triple work, and then
+goes out of its way to reproduce the two **pinned ggml** reductions bit for
+bit: a 32-SIMD-group reduction, `1.0f / sqrt(...)` instead of `rsqrt`,
+llama's exact multiply/add expression shape, and even a forced
+`threadgroup_barrier(mem_flags::mem_device)` between the two norms, so that
+the f32 device-memory publication boundary of the split route survives the
+fusion (`rmsnorm_batch_tail.metal:277-303`). None of that buys speed. Its
+comment records what it does buy: "changing any of these moved public
+logprobs beyond the contract in the rejected four-group fusion" — the
+failure the tradeoffs section below tells in full.
+
+The call sites confirm the split: `decode.rs:4513`/`4656` (batch graph) take
+the exact variant; `decode.rs:5807`/`5878` (the legacy one-token
+`encode_token` graph this book narrates) take the 32sg variant.
 
 ## 12.5 The Rust dispatch — where the norms run in one token
+
+Four kernels exist; one token has to choose among them dozens of times. So
+where do the norms actually fire, and how many of them stand alone? Fewer
+than the sandwich diagram earlier would lead you to guess — and the reason
+is the whole point of fusing tails.
 
 From `encode_token` (`decode.rs:5515-5906`), the norm dispatches of one
 token are:
@@ -409,13 +461,20 @@ only standalone pre-norm in the graph, plus the entry norm before it (whose
 γ is the all-ones vector of §12.2). Counting dispatches per token: 2
 standalone + 2×52 fused = **106 norm-carrying dispatches**, each folding
 two norms in the fused case — the number the gap accounting of §12.8
-reconciles. On top of these, the per-head QK-norms of
+reconciles. Two more norms per layer run through the same
+`encode_rms_norm_mul` wrapper, and they belong in this count because they
+spend from the same dispatch budget: the per-head QK-norms of
 [Ch 14](14-qk-norm-and-rope.md) add 2 dispatches per layer (104 per token)
-through the same `encode_rms_norm_mul` wrapper at width `head_dim = 128`
-(`decode.rs:5599-5618`) — same math, tiny `n`, per-head γ that turns out to
-be a constant broadcast. That is the preview; Ch 14 owns the full story.
+at width `head_dim = 128` (`decode.rs:5599-5618`) — same math, tiny `n`,
+per-head γ that turns out to be a constant broadcast. That is the preview;
+Ch 14 owns the full story.
 
 ## 12.6 The access pattern
+
+Every kernel chapter in this Part asks the same two questions of its kernel:
+what does it read, and is it bandwidth-bound? For the norms the second
+answer is no — but the arithmetic is worth doing anyway, because *why* it is
+no is what decides how the kernels above are tuned.
 
 One row of one stream norm at `n = 6,656`: read `x` (26,624 B) + two γ
 vectors (26,624 B each for the fused tail) and write `hidden` (26,624 B) +
@@ -432,44 +491,68 @@ they are one-thousandth of the per-layer matvec weights of
 
 ## 12.7 Tradeoffs
 
-**The rejected 104-group fusion — the measured heart of this chapter.** The
-obvious optimization is to fuse *more*: merge each layer's separated
-norm-boundary dispatches (the +104 closures of §12.8) into the tails. It
-was tried. The retained-activation hybrid preserved greedy tokens but
-breached the public numerical contract: full-logit max absolute error
-`4.6300888e-4`, normalized logprob max error `3.197146176834309e-4` — above
-the `1e-4` contract — with 201,970 of 202,048 logits differing and the
-first KV difference one f16 ULP in layer 1's value plane (bits 39,892 vs
-39,893) `[docs/decode-dispatch-gap-20260815.md §Rejected hybrid
-postmortem]`, receipts
-`muser-receipt://pinned-token-parity-20260814-v{3,4}/`. It was
-removed, not hidden behind a tolerance. The corrected fusion — the
-`…_batch_dual_eps` kernel of §12.4.4, which reproduces the pinned ggml
-reductions exactly — kept the baseline's full-logit SHA-256 and measured
-39.274 ms GPU vs the 40.330 ms baseline (655 vs 760 closures), a single-run
-diagnostic `[docs/decode-dispatch-gap-20260815.md §Landed and rejected
-reductions]`. Lesson, in this campaign's voice: a fusion is eligible only
-if it is *bit-exact*, and "almost the same reduction" is not.
+**The rejected 104-group fusion — the measured heart of this chapter.**
+Stand at the fork with us. The gap accounting of §12.8 counts one separated
+norm-boundary closure on each side of every layer's sandwich, and the
+obvious optimization is to fuse *more*: sweep those +104 closures into the
+tails and let one dispatch do the work of three. We expected a cheap win.
+The reduction would be the same reduction, the epsilons the same epsilons;
+only the dispatch boundary moves.
+
+It did not survive the gate. The retained-activation hybrid preserved greedy
+tokens — every sampled token identical, which is exactly the result that
+makes a change look safe — and then breached the public numerical contract
+underneath them. Full-logit max absolute error came in at `4.6300888e-4` and
+normalized logprob max error at `3.197146176834309e-4`, both above the
+`1e-4` contract, with 201,970 of 202,048 logits differing. Tracing
+backwards, the first KV difference was a single f16 ULP in layer 1's value
+plane (bits 39,892 vs 39,893). We kept the postmortem:
+`[docs/decode-dispatch-gap-20260815.md §Rejected hybrid
+postmortem]`, and the runs behind it:
+`muser-receipt://pinned-token-parity-20260814-v{3,4}/`.
+
+The hybrid was removed rather than hidden behind a widened tolerance, and
+what it taught is narrower and more useful than "fusion is dangerous". It
+was not wrong about the arithmetic. It was wrong about the *order* of the
+arithmetic — and order is what the contract grades. The corrected fusion
+took that lesson literally. The `…_batch_dual_eps` kernel of §12.4.4
+reproduces the pinned ggml reductions exactly; it kept the baseline's
+full-logit SHA-256 and measured 39.274 ms GPU against the 40.330 ms
+baseline (655 vs 760 closures) in a single-run diagnostic:
+`[docs/decode-dispatch-gap-20260815.md §Landed and rejected
+reductions]`. The rule we came away with is the one this chapter keeps
+repeating: a fusion is eligible only if it is *bit-exact*, and "almost the
+same reduction" is a different reduction.
 
 **`rsqrt` vs `1.0f / sqrt` — one function name, contract-sized
-consequences.** `rsqrt` is Metal's fast-math reciprocal square root — one
-hardware instruction, a few ULP short of the IEEE-rounded result;
-`1.0f / sqrt(x)` is fully rounded. The ferrite-lineage port
-`rms_norm_llamacpp.metal` exists entirely to document and fix this
-difference: its header explains that Ferrite's default `rsqrt(mean + eps)`
-"differs from `1/sqrt` by a few ULP per call," that those ULPs "compound
-into knife-edge logit flips past ~50 tokens," and that llama uses the
-multi-simdgroup reduction *and* `1.0f / sqrt`
-(`shaders/ferrite/rms_norm_llamacpp.metal:14-19, 96-101`). Muser's serving
-answer is blunter: route the standalone norms through llama's *own*
-metallib kernel (§12.4.2) and make the fused batch tail reproduce llama's
-reduction bit for bit (§12.4.4). The 32sg kernel's `rsqrt` is one reason it
-is confined to the legacy one-token graph — which, per the routing comment
-at `decode.rs:2085-2091`, is itself confined to teacher-forced and
-profiling duty because its fused kernels' rounding "diverges from the
-source-pinned llama Metal graph enough to breach public logprob tolerance."
+consequences.** The next fork is far smaller than the last one: not a
+dispatch, not a kernel, a single function name inside a single line.
+`rsqrt` is Metal's fast-math reciprocal square root — one hardware
+instruction, a few ULP short of the IEEE-rounded result; `1.0f / sqrt(x)`
+is fully rounded. A few ULP on one norm is nothing. A few ULP on every norm
+of every layer, each one feeding the multiply that follows it, is not
+nothing.
 
-**One fused dispatch vs three split dispatches.** Unfused, each tail is:
+The ferrite-lineage port `rms_norm_llamacpp.metal` exists entirely to
+document and fix this difference: its header explains that Ferrite's default
+`rsqrt(mean + eps)` "differs from `1/sqrt` by a few ULP per call," that
+those ULPs "compound into knife-edge logit flips past ~50 tokens," and that
+llama uses the multi-simdgroup reduction *and* `1.0f / sqrt`
+(`shaders/ferrite/rms_norm_llamacpp.metal:14-19, 96-101`).
+
+Muser's serving answer is blunter than porting that fix: route the
+standalone norms through llama's *own* metallib kernel (§12.4.2) and make
+the fused batch tail reproduce llama's reduction bit for bit (§12.4.4). That
+leaves the 32sg kernel's `rsqrt` where it can do no public harm, and it is
+one reason that kernel is confined to the legacy one-token graph — which,
+per the routing comment at `decode.rs:2085-2091`, is itself confined to
+teacher-forced and profiling duty because its fused kernels' rounding
+"diverges from the source-pinned llama Metal graph enough to breach public
+logprob tolerance."
+
+**One fused dispatch vs three split dispatches.** If fusing is this
+dangerous, why fuse at all? Because the tail that *is* exact still pays for
+itself, and the bookkeeping is easy to read. Unfused, each tail is:
 post-norm (read `src`+γ1, write normed), residual add (read `hidden`+normed,
 write `hidden`), pre-norm (read `hidden`+γ2, write output) — 5 reads and 3
 writes over 26 KB buffers plus two extra dispatch boundaries. The fused
@@ -478,17 +561,24 @@ fewer over the residual, two fewer dispatches, ×104 per token. That is the
 +104-closure saving the rejected fusion chased; the exact tail captures it
 for the two norm pairs it covers without touching the reduction order.
 
-**The cross-vendor seam — when the norm must split in two.** Under
-`MUSER_CROSS_VENDOR_QK`, every norm wrapper here reroutes to a decomposed
-*no-fast-math* pair — unweighted RMS in one dispatch, explicit
+**The cross-vendor seam — when the norm must split in two.** One last fork,
+and it reframes the other three. Everything so far measured "exact" against
+pinned llama.cpp. Point the engine at a different partner and the same fused
+kernel becomes the wrong answer.
+
+Under `MUSER_CROSS_VENDOR_QK`, every norm wrapper here reroutes to a
+decomposed *no-fast-math* pair — unweighted RMS in one dispatch, explicit
 learned-weight multiply in a second, with a barrier between
 (`norm.rs:25-50`, `norm.rs:115-146`). The reason is the disaggregated lane:
 vLLM's producer materializes the weightless norm output in F16 and applies
 its scale as a *second* F16 operation, so the seam-exact receiver must
 preserve that intermediate rounding point (`norm.rs:280-284`). The fused
 kernel "loses that intermediate rounding point and is therefore not
-seam-exact." A fusion that is exact against llama is still wrong against
-CUDA — exactness is always *relative to an anchor*.
+seam-exact."
+
+That is the sentence to leave this section on. A fusion that is exact
+against llama is still wrong against CUDA, because exactness is never a
+property a kernel has by itself — it is always *relative to an anchor*.
 
 ## 12.8 Where the gap lives
 
@@ -496,14 +586,19 @@ This chapter is the **most direct resident of the gap** in Part IV. The
 one-token dispatch-gap reconciliation counts **104 separated norm-boundary
 closures** (52 post-attention + 52 post-FFN boundary pairs) in the
 production graph's +196-closure delta — the largest single family
-`[docs/decode-dispatch-gap-20260815.md §Corrected closure-count diff]`. And
-the accounting's sharpest lesson lives here too: those 104 groups look like
-pure waste, but every cheap removal tried changed bits (§12.7's 3.197e-4
+`[docs/decode-dispatch-gap-20260815.md §Corrected closure-count diff]`.
+
+The accounting's sharpest lesson lives here too. Those 104 groups look like
+pure waste, and they are the first thing anyone reading the profile wants to
+delete — but every cheap removal we tried changed bits (§12.7's 3.197e-4
 logprob breach), so they are *kept*, classed "fusible adjacent ops —
-existing fusion is not exact; reject." The gap survived bit-exactness until
-the anchor itself changed (the J0/J1 story of
-[Ch 38](38-measuring-against-llama-cpp.md) and
-[Ch 40](40-what-we-measured-and-rejected.md)). When a later chapter says
+existing fusion is not exact; reject." That is what the retained evidence
+buys: not a faster engine, but the right to leave an obvious-looking
+inefficiency in place and be able to say exactly why.
+
+The gap survived bit-exactness until the anchor itself changed — the J0/J1
+story of [Ch 38](38-measuring-against-llama-cpp.md) and
+[Ch 40](40-what-we-measured-and-rejected.md). When a later chapter says
 "the norm boundary is the gap," this table row is what it means.
 
 ## 12.9 What comes next

@@ -52,21 +52,32 @@ things can quietly invalidate that:
    [Ch 1](01-why-inference-is-a-memory-problem.md): decode time *is*
    weight-read time; anything that slows memory slows tokens exactly
    proportionally.
-3. **Clock choice.** Which clock did you divide by? Muser's campaign learned
-   this the hard way on the wire side: userspace send-time and
-   receiver-first-read clocks were both rejected, and Linux
-   `TCP_INFO.busy_time` became "the only honest link denominator" for wire
-   rate `[ledger P4, "The original installed-payload row…"]`. The one-button
-   wizard once computed its 3.0 Gbps link gate from the wrong clock and
-   reported 0.67 Gbps against a true 6.71 Gbps median — a healthy link
-   failed its own gate `[ledger §2b wizard attempt 8, 2026-08-24]`.
+3. **Clock choice.** Which clock did you divide by? This is the one that cost
+   us. On the wire side we reached for the obvious denominators first —
+   userspace send-time, then the receiver's first read — expecting either to
+   be good enough to state a link rate. Both were rejected; only Linux
+   `TCP_INFO.busy_time` survived, as "the only honest link denominator" for
+   wire rate `[ledger P4, "The original installed-payload row…"]`. The lesson
+   arrived with a bill attached. The one-button wizard computed its 3.0 Gbps
+   link gate from the wrong clock and reported 0.67 Gbps against a true
+   6.71 Gbps median, so a perfectly healthy link failed its own gate
+   `[ledger §2b wizard attempt 8, 2026-08-24]`. A denominator is a
+   measurement decision, not a formality.
 
 The cure is not a better stopwatch. It is a design that makes the noise
 *common-mode*: measure both engines in the same session, interleaved, so that
 whatever the machine is doing to A it is also doing to B, and the ratio
-cancels it.
+cancels it. Said the other way round, because this is the hinge the rest of
+the chapter swings on: you stop trying to measure two speeds accurately and
+start measuring one comparison accurately. The absolute numbers stay noisy —
+we publish them anyway — but their quotient holds still.
 
 ## 38.3 Same-session interleaved A/B — the only stable cross-engine statistic
+
+So what does a measurement look like that the machine cannot spoil? Not a
+quieter machine — you will never get one. The move is to stop holding the
+machine still and instead measure both engines while it drifts, close enough
+together that every drift lands on both sides of the ratio at once.
 
 The canonical protocol is the **J3 five-pair streamed verdict**, and it is
 worth reading as a recipe — its five reps are Table 38.1
@@ -104,15 +115,24 @@ Three details in that table carry the whole methodology:
   serving conditions, but not a controlled comparison.
 - **"Exact" is a column.** Timing and correctness travel together, always.
 
-For the product-lane decode cells, the same discipline has a name: the
-**adjacent lease window**. The kquant-vs-NVFP4 plain-decode comparison (35.440
-vs 35.491 tok/s) used "the same 66-token prefix, 32 teacher-forced tokens, F16
+The same discipline applies inside Muser, not only across engines — comparing
+two of our own quantization lanes is the same problem wearing different
+clothes. There the guard has a name: the **adjacent lease window**. Both
+lanes are measured back-to-back under a single held accelerator lease, so the
+drift between them is bounded by seconds rather than days, and everything
+else is nailed down: "the same 66-token prefix, 32 teacher-forced tokens, F16
 KV, flash attention, release binary, and adjacent lease window"
-`[ledger P1.3]` — the two lanes measured back-to-back under one held
-accelerator lease, so drift between them is bounded by seconds, not days.
+`[ledger P1.3]`. Under those conditions the kquant-vs-NVFP4 plain-decode
+cells landed at 35.440 vs 35.491 tok/s — a gap you are entitled to read as
+small, because the apparatus earned the right to resolve something that
+narrow.
+
+One term in that quoted setup does more work than it looks like it does.
 *Teacher-forced* means the harness feeds each engine the correct previous
-token rather than its own prediction, which is what makes per-token timing
-comparable even before you trust either engine's sampler.
+token rather than letting it run on its own prediction. That is what makes
+per-token timing comparable before you trust either engine's sampler: both
+lanes walk the identical token path, so the clock is timing the same
+computation on both sides rather than two divergent ones.
 
 ## 38.4 Exact-token comparison — divergence poisons timing
 
@@ -163,11 +183,20 @@ diverge, so speed stands without an exactness gate" `[docs/benchmarks.md §2]`.
 
 ## 38.5 Five-repetition means and the six-depth matrix
 
+One ratio at one prompt depth answers almost nothing. Decode cost changes
+shape as the KV cache grows, and an engine can plausibly win where the cache
+is small and lose where reading it dominates the token. So the answerable
+question is never "is Muser faster?" but "faster at which depths, and does
+the answer survive as the context lengthens?" A single cell cannot say. A
+matrix can.
+
 The campaign's headline throughput artifact is the **Phase 2 non-spec context
-matrix**: six prompt depths × five reps, every cell exact-token, zero failures
-`[ledger "Phase 2 non-spec context matrix", 2026-08-20]`, all timings through
-`representative_target_smoke.py` under the accelerator lease
-`[scripts/representative_target_smoke.py]`:
+matrix**: six prompt depths, five reps at each, every cell exact-token, zero
+failures. Every timing in it came through one harness,
+`representative_target_smoke.py`, held under the accelerator lease this
+chapter unpacks later `[scripts/representative_target_smoke.py]`, and the
+whole run is retained
+`[ledger "Phase 2 non-spec context matrix", 2026-08-20]`:
 
 | Depth | Decode mean | Decode CV | Prefill mean | Prefill CV |
 |---:|---:|---:|---:|---:|
@@ -299,15 +328,25 @@ frame the parity is defined in.** The ancestor book's version of this was
 "the gate before perf" `[ferrite-book Ch 24]`; Muser's version is sharper:
 sometimes the gate *is* the perf story.
 
-**Stage B, briefly**, because the spec lane repeats the shape: initial
-five-rep verdict 0.8670× (six exact levers probed and rejected), then the
-L-series microbenchmark-first n32 tile took the 16-row verify matmul from
-~148 to ~83 ms/cycle and the verdict to 1.3273× `[ledger K0, L2]`. That
-1.3273× is **superseded** — it predates the draft-window fix of §38.7 — and
-must not be cited as a current result `[ledger "Spec re-measurement at the
-fixed window"]`.
+**Stage B, briefly**, because the spec lane replayed the same shape at
+smaller scale. It opened badly, with a five-rep verdict of 0.8670×. We probed
+six exact levers hunting for the deficit and rejected every one of them —
+which is the point in an investigation where you either concede or change
+instrument. The L-series changed instrument, going microbenchmark-first, and
+the microbenchmark named the culprit: an n32 tile took the 16-row verify
+matmul from ~148 to ~83 ms/cycle, and the verdict to 1.3273×
+`[ledger K0, L2]`. Then watch what the campaign did to its own good news.
+That 1.3273× is **superseded** — it predates the draft-window fix of §38.7 —
+and it must not be cited as a current result
+`[ledger "Spec re-measurement at the
+fixed window"]`. A real number, honestly earned, retired anyway.
 
 ## 38.7 Synthetic vs natural — the fixture that could not see the bug
+
+Every measurement rests on a fixture, and a fixture is a decision about what
+you will be able to see. That decision deserves the question *what can this
+prompt not show me?* asked out loud and early — because if you do not ask it,
+the fixture will answer it for you later, at a time of its choosing.
 
 The campaign's synthetic fixture is a **period-8 cycle of 9 token ids** — a
 prompt whose next token is predictable from token identity alone. It exists
@@ -355,8 +394,13 @@ certified a broken lane for a week of campaign time.
 
 ## 38.8 The apparatus — the lease, the lock, the labels, the receipts
 
-You cannot measure fairly on a machine you do not control. Every accelerator
-run — Metal, llama.cpp, Core ML — goes through one wrapper,
+You cannot measure fairly on a machine you do not control. That reads like a
+platitude until you price it: one forgotten profiler still attached, or a
+second engine that never released the GPU, and your parity verdict is a
+measurement of contention instead — with nothing in the resulting number to
+tell you so. Discipline you have to remember is discipline you will
+eventually forget, so the campaign does not rely on remembering. Every
+accelerator run — Metal, llama.cpp, Core ML — goes through one wrapper,
 `scripts/accelerator_safe.py`:
 
 ```python
@@ -401,31 +445,51 @@ to run unless `MUSER_ACCELERATOR_LEASE` is set by the wrapper
 `[scripts/qualify_nvfp4_fast.py:307-308]` — so the discipline is structural,
 not habitual.
 
-**The [labels] discipline.** Two distinct label contracts keep instruments
-honest. On the profiling side, the dispatch-gap investigation found its own
-instrument lying: production labels omitted `lm_head` (its time silently
-attributed to `softcap`) and the legacy schedule declared a separate SWA
-`kv_store` that no longer existed, shifting *every* legacy timing; the fix
-derives labels from post-append ring state and "aborts if label and sample
-counts differ" `[docs/decode-dispatch-gap-20260815.md §Instrumentation
-correction]`. On the wizard side, node onboarding reports progress as seven
-versioned JSON labels relayed verbatim over SSE `[docs/one-button-onboarding.md
-§Six executable stages, seven progress labels]` — attempt 9's "native/text
-PASS" is precisely "all seven labels" green plus three exact handoffs
-`[claims #9]`. In both cases the rule is the same: a measurement (or a
-pipeline stage) exists only when its label exists and reconciles.
+**The [labels] discipline.** There is a failure mode worse than a noisy
+instrument, and the dispatch-gap investigation walked straight into it: an
+instrument that answers confidently and wrongly. We were reading a per-stage
+timing breakdown, chasing where the decode time went, and taking the stage
+names on that breakdown at face value. They were not trustworthy. Production
+labels omitted `lm_head` altogether, so its time was being charged silently
+to `softcap`; worse, the legacy schedule still declared a separate SWA
+`kv_store` stage that no longer existed, which shifted *every* legacy timing.
+The profile we had been reasoning from was describing a schedule the engine
+had stopped running. The repair was structural rather than clerical: labels
+are now derived from post-append ring state, and the tool "aborts if label
+and sample counts differ" instead of printing a plausible table
+`[docs/decode-dispatch-gap-20260815.md §Instrumentation
+correction]`.
 
-**The wire-side apparatus** extends the same ideas to the GX10 lane:
-`tcp_probe.py` re-establishes the raw ceiling (the ~9.4 Gbps reference is
-pre-rebuild and must be re-proven after topology changes; the switched fabric
-is asymmetric — 9.256 Gbps product-direction, 6.161 reverse, retained as a
-deviation `[ledger, 2026-08-23 readiness entries]`),
-`durable_fsync_probe.py` fails (exit 1) any volume whose reserve-pattern
-tail would poison TTFT, and `handoff_report.py` turns a packet's retained
-receipts into a per-rep phase table `[scripts/gx10/README.md]`. And one
-measurement rule from that lane deserves general statute: **Wi-Fi never
-carries a measurement** — Mac `en0` wired only, `en1` invalidates
-`[scripts/gx10/README.md:7-11]`.
+The wizard side arrived at the same rule from the opposite direction. Node
+onboarding reports its progress as seven versioned JSON labels relayed
+verbatim over SSE `[docs/one-button-onboarding.md
+§Six executable stages, seven progress labels]`, and a pass is defined by
+those labels rather than by anyone's impression that the thing worked —
+attempt 9's "native/text PASS" means precisely "all seven labels" green plus
+three exact handoffs
+`[claims #9]`. The rule is worth stating twice, because it governs the
+profiler and the wizard alike: a measurement — or a pipeline stage — exists
+only when its label exists and reconciles. An unlabelled number is not a
+minor documentation debt. It is a number about nothing in particular.
+
+**The wire-side apparatus** extends the same ideas to the GX10 lane, and it
+reads best as three questions asked in order before any handoff is timed.
+*What can this link actually carry?* `tcp_probe.py` re-establishes the raw
+ceiling, and the answer is never inherited from last week: the ~9.4 Gbps
+reference is pre-rebuild and must be re-proven after topology changes. When we
+did re-prove it, the switched fabric turned out to be asymmetric — 9.256 Gbps
+in the product direction, 6.161 in reverse — and rather than average that
+away we retained the asymmetry as a deviation
+`[ledger, 2026-08-23 readiness entries]`. *Will the storage underneath spoil
+the number?* `durable_fsync_probe.py` fails (exit 1) any volume whose
+reserve-pattern tail would poison TTFT. *And where did the time actually go?*
+`handoff_report.py` turns a packet's retained receipts into a per-rep phase
+table `[scripts/gx10/README.md]`.
+
+One rule from that lane deserves promotion to general statute, because it is
+the cheapest mistake to make and the hardest to detect after the fact:
+**Wi-Fi never carries a measurement.** Mac `en0`, wired, or the run does not
+count; `en1` invalidates it `[scripts/gx10/README.md:7-11]`.
 
 Finally, the volume split that [Ch 31](31-the-wire-discipline.md) derived:
 evidence is append-only on `muser-receipt://`; operational state
@@ -436,11 +500,15 @@ findings, 2026-08-18]`.
 
 ## 38.9 Best-of-N, median, mean — choosing the statistic
 
-The ancestor's rule ports cleanly `[ferrite-book Ch 24]`: **best-of-N for
-ceilings, median (or mean+CV) for ratios.** Best-of-N answers "how fast can
-this possibly go" — a kernel-occupancy question — but it selects the
-luckiest sample, which is exactly what you must not do when claiming your
-engine beats another. Muser's campaign statistic choices, all citable:
+You have a handful of samples and one number to publish. Which one? The
+choice is not cosmetic bookkeeping; it decides which question your number is
+answering, and picking the wrong summary is how an honest run turns into a
+dishonest headline. The ancestor's rule ports cleanly `[ferrite-book Ch 24]`:
+**best-of-N for ceilings, median (or mean+CV) for ratios.** Best-of-N answers
+"how fast can this possibly go" — a kernel-occupancy question — but it
+selects the luckiest sample, which is exactly what you must not do when
+claiming your engine beats another. Muser's campaign statistic choices, all
+citable:
 
 - **Ratios of per-engine medians** for the streamed A/B verdicts (J3, above).
 - **Means with CV** for the matrices (Table 38.2) — five reps, every rep
@@ -463,7 +531,12 @@ no-automatic-retry flag exists to make that impossible
 
 ## 38.10 What a ratio may and may not claim
 
-The numbers that must never be quoted, with their reasons — this list is
+A measurement's scope is part of the measurement. Strip the scope and the
+number keeps all its digits while losing everything that made it true — which
+is exactly how a careful lab ships a careless sentence. So the campaign
+maintains a register of numbers that are real, retained, and nonetheless
+unquotable. Each one below is a genuine measurement; each is barred for a
+different reason, and the reasons are the interesting part. This list is
 binding on this book too `[docs/launch-claims.md]`:
 
 - **110.59 tok/s** (distributed all-accept control): a positive control under
@@ -476,13 +549,17 @@ binding on this book too `[docs/launch-claims.md]`:
 - **0.781×** as a current deficit: single sample, superseded by the six-depth
   matrix `[claims #2]`.
 - **1.64960× decode @131,008**: barred by the 2026-08-23 accounting
-  amendment — at 48 output tokens the decode phase boundary is asymmetric
-  across engines (Muser's denominator excludes its first verified round;
-  llama's includes its first eval round), so "no value in that series should
-  be presented as an accounting-neutral cross-engine per-round speedup.
-  Prefer wall time" `[ledger "AMENDMENT — 131008 decode accounting audit"]`.
-  The robust headline is the wall crossing parity: 0.9768 → 0.98400 →
-  **1.02536×** `[claims #16]`.
+  amendment. This one is the most instructive of the five, because nothing
+  about the run itself was wrong. At 48 output tokens the decode phase
+  boundary simply is not drawn in the same place on both sides — Muser's
+  denominator excludes its first verified round, llama's includes its first
+  eval round — so the ratio is comparing two differently-bounded phases and
+  flatters us accordingly. The amendment's ruling: "no value in that series
+  should be presented as an accounting-neutral cross-engine per-round
+  speedup. Prefer wall time"
+  `[ledger "AMENDMENT — 131008 decode accounting audit"]`. Wall time admits
+  no such ambiguity, which is why the surviving headline is the wall crossing
+  parity: 0.9768 → 0.98400 → **1.02536×** `[claims #16]`.
 
 And the positive statement of scope discipline: ratios carry their depth,
 lane, fixture class, rep count, and hardware in the same breath. "1.05× at

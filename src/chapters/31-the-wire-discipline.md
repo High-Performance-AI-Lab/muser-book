@@ -10,28 +10,41 @@ receipts, why it took exactly that long.*
 
 Chapter 30 ended with a sealed manifest: every segment HMAC-verified, the
 replay ledger consulted, the ACK meaningful. That is the *correctness*
-story of the wire. This chapter is the *performance and honesty* story.
-Between 2026-08-16 and 2026-08-23, the disaggregated lane's transfer looked
-sick four different times, and four times the culprit turned out to be
-Muser's own infrastructure — a pacing pin, a filesystem, a power-saving
- Ethernet feature, and a stale reference number — never the network the
-symptoms were blaming. The pacing ladder is the campaign's cleanest
-example of a rule this book keeps returning to: **the link is never the
-constraint until it suddenly is, and every stall is self-inflicted until
-proven otherwise.**
+story of the wire — the bytes you received are the bytes that were sent.
+This chapter asks the question that comes next, and it is the one that
+actually hurt: why did those bytes take as long as they did, and how
+would we know?
 
-The rule is not a slogan; it is written into the operating agreements of
-the repo itself: "every stall in this campaign was self-inflicted
-infrastructure until proven otherwise" is how the research ledger frames
-the wire question `[measured-numbers §3, question 3]`, and the operator
-cheat sheet at the Muser root states the standing lesson — operational
-state (replay ledger, sockets, locks) belongs on the internal disk,
-because "the evidence volume's directory-fsync tail produces bimodal ~1 s
-stalls in commit paths" `[AGENTS.md, muser root]`.
+Between 2026-08-16 and 2026-08-23 we asked it four times, because four
+times the transfer looked sick. Each time we went in half expecting to
+find a bad link. Each time the culprit turned out to be something we had
+built ourselves — a pacing pin, a filesystem, a power-saving Ethernet
+feature, and a stale reference number — never the network the symptoms
+were blaming. Being wrong in the same direction four times running is how
+a rule gets earned, and this is the one we earned: **the link is never
+the constraint until it suddenly is, and every stall is self-inflicted
+until proven otherwise.**
+
+We did not invent that rule for the book; by the time we wrote it down it
+was already load-bearing in the repo. "Every stall in this campaign was
+self-inflicted infrastructure until proven otherwise" is how the research
+ledger frames the wire question `[measured-numbers §3, question 3]`. And
+the operator cheat sheet at the Muser root carries the scar tissue as
+standing policy: operational state — replay ledger, sockets, locks —
+belongs on the internal disk, because "the evidence volume's
+directory-fsync tail produces bimodal ~1 s stalls in commit paths"
+`[AGENTS.md, muser root]`. That sentence has a date and a price, and you
+will meet both.
 
 ---
 
 ## 31.1 The bill: what actually crosses the wire
+
+Every argument in this chapter is an argument about seconds, and a second
+on a wire is only ever bytes divided by a rate. So before we are allowed
+to accuse the link of anything, we owe the reader — as we owed ourselves —
+an exact count of what we are handing it. Get the numerator wrong and
+every rate in the chapter is fiction.
 
 Start with the invoice, derived the way Chapter 22 taught you. One
 layer-token of KV is 2 KV heads × 128 head-dim × 2 bytes (f16) × 2 planes
@@ -50,15 +63,22 @@ layers split 39 SWA (window 2,048) + 13 NoPE (full history)
 At the shallow end, a 2,048-token prompt moves ≈104 MiB of target KV plus
 ≈42.5 MiB of DFlash context in 36 segments — ≈146 MiB combined
 `[docs/disaggregated-prefill-sealing-plan-20260818.md §2]`. At the deep
-end, the 130,815-token cell moves exactly **1,823,184,896 B** — the
-per-class decomposition above reconciles to that byte, derivation and
-receipts in [Ch 22 §22.7](22-the-price-of-context.md)
+end, the 130,815-token cell moves exactly **1,823,184,896 B**. The word
+*exactly* is doing real work there: the per-class decomposition above
+reconciles to the byte, and we kept the run that proves it
 `[docs/kvpack-merge-handoff-20260820.md §3 D1; receipt
 phase4-disagg-20260820/130815-g900091/out-p4/f-p4-text-g900091-client.json]`.
-(An early doc misread that payload as "~7 GB" by confusing it with the
-producer's `--kv-cache-memory-bytes` *allocation* — one of this book's
-standing landmines, told in full at
-[Ch 22 §22.7](22-the-price-of-context.md).)
+The derivation is walked in full in
+[Ch 22 §22.7](22-the-price-of-context.md).
+
+We are this pedantic about the invoice because we once got it wrong, and
+badly. An early doc read the deep payload as "~7 GB" — it had picked up
+the producer's `--kv-cache-memory-bytes` *allocation* instead, which is
+the size of the box, not the weight of what is in it. A wrong numerator
+never announces itself; it simply makes a healthy link look sick, and
+sends you hunting for a fault that is not there. That kind of mistake is
+one of this book's standing landmines, and it is told as its own story at
+[Ch 22 §22.7](22-the-price-of-context.md).
 
 Now the physics. A 10GbE link at its measured ~9.4 Gbps raw ceiling moves
 1.823 GB in `1.823e9 × 8 / 9.4e9 ≈ 1.55 s`; at the 3.9 Gbps the lane
@@ -104,7 +124,12 @@ numbers after the topology change (§31.5).*
 
 ## 31.2 The pacing ladder: 3.9 of 9.4 Gbps was our own pin
 
-The ladder is best told as the campaign told it, one dated rung at a time.
+So: where did the other half of the link go? For the better part of a
+week we would have told you the network ate it, and we would have been
+wrong. What follows is the ladder we climbed to find that out, told the
+way the campaign climbed it — one dated rung at a time. The order the
+rungs arrived in is the whole lesson, so resist reading ahead to the
+answer.
 
 **Rung 0 — the symptom (2026-08-17).** The F-series engineering packet
 measured installed payload at **3.910 Gbps median, CV 0.401%** on the
@@ -127,13 +152,20 @@ was never the constraint."
 `SO_MAX_PACING_RATE = 500 MB/s` pin — a Linux socket option that caps the
 kernel's transmit pacing — set as "the N-series floor guard" to protect
 the 3 Gbps product floor on a then-unhealthy link
-`[docs/disaggregated-prefill-sealing-plan-20260818.md §5 W0]`. Both
-producers shared it, because the vLLM connector imports the sender from
-the llamacpp path.
+`[docs/disaggregated-prefill-sealing-plan-20260818.md §5 W0]`. Read that
+again slowly, because it is the whole chapter in one sentence: a guard we
+had written earlier in the campaign, to stop a sick link from dipping
+under the product floor, was now the only reason we could not go faster
+on a healthy one. Both producers inherited it, because the vLLM connector
+imports the sender from the llamacpp path — one line of old caution, two
+lanes throttled.
 
 **Rung 3 — the raise (W1).** The pin went 4 → 8 Gbps, env-configurable.
 Installed payload moved **3.91 → 5.89 Gbps median** `[ledger §T-series
-T1]`. The code that owns this today reads:
+T1]`. Note what that arithmetic does *not* say: doubling a ceiling did
+not double a rate. The payload landed well short of the new pin, which
+was our first hint that the pin had stopped being the only thing standing
+in the way. The code that owns this today reads:
 
 ```python
 # scripts/gx10/llamacpp/muser_v2_send.py:55
@@ -163,23 +195,40 @@ resident producer's receipt validator refuses any handoff whose
 refusal of the socket option aborts the send rather than silently
 unpacing.
 
-**Rung 4 — the honest clock.** Raising the pin exposed a measurement
-defect: at pins above the achievable rate, the producer's TCP busy-time
-metric tracks real jitter (CV ~5%) instead of the pacer (CV 0.4%), and
-the old ≤2% link-CV gate had been calibrated on the flattened version.
-The campaign's response is worth quoting as a pattern: the wire clock
-ruling is that Linux `TCP_INFO.busy_time` is *the only honest link
-denominator* — userspace send-time and receiver first-read clocks were
-both rejected as buffer- and compute-dependent `[ledger §P4; §N5]` — and
-the link gate was re-specified from a rate-CV to a **per-counted-rep
-floor: every counted repetition ≥ 3.0 Gbps installed payload**, with the
-CV retained in receipts for audit only `[docs/disaggregated-prefill-
-sealing-plan-20260818.md §7.4]`. An earlier five-rep row of 5.581 /
-4.550 / 5.309 / 5.769 / 4.765 Gbps at CV 8.9985% survives in the record
-only as failed-metric evidence `[measured-numbers §1e]`.
+**Rung 4 — the honest clock.** Then the fix broke the thermometer. We
+expected a faster lane to look like the old lane with a bigger number;
+what we got was a lane that suddenly failed its own stability gate. At
+pins above the achievable rate, the producer's TCP busy-time metric
+tracks real jitter (CV ~5%) instead of the pacer (CV 0.4%), and the old
+≤2% link-CV gate had been calibrated on the flattened version.
 
-**Rung 5 — the landed numbers.** With the ladder climbed, the lane's
-shallow headline became the final-image 2,048/256 packet: **TTFT median
+Say that the other way round, because it is the part that trips people
+up. While the pin was low, the pacer — not the link — was setting the
+rate, so the rate came out beautifully steady. The gate was never
+measuring the wire; it was measuring our own metronome, and grading it
+excellent. Unpin the sender and the gate starts seeing the world for the
+first time, and the world is noisy. The stability we had been shipping
+was, in part, a property of the instrument.
+
+So the campaign repaired the instrument before trusting it again. The
+wire clock ruling is that Linux `TCP_INFO.busy_time` is *the only honest
+link denominator*; userspace send-time and receiver first-read clocks
+were both tried and both rejected, each one contaminated by something
+that is not the wire — buffering in one case, compute in the other
+`[ledger §P4; §N5]`. The link gate was then re-specified from a rate-CV
+to a **per-counted-rep floor: every counted repetition ≥ 3.0 Gbps
+installed payload**, with the CV retained in receipts for audit only
+`[docs/disaggregated-prefill-
+sealing-plan-20260818.md §7.4]`. And the row that died in the transition
+was kept rather than deleted: five reps of 5.581 / 4.550 / 5.309 /
+5.769 / 4.765 Gbps at CV 8.9985% survive in the record as failed-metric
+evidence `[measured-numbers §1e]`. Nothing about the link changed when
+that row was retired. Only our right to quote it did.
+
+**Rung 5 — the landed numbers.** With the ladder climbed, three results
+landed, and they are worth reading as a set rather than as a list: one
+shallow, one deep, and one that quietly embarrasses the pin. The shallow
+headline is the final-image 2,048/256 packet: **TTFT median
 1.493 s, counted CV 0.22%, ≥6.23 Gbps installed payload (receipt minimum
 6.228), deterministic, exit 0** — `stable: true`
 `[claims #6; ledger §T-series "Final packet on the final image"; receipt
@@ -195,17 +244,32 @@ we set ourselves.
 
 ## 31.3 Our own fsync tail: the durability lesson of 2026-08-18
 
-The pacing fix did not kill the 2,048-class TTFT variance. What remained
-was a **bimodal ~1 s stall on random repetitions** — the packet whose
-five-rep TTFT median was 2.699 s at CV 21.40% `[docs/nvfp4-fast-lane-
-evidence-20260817.md §Measured product numbers]`. The hunt is a small
-masterpiece of elimination: per-frame arrival stamps and absolute seal
-clocks ruled out the raw link (0 retransmits under saturation), CPython
-GC (sub-ms collections), producer compute (flat CPU), Mac-side engine
-phases (constant), and session creation (constant ~650 ms) `[ledger
-§T-series T2]`. What was left sat between `prepare_commit` and `commit`:
-**the replay ledger's directory fsync on the evidence volume** — reserve
-median 0.22 ms, observed tail **691 ms** `[ledger §T-series T2]`.
+Raising the pin bought real throughput and settled nothing about the
+question that mattered more: could we promise a time-to-first-token at
+all? The pacing fix did not kill the 2,048-class TTFT variance. What
+remained was a **bimodal ~1 s stall on random repetitions** — the packet
+whose five-rep TTFT median was 2.699 s at CV 21.40%
+`[docs/nvfp4-fast-lane-
+evidence-20260817.md §Measured product numbers]`. *Bimodal* is the tell,
+and it is worth pausing on it. A slow lane is a lane that is slow every
+time. This one was quick on most repetitions and roughly a second slower
+on the others, with nothing in the inputs to tell the two groups apart.
+That shape does not come from a gradual cost. Something was either
+happening or not happening.
+
+The hunt that followed was pure elimination, and every
+suspect on the list was one we had reason to fear. Per-frame arrival
+stamps and absolute seal clocks cleared the raw link (0 retransmits
+under saturation), then CPython GC (sub-ms collections), then producer
+compute (flat CPU), then the Mac-side engine phases (constant), then
+session creation (constant ~650 ms) `[ledger
+§T-series T2]`. That exhausted everything we had instrumented, and the
+stall was still there — which meant it lived in the one seam nobody had
+thought to time, between `prepare_commit` and `commit`. There it was:
+**the replay ledger's directory fsync on the evidence volume**, reserve
+median 0.22 ms, observed tail **691 ms** `[ledger §T-series T2]`. A
+durability primitive, sitting on the critical path of a network
+benchmark.
 
 Here is why a directory fsync is on the critical path at all. Replay
 admission (Chapter 30's defense against a replayed generation) must be
@@ -265,12 +329,17 @@ past a 100 ms worst sample); its error message teaches the fix:
     }
 ```
 
-`RemoteReceiver::bind` runs `check_ledger_volume` — twenty real
-write+fsync+rename+dir-fsync cycles against the ledger's parent
-directory — before the listener even opens, and refuses the config if the
-worst sample exceeds 100 ms `[crates/muser-cluster/src/receiver.rs:189-206]`.
-The probe `probe_ledger_reserve` is a faithful in-process twin of
-`persist_replay_state`'s sequence `[crates/muser-cluster/src/receiver.rs:150-178]`.
+Note *when* that check runs. `RemoteReceiver::bind` performs
+`check_ledger_volume` — twenty real write+fsync+rename+dir-fsync cycles
+against the ledger's parent directory — before the listener even opens,
+and refuses the config outright if the worst sample exceeds 100 ms
+`[crates/muser-cluster/src/receiver.rs:189-206]`. A misconfigured node
+therefore never gets as far as accepting a handoff it would go on to
+stall. And the check is only worth anything because it lies about
+nothing: `probe_ledger_reserve` is a faithful in-process twin of
+`persist_replay_state`'s sequence, the same four steps in the same order
+`[crates/muser-cluster/src/receiver.rs:150-178]`. A cheaper probe would
+have measured a cheaper thing.
 
 The operator-side twin is `scripts/gx10/durable_fsync_probe.py`, whose
 docstring is the pre-flight ritual in miniature: run it "against the
@@ -285,13 +354,19 @@ the scar: "This exact failure cost the fast lane its stability gate on
 
 ## 31.4 EEE: when the power saver eats the burst
 
-The third stall was the strangest, because the shallow cells were now
-healthy and the *deep* cells collapsed. Two investigations, two
-payoffs.
+The third stall was the strangest, because by now the shallow cells were
+healthy and it was the *deep* cells that collapsed. Depth-dependent
+failure has an obvious shortlist, and ours was two names long: either the
+receiver had started pushing back once the payload got big, or the
+producer had simply gotten slower per byte on a long prompt. Both are our
+own software. Both would have been consistent with the rule. Both were
+wrong. Two investigations, two payoffs.
 
-**The controlled diagnosis (N2, 2026-08-16 era).** Six repetitions of the
-identical strict 1×2048×256 cell, with receiver phases instrumented
-(Figure 31.3):
+**The controlled diagnosis (N2, 2026-08-16 era).** The first
+investigation was built to kill those two hypotheses cleanly: six
+repetitions of the identical strict 1×2048×256 cell, with the receiver's
+phases instrumented so that "the receiver is slow" would have to show up
+as an actual number (Figure 31.3):
 
 | Condition | Rep | Producer wire s | installed Gbps | verify+install+seal+commit |
 |---|---|---:|---:|---:|
@@ -308,23 +383,38 @@ identical strict 1×2048×256 cell, with receiver phases instrumented
 roughly 90× — across identical conditions, while the receiver's entire
 post-wire cost sits still at ~0.2 s `[ledger §N2]`.*
 
-Read the columns the way the campaign did. Receiver backpressure:
-refuted (constant ~0.2 s). Producer compute: refuted. The collapsed
-component is the **wire span itself**. [EEE](../glossary.md#eee-energy-efficient-ethernet) —
+Read the columns the way we had to read them. Our first hypothesis,
+receiver backpressure: refuted, because the last column never moves
+(constant ~0.2 s). Our second, producer compute: refuted the same way.
+Both shortlist names were gone, and the swing had to live in the only
+column left — the **wire span itself**, which is precisely the thing the
+chapter's rule says to suspect last. The last row of the table is the
+answer, and it is a row about a power-saving feature.
+[EEE](../glossary.md#eee-energy-efficient-ethernet) —
 Energy-Efficient Ethernet, the link's low-power idle mode — was
 enabled-and-active on the GX10 side (Tx LPI 19 µs), and with EEE disabled
 on the Spark side both probe reps ran the fast case `[ledger §N2]`. One
-wrinkle that matters operationally: macOS exposes no EEE control on
-`en0`; the toggle exists only on the Spark side `[ledger §N2]`.
+wrinkle that matters operationally, and that will shape every remedy
+below: macOS exposes no EEE control on `en0`; the toggle exists only on
+the Spark side `[ledger §N2]`.
 
-**Why this lane, specifically.** EEE punishes bursty senders, and this
-lane's wire schedule is bursty by architecture. The SWA groups (~82 MB)
+**Why this lane, specifically.** A power saver that harms a link is not a
+general law — offices run on EEE happily. So the question we owed
+ourselves was why *our* traffic provoked it, and the answer is that EEE
+punishes bursty senders while this lane's wire schedule is bursty by
+architecture. The SWA groups (~82 MB)
 stream early, during the last CUDA ubatches; but the NoPE bulk — 1.74 GB,
 95.5% of the payload by the §31.1 arithmetic — cannot start until CUDA
 finishes layer 51, because NoPE planes are absolute full-history planes
 built in layer order `[docs/kvpack-merge-handoff-20260820.md §6 "Pacing
 reality"]`. The deep cell therefore manufactures **41–47 s of forced link
 idle and then dumps a 1.74 GB burst onto a link that has gone to sleep**.
+
+Said without the units: for the better part of a minute we tell the link
+there is nothing to do, the link takes us at our word and powers its
+lanes down, and then we hand it the single largest burst of the entire
+run and expect it to be awake. The deep cell is not an unlucky workload
+for EEE. It is close to the worst one you could design.
 
 **The blackouts, quantized.** On the 130,815-token payload the failure
 mode is not vague jitter but *discrete retransmission ladders quantized
@@ -361,15 +451,24 @@ register carries — **4.149×** median TTFT versus the 570.122 s local
 
 ## 31.5 After the rebuild: re-prove the ceiling, and never trust en1
 
+Rewiring a lab bench is not usually a chapter event. This one was,
+because the day it happened it silently invalidated every wire number
+printed above — and nothing in any tool would have told us. That is the
+fourth villain, and it is the quietest of the four: not a pin, not a
+volume, not a power saver, just a figure that used to be true.
+
 On 2026-08-23 the lab moved from the retired direct `retired /30` link
 to the wired MikroTik fabric: Mac Ethernet `en0` at `192.0.2.10` to
 the producer's `enp1s0f0np0` at `192.0.2.20` `[AGENTS.md, muser
 root]`. Every historical wire number in this chapter — including the 9.40
-Gbps T0 ceiling — was measured on the old path, and the topology
+Gbps T0 ceiling that gave us the confidence to raise the pin at all — was
+measured on the old path. The topology
 amendment to the sealing plan says what to do about that: "qualification
 must first re-anchor raw TCP on the new topology and must never use Mac
 Wi-Fi `en1`" `[docs/disaggregated-prefill-sealing-plan-20260818.md,
-topology amendment]`.
+topology amendment]`. Re-anchoring costs an afternoon. Carrying a stale
+ceiling forward costs you the ability to tell a healthy lane from a sick
+one, which is the only thing this chapter has been doing.
 
 The re-anchor found something the direct link had hidden: **asymmetry**.
 In the product payload direction (GX10 → Mac) single-stream TCP measured
@@ -396,11 +495,15 @@ a measurement is invalid if it routes there" `[scripts/gx10/README.md:7-11]`.
 
 ## 31.6 The tools: a diagnostic ladder, bottom-up
 
+The point of a war story is that the next person should not have to fight
+the war. Each villain above therefore has a script attached, so that the
+question "is it the wire?" can be answered in a minute instead of a week.
 Every lesson in this chapter is productized under `scripts/gx10/`,
 documented in `scripts/gx10/README.md` and tested by
 `scripts/tests/test_gx10_diagnostics.py`. The flow is deliberately
 bottom-up — fix the layer under suspicion before debugging the layer
-above it `[scripts/gx10/README.md:21-41]`:
+above it `[scripts/gx10/README.md:21-41]`. Read the ladder as the
+chapter's own history, rung for rung:
 
 1. **`tcp_probe.py`** — "Answer exactly one question, fast: is the wire
    healthy?" Interpretation bands are in the docstring: ~9+ Gbps
@@ -431,14 +534,23 @@ above it `[scripts/gx10/README.md:21-41]`:
    off after three consecutive failed starts `[AGENTS.md, muser root;
    scripts/gx10/README.md:42-48]`.
 
-The deep-payload soak that closed this arc deserves its own line: eight
-consecutive 130,815-token handoffs with zero producer deaths and
+One more measurement belongs in this section rather than in a results
+table, because it is the one that let us stop suspecting ourselves: the
+deep-payload soak that closed the arc. Eight
+consecutive 130,815-token handoffs ran with zero producer deaths and
 deterministic output, payload declining 6.87 → 3.47 Gbps across the soak
-with every rep ≥ the 3.0 floor — a bounded soak, explicitly "not a 20-rep
+while every rep held ≥ the 3.0 floor. That decline is not nothing, and we
+have not dressed it up — the soak is bounded, and is labelled in the
+ledger as explicitly "not a 20-rep
 W4 stability packet" `[ledger §"bounded eight-handoff deep-load soak";
 receipts final-campaign-20260823/attempt-4/soak/run-attempt-3/SOAK_VERDICT.json]`.
 
 ## 31.7 Tradeoffs
+
+Four villains, four decisions — and none of the decisions was simply
+"remove the thing that hurt us." Each had an obvious lever beside it that
+we did not pull, or pulled only within a stated scope. Here is what each
+choice bought and what it cost, in measured terms.
 
 **Pin vs no pin.** The obvious alternative — remove `SO_MAX_PACING_RATE`
 and let TCP self-clock at line rate — was never taken, and the measured

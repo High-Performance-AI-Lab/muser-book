@@ -11,14 +11,27 @@ Chapter 5 ended on a promise: the concrete formats. Here is the first one.
 The [kquant](../glossary.md#kquant) family — llama.cpp's "K-quant" block formats — is what fills
 the 16,756,681,056-byte reference artifact that Muser's kquant lane decodes
 from, the lane measured at 35.440 tok/s `[claims #11]` and used as the
-program's reference lock. We will read its byte layouts straight from
-Muser's own dequantizers, dequantize real-format elements by hand, map
-which tensor class carries which member of the family, and then watch the
-dispatch code choose a kernel for each batch shape.
+program's reference lock.
+
+Everything that follows answers one question in different disguises: when a
+weight has been squeezed down to a handful of bits inside a packed block,
+what exactly must the machine read, and in what order, to get a usable number
+back out? So we read the byte layouts straight from Muser's own dequantizers,
+dequantize real-format elements by hand, map which tensor class carries which
+member of the family, and then watch the dispatch code choose a kernel for
+each batch shape. The receipts are all here; they simply arrive after the
+idea they support rather than in the middle of it.
 
 ---
 
 ## 6.1 One model, several dtypes — decided by the GGUF
+
+Before any bytes, a question of authority: who decides that *this* tensor is
+Q4_K and *that* one is Q6_K? Not the engine, and not an operator flag at
+startup. The file decides, and it decides tensor by tensor. The stake is
+higher than it sounds — guess wrong here and you do not get a slightly worse
+model, you get an engine that refuses to start, because every admission check
+below is fail-closed.
 
 A GGUF file carries a dtype **per tensor**, not per model. Muser's parser
 enumerates the types it is willing to meet:
@@ -66,18 +79,31 @@ and those two numbers define the format's
 `block_elements`. Bits/element = block_bytes × 8 ÷ elements — derive each
 one yourself: Q4_K is 144×8/256 = 4.5; Q6_K is 210×8/256 = 6.5625.*
 
-The CPU reference path can dequant any of these (`quant/dispatch.rs`
-fans out per dtype); the live Metal decode path is narrower — a projection
-tensor must be one of `Q4_K | Q5_K | Q6_K | NVFP4_E2M1 | F16`
-(`[crates/muser-engine/src/decode.rs:136-139]`), and the embedding table
-must be `Q4_K` or `F16` (`[crates/muser-engine/src/decode.rs:1209]`).
+Two paths read these types, and they are not equally permissive. The CPU
+reference path will dequant anything on the list — `quant/dispatch.rs` simply
+fans out per dtype. The live Metal decode path is deliberately narrower. A
+projection tensor must be one of `Q4_K | Q5_K | Q6_K | NVFP4_E2M1 | F16`, and
+the embedding table is narrower still: `Q4_K` or `F16`, nothing else.
+Anything outside those sets is not quietly converted on the way in; it is
+refused. The two fences are drawn at
+`[crates/muser-engine/src/decode.rs:136-139]` for projections and
+`[crates/muser-engine/src/decode.rs:1209]` for the embedding.
 
-The lane itself is chosen fail-closed at load: the GGUF must declare
-`muser.weight_precision`, and a kquant artifact is the default only when no
-native NVFP4 tensors exist (`[crates/muser-engine/src/loader.rs:72-91]`).
-Chapter 7 covers the `nvfp4` pairing; this chapter stays on `q4_k_xl`.
+The lane itself is chosen the same fail-closed way at load. The GGUF must
+declare `muser.weight_precision`, and a kquant artifact becomes the default
+only when the file contains no native NVFP4 tensors at all
+`[crates/muser-engine/src/loader.rs:72-91]`. The artifact picks the lane —
+not a flag, not a heuristic, not a fallback that guesses. Chapter 7 covers
+the `nvfp4` pairing; this chapter stays on `q4_k_xl`.
 
 ## 6.2 Q4_K: the 144-byte super-block
+
+Q4_K is the format most of this artifact is written in, which makes it the
+one worth knowing to the byte. It answers the question the previous chapter
+left open: how do you give every small group of weights its own local scale
+without the scales themselves eating the savings you went to all this trouble
+for? Watch where each header byte goes, and the answer is arithmetic rather
+than magic.
 
 The unit of Q4_K storage is a **[super-block](../glossary.md)**: 256
 weights in 144 bytes, which is the 4.5 bits/weight of Figure 6.1. As in
@@ -182,10 +208,19 @@ the high nibble plus the top 2 bits of `scales[j]`.*
 Note also the **interleaving** in the dequant loop: within each 64-element
 group, the *low* nibble of byte `qs[q_off+l]` feeds element `base+l`
 (even sub-block) and the *high* nibble feeds element `base+l+32` (odd
-sub-block). One byte, two sub-blocks, two different scales — the property
-Chapter 5's toy deliberately did not have.
+sub-block). Said the other way round, because this is the part that trips
+people up: a byte of `qs` does not belong to any single sub-block. Its low
+half is a weight in one sub-block and its high half is a weight in the
+neighbouring one, and the two halves are reconstructed with different
+effective scales and different mins. One byte, two sub-blocks, two different
+scales — the property Chapter 5's toy deliberately did not have.
 
 ## 6.3 A worked dequant of real-format bytes
+
+Reading a layout table is not the same as believing it. The only way to be
+sure you have the packing right is to build a block out of nothing, run the
+extraction the shipping code runs, and watch the values come back. That is
+the exercise here, and it is worth doing with a pencil rather than skimming.
 
 Hand-build one super-block (values schematic in magnitude — real weights
 dequant near ±0.05; the mechanics are identical):
@@ -257,6 +292,12 @@ by hand against the shipping code.
 
 ## 6.4 Q5_K and Q6_K: the siblings
 
+Q4_K has two siblings on this artifact, and each one changes exactly one
+thing. Both are answering the same question — *where do you put the bits that
+did not fit in a nibble?* — and they answer it differently: Q5_K adds a
+plane, Q6_K changes the codebook. Keep that distinction in hand; it is what
+makes their layouts feel different when they are really not.
+
 **Q5_K** is Q4_K plus one extra bit per element, stored in a separate
 plane. Its 176 bytes (Figure 6.4): the same `d`/`dmin`/12-byte scale strip, then 32
 bytes `qh` holding one high bit per element (256 bits), then the same 128
@@ -299,6 +340,11 @@ argument of Chapter 5 matters less. The code-extraction quadruple
 deferred-scaling order (§6.7).
 
 ## 6.5 Which tensor carries which format
+
+So the family has members. Which tensor gets which, and who is keeping
+score? This is where a quantization recipe stops being theory: a few tensors
+get promoted to more bits, most do not, and every promotion is paid for out
+of the per-token byte budget this book opened with.
 
 The release artifact is a *mix*, like llama.cpp's "Q4_K_M" recipes. The
 authoritative in-repo map is the shape table of the M=16 microbenchmark
@@ -368,6 +414,11 @@ DRAM traffic as one token (`[crates/muser-engine/src/weights.rs:4-7]`).
 
 ## 6.7 The kernels that eat these bytes
 
+A format is only worth what the code reading it is worth, so the next
+question is: whose kernel actually touches these bytes? The answer is not
+"ours," and that turns out to be a deliberate choice with a numerical
+argument behind it rather than a shortcut.
+
 Muser deliberately runs kquant matmuls through **three sources**
 (recall Chapter 4). For a single-token decode projection
 (`encode_quantized_matmul`, tokens = 1), the first choice is the pinned
@@ -394,12 +445,16 @@ is named in prose as the contract requires: grid = `n_out ÷
 (rows_per_group × 2)` threadgroups, threadgroup size `(32, 2)` — 64
 threads, two [SIMD groups](../glossary.md#simd-group) (Chapter 2's 32-lane
 hardware execution unit), Q4_K/Q6_K computing two rows per group and Q5_K
-one (`[crates/muser-engine/src/metal/encode/qkv.rs:444-448]`). Note what
-the `unreachable!` arm implies: **without the metallib there is no
-Muser-authored single-token Q6_K matvec** — the fallback switch panics on
-Q6_K (`[crates/muser-engine/src/metal/encode/qkv.rs:451-459]`); only Q4_K
-(`muser_matvec_q4k_4r2s`) and Q5_K (`muser_matvec_q5k_4sg`) have
-hand-written siblings.
+one (`[crates/muser-engine/src/metal/encode/qkv.rs:444-448]`).
+
+Now look at what the `unreachable!` arm quietly admits. **Without the
+metallib there is no Muser-authored single-token Q6_K matvec.** Only Q4_K and
+Q5_K have hand-written siblings — `muser_matvec_q4k_4r2s` and
+`muser_matvec_q5k_4sg` — so when the pinned metallib is absent the fallback
+switch does not degrade gracefully on Q6_K, it panics
+`[crates/muser-engine/src/metal/encode/qkv.rs:451-459]`. That is the
+fail-closed reflex again, and it is the right reflex: a wrong logit is worse
+than no logit.
 
 When the ferrite-lineage fallback does run, here is the Q4_K kernel's core
 — read it against §6.3:
@@ -482,8 +537,12 @@ second source), and `MUSER_MULTI_COL_VERIFY` gates an exact multi-column
 verify route (`[crates/muser-engine/src/metal/encode/multicol.rs:12-14]`).*
 
 
-Why keep llama's batch boundaries at all? The comment in the dispatch says
-it exactly — and it is the chapter's most important citation:
+Why keep llama's batch boundaries at all? Look at the ladder and an obvious
+simplification suggests itself: the middle rungs could just call the
+single-token kernel repeatedly, once per activation row, and a whole family
+of kernels would disappear from the engine. It is the kind of cleanup that
+looks free. The comment in the dispatch exists to close that door, and it is
+the chapter's most important citation:
 
 ```rust
 // crates/muser-engine/src/metal/encode/qkv.rs:476
@@ -495,6 +554,17 @@ it exactly — and it is the chapter's most important citation:
 // numerical parity even when every other layer is identical.
 ```
 
+That is worth restating slowly, because it is the second genuinely hard idea
+in this chapter. Floating-point addition is not associative: add the same
+products in a different order and you get a *different* sum, usually differing
+only in the last bits. A different kernel means a different reduction order, a
+different order means different last bits, and different last bits mean a
+logprob that no longer matches the comparator's. So these batch boundaries are
+not a performance-tuning quirk inherited by accident. They are part of the
+numerical contract. Match the comparator's kernels and you inherit its
+arithmetic; improvise, and parity is gone before anyone has asked a speed
+question.
+
 The embedding kernel completes the single-token picture. `muser_embedding_q4k`
 (`[crates/muser-engine/src/shaders/muse_reference.metal:961]`) is one
 thread per output element: it resolves `row_bytes = (hidden_dim/256) × 144`
@@ -504,31 +574,55 @@ thread per output element: it resolves `row_bytes = (hidden_dim/256) × 144`
 
 ## 6.8 Tradeoffs
 
-**The n32 tile: measured occupancy over intuition.** The 16-row batch (the
-DFlash verify shape, Chapter 8) had a real measured problem: the retained
-kernels ran those projections at ~50–180 GB/s on an ~800 GB/s-class M3
-Ultra because the `n_out/64` K-serial threadgroup shape carried 6–20 KiB of
-threadgroup memory and could not fill a core `[ledger §Stage B L0]`. The
-microbenchmark-first L-series iterated t128/t64/cross-sg designs and landed
-on the weight-stationary `m16_q*k_n32` (32 output rows per threadgroup,
-64-K stages, 6 KiB): verify-cycle matmul estimate **148.3 → 82.8–85.0 ms**
-against the retained SGM tile (pinned `mul_mm` measured ~177)
-`[ledger §Stage B L0]`, and the integrated verify forward fell 202.3 →
-128.4 ms `[ledger §Stage B L1]`. Exactness was gated, not assumed: the tile
-landed "within the accepted half-staged error envelope (max-abs identical
-to the pinned kernels on the same data, zero argmax flips on every shape)"
-`[ledger §Stage B L0]`. This is the house style: hypothesis (occupancy),
-apparatus (`muser-m16-bench` at the exact Figure 6.6 shapes), then a gate.
+**The n32 tile: measured occupancy over intuition.** Start with the fork.
+The 16-row batch — the DFlash verify shape of Chapter 8 — had to run on
+*something*, and the retained kernels already covered it. Keeping them was
+the cheap answer, and on paper it looked like the right one: same shapes,
+same arithmetic, only the batch width had changed. The bandwidth counter
+disagreed. Those projections came back at ~50–180 GB/s on an ~800 GB/s-class
+M3 Ultra, and the reason was structural rather than arithmetic: the
+`n_out/64` K-serial threadgroup shape carried 6–20 KiB of
+threadgroup memory, and a threadgroup that fat could not fill a core
+`[ledger §Stage B L0]`. The kernel was not doing too much work. It was
+leaving most of the machine standing idle.
+
+That reframed the problem from arithmetic to occupancy — and occupancy is a
+shape question, so the microbenchmark-first L-series went shape-hunting
+before anything touched the engine. The t128/t64/cross-sg designs were
+iterated and none of them won. What won was a weight-stationary tile,
+`m16_q*k_n32`: 32 output rows per threadgroup, 64-K stages, 6 KiB of
+threadgroup memory. The verify-cycle matmul estimate fell **148.3 →
+82.8–85.0 ms** against the retained SGM tile, with the pinned `mul_mm`
+measured at ~177 for scale `[ledger §Stage B L0]`; in the integrated engine
+the verify forward followed it down, 202.3 → 128.4 ms
+`[ledger §Stage B L1]`.
+
+Speed alone would not have shipped it. Exactness was gated, not assumed: the
+tile landed "within the accepted half-staged error envelope (max-abs
+identical to the pinned kernels on the same data, zero argmax flips on every
+shape)" `[ledger §Stage B L0]`. That sequence is the house style — hypothesis
+(occupancy), apparatus (`muser-m16-bench` at the exact Figure 6.6 shapes),
+then a gate — and the lesson outlives this particular tile: when a kernel
+runs far under the machine's rated bandwidth, suspect its shape before you
+suspect its math.
 
 **Q5_K at 5.5 bits on the lm_head — and the transcode temptation.** The
-5-bit lm_head costs 924,571,648 B (§6.5 arithmetic) — 1.22× a Q4_K
-equivalent (756,467,712 B). The Q5_0 sibling has an instructive in-tree
-trade: `transcode_q5_to_q8` expands 5-bit blocks to Q8_0 at GPU upload
-time, "trading 30 % more memory bandwidth for 3× fewer GPU decode
-instructions" `[crates/muser-engine/src/quant/blocks.rs:100-103]` — the
-same class of trade the n32 tile makes in reverse. On the live path the
-lm_head stays Q5_K and rides `m16_q5k_n32` at 16 rows: 5.87 → 4.11 ms per
-dispatch against `mul_mm` `[ledger §Stage B L0]`.
+promoted lm_head is the one place this artifact pays a premium you can see
+from orbit, so it is fair to ask what that premium buys and whether a cheaper
+trick could have dodged it. The 5-bit lm_head costs 924,571,648 B (§6.5
+arithmetic) — 1.22× a Q4_K equivalent (756,467,712 B).
+
+There is a tempting move available here, and the tree already contains a
+worked example of it. The Q5_0 sibling has an instructive in-tree trade:
+`transcode_q5_to_q8` expands 5-bit blocks to Q8_0 at GPU upload time,
+"trading 30 % more memory bandwidth for 3× fewer GPU decode instructions"
+`[crates/muser-engine/src/quant/blocks.rs:100-103]`. The reason that
+digression matters for the lm_head is that it is the *same* class of trade
+the n32 tile makes, run in the opposite direction: one spends bandwidth to
+buy decode instructions, the other spends decode work to buy occupancy. On
+the live path the lm_head takes neither deal. It stays Q5_K and rides
+`m16_q5k_n32` at 16 rows: 5.87 → 4.11 ms per dispatch against `mul_mm`
+`[ledger §Stage B L0]`.
 
 **Why not Q6_K everywhere?** By Figure 6.1, Q6_K is 6.5625/4.5 = 1.458×
 the bytes of Q4_K. Every weight byte is read per token (§6.6), so
@@ -540,6 +634,11 @@ factor. The artifact spends 6.5625 bits only where the recipe says it pays
 claim, not a Muser measurement [unverified].
 
 ## 6.9 Where the gap lives
+
+Every chapter in this book has to answer the same question about its own
+subject: is this where the missing time hides? Here the answer is no — and
+the way that answer was reached matters more than the answer itself, because
+it was reconciled rather than assumed.
 
 The quant format is not the decode gap. When the engine's one-token graphs
 were reconciled closure-by-closure (the +196 dispatch-gap diagnosis), the

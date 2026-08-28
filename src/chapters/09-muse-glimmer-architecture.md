@@ -48,10 +48,18 @@ section.
 
 ## 9.2 The exact hyperparameters (verified from source)
 
-The table every later chapter reaches for: each value cited from the live
-GGUF metadata reader (fail-closed on a missing key) and from the
-release-model gate test — the same double-citation discipline as the pinned
-SHA-256 identity [crates/muser-engine/tests/muse_golden.rs:14-15].
+Before a single kernel can be written, one question has to be settled: how
+wide is this model, exactly? Every kernel chapter in Part IV sizes its
+buffers, its threadgroups and its loop bounds from the answer, so one wrong
+row here does not fail loudly — it propagates quietly into a dozen chapters
+and into an engine that runs and emits plausible text.
+
+So we did not transcribe these values from a model card. Each one is read
+twice: once by the live GGUF metadata reader, which fails closed on a
+missing key, and once by the release-model gate test, which asserts what the
+pinned artifact actually carries. That is the same double-citation discipline
+we apply to the pinned SHA-256 identity, and we kept the receipt:
+[crates/muser-engine/tests/muse_golden.rs:14-15].
 
 **Table 9.1 — Muse Glimmer hyperparameters (pinned release GGUF)**
 
@@ -86,14 +94,19 @@ and the loader prefers the declared key [config.rs:174-176] — so query
 space is `32 × 128 = 4,096` while the residual stream is 6,656, and the Q
 projection is *not* square. Third, **one value is famously not in the
 file**: the 1e-8 post-norm epsilon is a llama.cpp graph constant, not GGUF
-metadata — §9.9 explains why that is a landmine. (Two rows whose names
-have not been met yet — SWA, sliding-window attention, and NoPE, "no
-positional embedding" — are §9.7's subject, as is the `rope_base_swa`
-key.) The artifact this geometry
-belongs to: SHA-256
+metadata — §9.9 explains why that is a landmine.
+
+Two rows use names you have not met yet: SWA, sliding-window attention, and
+NoPE, "no positional embedding." They earn their own section rather than a
+parenthesis, because they are the reason this model's memory cost does not
+grow the way its depth suggests — that is §9.7, and the `rope_base_swa` key
+belongs to the same story. And one last thing before we leave the table: it
+describes one specific file and no other — the artifact with SHA-256
 `7e9b74b7c8875e9e265695df9613bf6290f2392e479ce740495a129019c488d8`,
 **16,756,681,056 bytes** on disk
-[crates/muser-server/src/chat_template.rs:237-250].
+[crates/muser-server/src/chat_template.rs:237-250]. Every value above was
+read out of that artifact; held against a different one, the whole geometry
+is a guess.
 
 > **Derived quantities** used everywhere below: `attn_dim = n_heads ×
 > head_dim = 4,096`; `kv_dim = n_kv_heads × head_dim = 256`
@@ -155,6 +168,12 @@ but everywhere at 52 layers, which is why the *fused* norm tails of
 
 ## 9.4 The full model — 52 blocks in a repeating pattern
 
+Now zoom out one level. If the figure above is the cell, the one below is
+the organism: everything that happens to a token id between the moment it
+arrives and the moment a successor is chosen. The question this section
+answers is where the blocks sit in that path, and what decides which kind of
+block a given layer is.
+
 ```mermaid
 flowchart TD
     tok["token_ids (u32)"]
@@ -198,12 +217,26 @@ So 52 layers = 13 groups of `[sliding, sliding, sliding, full]`: **39 SWA
 layers** and **13 NoPE full layers** at indices 3, 7, …, 51 — exactly the
 set the remote-prefill schedule ships as position-free tiles
 [crates/muser-cluster/src/schedule.rs:20]. The counts are asserted in code
-[config.rs:14-15] and in the release test [muse_golden.rs:109-116]. A
-missing pattern key panics rather than guessing: *"an all-full model runs
-and emits plausible text while being wrong"* [config.rs:378-380] —
-fail-closed design applied to architecture itself.
+[config.rs:14-15] and in the release test [muse_golden.rs:109-116].
+
+There was a fork at the resolver, and it is worth naming, because the
+tempting branch is the friendly one. If a GGUF arrives without its
+sliding-window pattern key, the loader could simply assume every layer is a
+full-attention layer. The model would load. It would run. It would emit
+fluent English. We took the unfriendly branch instead: a missing pattern key
+panics. The comment in the resolver gives the reason in one line — *"an
+all-full model runs and emits plausible text while being wrong"*
+[config.rs:378-380]. That is the fail-closed posture in miniature, applied
+here not to a tensor or a hash but to the shape of the graph itself, and it
+rests on a judgement we will keep returning to: an answer that looks right
+and is wrong costs more than a refusal.
 
 ## 9.5 The components, one short tour each
+
+Before the traps, a quick pass over the parts by name. Nothing in this
+section is peculiar to Muse Glimmer; it is the shared vocabulary the rest of
+the book leans on, so skim what you already know and slow down where a term
+is new.
 
 The **[embedding](../glossary.md#embedding)** is a lookup table — a token id picks
 one row of `token_embd.weight [6656 × 202048]`; that row is the initial
@@ -245,6 +278,14 @@ KV heads:         K0 , V0               K1 , V1       2 heads  × 128 = kv_dim  
 `heads_per_kv = n_heads / n_kv_heads = 32 / 2 = 16` query heads
 [config.rs:274-276].*
 
+Said the other way round, because this is the idea the whole memory story
+rests on: the model keeps thirty-two independent ways of asking a question,
+but only two distinct sets of answers on file, and every question is served
+from one of those two sets. Asking is cheap — it is arithmetic on a vector
+the model already has. Answering is expensive, because the answers have to
+be fetched from memory. Grouped-Query Attention makes the expensive half
+small.
+
 **Why this is a bandwidth win.** During decode, attention must read the K
 and V of every visible past token out of the KV cache. With full multi-head
 attention one cached row in one layer would cost
@@ -261,6 +302,13 @@ matvec geometry than Q in [Ch 13](13-the-qkv-gate-matvec-family.md) and a
 16-way fan-in per KV head in attention [Ch 16](16-attention-decode-kernels.md).
 
 ## 9.7 The two attention classes: 39 SWA rings, 13 NoPE planes
+
+This is the section to read twice. Almost everything Part VI does — remote
+prefill, warm reuse, the delta handoff — is downstream of a single fact
+established here, and the fact is easy to miss because it hides inside a
+routine-looking layer schedule. The question: what does a layer of this
+model see when it looks backwards, and does the answer depend on *where* the
+tokens it sees happened to sit?
 
 Muse Glimmer's most consequential structural choice: its 52 layers do not
 all attend the same way (Figure 9.4).
@@ -302,10 +350,20 @@ Because a NoPE layer's K/V rows do not encode absolute position, its cache
 rows are **relocatable bytes** — a KV tile for positions `[a, b)` can be
 planted anywhere in the plane without recomputation: *"the 13 NoPE layers
 are position-free (relocate = memcpy) — the whole kvpack free lunch"*
-[crates/muser-engine/src/lib.rs:8-10]. That sentence is why remote prefill
-can stream 512-token NoPE tiles while the producer still computes, why warm
+[crates/muser-engine/src/lib.rs:8-10].
+
+Put it side by side with the other class, because the contrast is the whole
+point. In a sliding layer, *where* a token sat has been rotated into its
+numbers; move its cached row to a new position and the numbers are now lies,
+so the row must be recomputed. In a NoPE layer nothing about position was
+ever written down; the row means the same thing wherever it lands, so moving
+it is a copy and nothing more. One class stores meaning-at-a-place, the
+other stores meaning. Only the second can be shipped over a wire.
+
+That single property is what pays for Part VI. It is why remote prefill can
+stream 512-token NoPE tiles while the producer is still computing, why warm
 reuse restores a 130,815-token prefix in ~1 s instead of ~148 s [ledger,
-kvpack ladder stage-5], and why Part VI's lane exists in the shape it does.
+kvpack ladder stage-5], and why that lane exists in the shape it does.
 (Why the authors trained full layers without rotation is a modeling
 question this codebase does not answer — `[unverified]`; the code proves
 the rotation is absent and the engine exploits that.)
@@ -344,9 +402,16 @@ full attention pays for depth, sliding attention does not.
 
 ## 9.8 The sigmoid attention gate
 
-Standard attention ends with o_proj. Muse Glimmer inserts a learned gate
-between the two; the CPU oracle shows the exact placement — after
-attention, before the output projection:
+Two questions hang over this component, and only one of them has an answer
+in this repository. *Where* does the gate sit, exactly? — answerable to the
+line, and the answer matters, because getting the placement wrong changes
+every logit downstream. *Why* is it there at all? — not answerable from
+code, and we will say so plainly rather than fill the gap with a plausible
+story.
+
+Take the placement first. Standard attention ends with o_proj; Muse Glimmer
+slips a learned gate in ahead of it, and the CPU oracle shows the seam
+exactly — after attention, before the output projection:
 
 ```rust
 // crates/muser-engine/src/reference.rs:446-455  (the trailing o_proj
@@ -430,12 +495,26 @@ This is a llama.cpp graph constant, transcribed into Muser so the two
 engines compute identical bytes [crates/muser-engine/src/lib.rs:103-108].
 Reading one epsilon from the GGUF and using it everywhere — the "obvious"
 simplification — would produce logits that differ from the comparator's at
-every layer boundary. The epsilons are small numbers with concentrated
-consequences: even *fusing* the two norm stages of a tail with exact-looking
-arithmetic changed public logprobs beyond the 1e-4 contract (max
-normalized-logprob error 3.197e-4, first divergence one f16 ULP in layer-1
-V) and was rejected [docs/decode-dispatch-gap-20260815.md §Rejected hybrid
-postmortem]. The full norm story — including why the fused tail kernel
+every layer boundary.
+
+We found out how little slack there is here the expensive way. A block's
+tail is two norm stages with a device-memory boundary between them, which
+reads like an open invitation to fuse: same data, same thread, one kernel
+instead of two, and the algebra on paper does not change. So we built it — a
+hybrid schedule that fused the tail and retained activations across the two
+stages — and we expected a dispatch saving for free, on the reasoning that
+arithmetic which is equal on paper is equal in the machine. It was not.
+Public logprobs moved past the 1e-4 contract: max normalized-logprob error
+3.197e-4, with the first divergence a single f16 ULP in layer-1 V, which
+then had the entire rest of the stack to grow in. The lesson is the one to
+carry out of this section: an epsilon this small is not a tolerance knob, it
+is part of the model's definition — rounding boundaries are the spec, and
+"the same algebra" is not "the same bits." The hybrid was rejected rather
+than waved through under a widened tolerance, and we retained the
+postmortem: [docs/decode-dispatch-gap-20260815.md §Rejected hybrid
+postmortem].
+
+The full norm story — including why the fused tail kernel that did ship
 reproduces "the two pinned ggml f32x4 norm reductions and their intervening
 f32 device-memory boundary" [crates/muser-engine/src/decode.rs:1328-1330] —
 is [Ch 12](12-rmsnorm-and-the-dual-eps-sandwich.md).
@@ -454,8 +533,10 @@ tensor-by-tensor and aborts on a genuinely learned norm
 
 ## 9.10 Final logits: multiply by 1/√26, then cap at tanh(20)
 
-The output stage has two unusual steps after the LM head; their *order* is
-contract:
+One question is left before a token can be chosen: what happens to the raw
+scores the LM head produces? Muse Glimmer does two unusual things to them,
+and the part that catches people is not either step on its own — it is that
+their *order* is contract, not taste:
 
 ```rust
 // crates/muser-engine/src/reference.rs:559-570
@@ -506,9 +587,12 @@ the tail [docs/muser-architecture.md §Model and engine; deep treatment in
 
 ## 9.11 The per-layer tensor inventory
 
-The shape checker asserts every tensor below exists with exactly this shape,
-per layer, fail-closed [crates/muser-engine/src/config.rs:286-333]. GGUF
-shapes are `[in, out]`.
+What does one layer actually consist of, as bytes on disk? The table below
+is the answer, and it is also a promise the loader keeps: the shape checker
+asserts that every tensor listed exists with exactly this shape, in every
+layer, and fails closed if one is missing or misshapen
+[crates/muser-engine/src/config.rs:286-333]. Read the shapes the way GGUF
+writes them, `[in, out]`.
 
 **Table 9.2 — Per-layer tensors (×52, `l = 0..51`)**
 
@@ -540,6 +624,11 @@ matrices are 2.69 B of the 27.85 B parameters (§9.12).
 
 ## 9.12 Parameter accounting — what "~30B" actually is
 
+The model is sold as a thirty-billion-parameter model. Is it? Everything
+needed to check now sits in the tables above, so rather than quote the
+label, we count — and the counting is worth doing slowly, because the
+*shape* of the total tells the kernel chapters where to spend their effort.
+
 Deriving the count from Table 9.2: per layer, the five attention
 projections sum to `3 × (6656×4096) + 2 × (6656×256) = 85,196,800`, the
 FFN adds `3 × (6656×19968) = 398,721,024`, the norms 26,880 — **483,944,704
@@ -563,8 +652,12 @@ pure Q4_K's ~4.5 bits.
 
 ## 9.13 Tokenizer and template identity
 
-Muser serves one model with one tokenizer, binding the whole surface by
-hash at load time:
+Geometry is not the whole of a model's identity. Something with exactly the
+right shape, that reads text with a slightly different tokenizer or wraps it
+in a slightly different chat template, is a different model in every way a
+user would notice — same weights, different answers. So Muser serves one
+model with one tokenizer and one template, binding the whole surface by hash
+at load time:
 
 - **Tokenizer** — a GGUF BPE tokenizer, merge-order aware: *"BPE tokenizer
   that respects merge priority order from GGUF metadata"*
@@ -610,12 +703,14 @@ a bit-exact output [ledger stage-6; benchmarks.md §4] — possible only
 because NoPE tiles are position-free bytes (§9.7).
 
 **The sandwich norms buy training stability and cost an exactness
-contract.** Every "obvious" fusion across the 1e-8 post-norms has been
-measured to change public logprobs beyond the 1e-4 contract — the hybrid
-retained-activation schedule reached max normalized-logprob error 3.197e-4
-and was removed, not hidden behind a tolerance
-[docs/decode-dispatch-gap-20260815.md]. The engine's answer is the dual-eps
-fused tail reproducing the pinned kernels' rounding boundaries exactly
+contract.** We told this one as a war story a few sections back; here it is
+as a ledger entry. Every "obvious" fusion across the 1e-8 post-norms has
+been measured to change public logprobs beyond the 1e-4 contract, and the
+hybrid retained-activation schedule that reached max normalized-logprob
+error 3.197e-4 was removed rather than hidden behind a widened tolerance
+[docs/decode-dispatch-gap-20260815.md]. What ships instead is a fusion built
+backwards from the requirement: the dual-eps fused tail reproduces the
+pinned kernels' rounding boundaries exactly
 [decode.rs:1328-1330] — a fusion whose design constraint is *bits*, not
 speed ([Ch 12](12-rmsnorm-and-the-dual-eps-sandwich.md),
 [Ch 35](35-ordering-hazards-and-the-dispatch-gap.md)).

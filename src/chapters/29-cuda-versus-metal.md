@@ -14,9 +14,12 @@
 that must agree about bytes: a Mac that decodes with SIMD-group Metal
 kernels out of unified memory, and a GB10 that prefills NVFP4 with CUDA
 tensor cores inside vLLM. This chapter is about the divide between their
-GPU programming models — but it is **not** a spec-sheet tour. Every contrast
-below earned its place by forcing a decision you can read in the Muser
-tree. Where a fact is about the vendors' models rather than Muser's code,
+GPU programming models — but it is **not** a spec-sheet tour. The question
+we kept asking, machine to machine, was never "which model is better." It
+was narrower and more useful: *where does agreement actually have to
+happen, and what does it cost us to get it?* Every contrast below earned
+its place by forcing a decision you can read in the Muser tree.
+Where a fact is about the vendors' models rather than Muser's code,
 it carries a vendor tag (`[CUDA §…]`, `[Metal-SS §…]`) or `[unverified]`;
 where it is about Muser, it carries a `file:line`.
 
@@ -28,6 +31,12 @@ bridging a semantics gap in code.** Table 29.1 lists all six disagreements
 and the decision each forced; the sections that follow take them in order.
 
 ## 29.2 The contrast table
+
+Before the arguments, the map. Each row below is a place where the two
+programming models genuinely disagree, paired with the decision that
+disagreement forced on us. Read the right-hand column first if you read
+nothing else: in every row, without exception, the decision was to pin an
+interface rather than to write code that bridges one model to the other.
 
 | # | CUDA (GB10 producer) | Metal (Mac consumer) | The Muser decision it forced |
 |---|---|---|---|
@@ -41,6 +50,13 @@ and the decision each forced; the sections that follow take them in order.
 *Table 29.1: Six contrasts that survived contact with this codebase.*
 
 ## 29.3 Contrast 1 — warps and SIMD groups: the shape that ported
+
+Start with the contrast that turned out not to be much of a contrast at
+all. If the two shader languages were as alien to each other as their
+toolchains are, nothing in this codebase could have crossed between them
+without a rewrite. So ask the question the port had to answer first: what
+is the unit a kernel is *organized around*, and do the two vendors agree
+about it?
 
 First definitions, vendor-side, once. A CUDA **[warp](../glossary.md#warp)**
 is the unit of 32 consecutive threads that an NVIDIA SM executes in
@@ -107,26 +123,49 @@ Same numeric format on both sides (NVFP4, [Ch 7](07-nvfp4-native-lane.md));
 radically different machines and purposes.
 
 This is [Ch 27](27-why-disaggregate.md)'s roofline enforced as a *lane
-policy* rather than a benchmark observation. The Mac *has* a batch route —
-`m16_q4k_n32`/`m16_n32`-family kernels, dispatched when a 16-token batch,
-the NVFP4 lane, and a 64-aligned input width coincide
-(`encode_nvfp4_w4a4_prequant_m16`,
-`[crates/muser-engine/src/metal/encode/qkv.rs:13]`; the route predicate at
-`[crates/muser-engine/src/decode.rs:5946-5980]`) — and it is exactly the
-right tool for 16-row speculative-verify shapes. But asking the Mac to do
-*prefill-scale* batch GEMM in the native lane was measured and rejected:
-native NVFP4 speculative decode — which lives on batched W4A4 target
-execution — ran at **6.805 tok/s** against the 107.9 tok/s kquant bar, the
-verify step consuming 35.915 s of a 37.619 s decode span
+policy* rather than as a benchmark observation — and the honest way to tell
+it is to admit that we tried the other thing first.
+
+Here is the fork. The Mac is not helpless at batch work: it *has* a batch
+route, the `m16_q4k_n32`/`m16_n32`-family kernels, dispatched when a
+16-token batch, the NVFP4 lane, and a 64-aligned input width all coincide.
+For 16-row speculative-verify shapes that route is exactly the right tool,
+and its existence is what made the tempting question tempting. If the Mac
+can already multiply a matrix by a small block of rows, why ship prefill to
+a second machine at all? Drop the wire, drop the box, keep the whole
+inference in one address space. We expected to pay a penalty for that
+convenience. We did not expect the shape of the bill.
+
+The measurement closed the question. Native NVFP4 speculative decode — the
+lane that lives on batched W4A4 target execution, and so the closest thing
+to Mac-native batch GEMM we could put on a stopwatch — ran at **6.805
+tok/s** against the 107.9 tok/s kquant bar. Worse than the headline ratio
+is where the time sat: the verify step alone consumed 35.915 s of a
+37.619 s decode span. The batch work was not merely slower than the rest;
+it *was* the clock. We kept the run that proved it
 `[docs/nvfp4-fast-lane-evidence-20260817.md]` `[ledger F-series
-remediation]`. The engine does not try to make the Mac a tensor-core
-machine; it sends batch work to the machine whose silicon *is* that shape,
-and keeps the Mac on the matvec workload its wide SIMD groups and unified
-memory are built for. The disaggregated lane is that policy, wired.
+remediation]`.
+
+The lesson is narrower than "Metal is bad at GEMM," which would be an
+intuition rather than a finding. What the run actually says is that a
+matvec-shaped machine, asked to do prefill-shaped arithmetic, spends nearly
+all of its time in precisely the part of the workload the disaggregated
+lane was invented to move elsewhere. So the engine does not try to make the
+Mac a tensor-core machine. It sends batch work to the machine whose silicon
+*is* that shape, and keeps the Mac on the matvec workload its wide SIMD
+groups and unified memory are built for. The disaggregated lane is that
+policy, wired — and the policy is code, not advice: the batch entry point
+is `encode_nvfp4_w4a4_prequant_m16`
+(`[crates/muser-engine/src/metal/encode/qkv.rs:13]`), and the predicate
+that decides when the Mac is allowed to take that route lives at
+`[crates/muser-engine/src/decode.rs:5946-5980]`.
 
 ## 29.5 Contrast 3 — the memory boundary: where the wire starts
 
-The deepest difference is not in the kernels at all. On the Mac, CPU and
+The deepest difference between the two models is not in the kernels at all.
+It is in what the word *pointer* is allowed to mean on each side, and if
+you follow that single question far enough you arrive at the physical
+picture the rest of this Part is built on. On the Mac, CPU and
 GPU share one physical memory and one pointer space —
 [Ch 3](03-unified-memory-and-buffers.md); a `StorageModeShared` buffer is
 visible to both without copies. CUDA's programming model, whatever the
@@ -183,6 +222,12 @@ like a DMA engine hiding behind compute.
 
 ## 29.6 Contrast 4 — streams and graphs versus one queue and one owner
 
+Both models have to answer the same question — how do you keep an
+accelerator busy when the work has dependencies? — and they answer it at
+very different altitudes. Knowing which altitude you are standing on
+decides who owns the ordering, and therefore who is to blame when the
+ordering is wrong.
+
 CUDA exposes concurrency as a first-class graph: multiple **streams**, each
 an ordered queue; **events** to cross-synchronize; and CUDA graphs to
 capture and replay whole dependency DAGs `[CUDA §streams]`. The connector
@@ -223,12 +268,22 @@ Why no CUDA-graph analogue on the Mac? Because the problem CUDA graphs solve
 `encode_decode_group`) rather than captured, and ordering hazards are
 managed by the single-queue owner plus tracked buffers and targeted barriers
 (the full hazard story is [Ch 35](35-ordering-hazards-and-the-dispatch-gap.md)).
-The ancestor Ferrite book's compiled-VM replay is the third design in this
-space, and Muser deliberately kept neither it nor graph capture — that
-divergence is documented lineage, not an oversight
+Worth one detour, because it is the kind of absence a reader can mistake
+for an omission: there is a third design in this space, the ancestor
+Ferrite book's compiled-VM replay, and Muser kept neither it nor graph
+capture. That matters for the handoff story because it means the consumer's
+execution order is authored in plain Rust that anyone auditing the seam can
+read top to bottom — no captured graph, no replayed bytecode standing
+between the source and what the GPU does. The divergence is documented
+lineage, not an oversight
 `[ferrite-book Ch 21]` (KEEP-AS-LINEAGE in the port audit).
 
 ## 29.7 Contrast 5 — when NOT to re-express a kernel: the pinned metallib
+
+When is the right amount of kernel code to write *none*? Here, and the
+reasoning is worth slowing down for, because it inverts the instinct that
+owning the source of everything you dispatch is always the safer
+engineering.
 
 The lane needs the Mac's Q/K/V/gate/o projections to match what the
 comparator (llama.cpp) computes — and later, what the producer computed
@@ -256,12 +311,17 @@ buy by rewriting.** The serving graph dispatches the pinned
 re-litigate every accumulation order in those kernels for a gain the
 dispatch-gap accounting says is not there ([Ch 35](35-ordering-hazards-and-the-dispatch-gap.md)).
 
-The discipline that makes the pin honest is **fingerprinting** — the
-ancestor book learned this the hard way when a silently missing metallib
-made a benchmark time the wrong kernel family
-(`[ferrite-book Ch 23 §23.7]`, lineage). Muser bakes the check into every
-route identity: `route_identity` reads the metallib bytes and hashes them
-into the record —
+A pin you cannot verify at runtime is not a pin; it is a wish. The
+discipline that makes this one honest is **fingerprinting**, and we
+inherited it as a scar rather than as a principle: in the ancestor project,
+a metallib that simply failed to load fell back silently, and a benchmark
+spent an afternoon carefully timing the wrong kernel family
+(`[ferrite-book Ch 23 §23.7]`, lineage). Nothing errored. The numbers
+looked plausible. That is the failure mode a pin invites — it moves the
+identity of your kernels out of your build and into your environment, where
+a missing file becomes a quiet substitution instead of a crash. So Muser
+bakes the check into every route identity: `route_identity` reads the
+metallib bytes and hashes them into the record —
 
 ```rust
 // crates/muser-bench/src/main.rs:329-333, 341-346 (excerpt)
@@ -306,34 +366,67 @@ flags** ([Ch 4](04-pso-and-three-kernel-sources.md)):
     pub cross_vendor_library: Library,
 ```
 
-The main library compiles with `set_fast_math_enabled(true)` — with the
-in-tree justification that disabling it "materially slows attention, FFN,
+The main library compiles with `set_fast_math_enabled(true)`, and the tree
+records the reason in place: disabling it "materially slows attention, FFN,
 and the norm/tiny-op stack without changing the imported GGML PSOs"
 (`[crates/muser-engine/src/metal/context.rs:49-53]`). The strict-f32
-`cross_vendor_library` recompiles exactly `muse_reference.metal` +
-`nvfp4.metal` with fast math **off**
-(`[crates/muser-engine/src/metal/context.rs:111-121]`), and the
-`MUSER_CROSS_VENDOR_QK` flag routes QK-norm and attention through it
-(`[crates/muser-engine/src/decode.rs:5645]`,
-`[crates/muser-engine/src/metal/encode/norm.rs:115-116]`) so the Mac "must
-derive Q/K exactly the way the producer did, or the KV is foreign by
-construction" `[docs/disaggregated-prefill.md §What you need]`. Serving
-refuses to start on the remote lane without it
+`cross_vendor_library` then recompiles exactly the same two shader files,
+`muse_reference.metal` and `nvfp4.metal`, with fast math **off**. Say that
+again slowly, because it is the whole trick: the source does not change at
+all. What changes is the license the compiler has to reassociate
+floating-point arithmetic — and that license is the difference between a
+result that matches CUDA and one that merely rounds to it.
+
+A single flag, `MUSER_CROSS_VENDOR_QK`, routes QK-norm and attention
+through the strict build, so that the Mac "must derive Q/K exactly the way
+the producer did, or the KV is foreign by construction"
+`[docs/disaggregated-prefill.md §What you need]`. The flag is not advisory:
+serving refuses to start on the remote lane without it. We kept the trail —
+the strict recompile at
+`[crates/muser-engine/src/metal/context.rs:111-121]`, the routing sites at
+`[crates/muser-engine/src/decode.rs:5645]` and
+`[crates/muser-engine/src/metal/encode/norm.rs:115-116]`, and the
+onboarding rule at
 `[docs/one-button-onboarding.md §Starting the production consumer]`.
 
-Why run both? Because **logit parity across the handoff demanded it**, and
-the campaign that proved it is the wizard's arithmetic-ABI chase. Attempts
-10–30 of the combined-lane onboarding failed on single-bit seam
-divergences; a layer-0 ladder (first mismatch `attn_norm-0` element 4 → K
-RoPE element 256 → `attn_out-0` element 4,096) isolated **two
-arithmetic-ABI splits**: "CUDA's serial 128-dim attention reduction vs
-Metal's 32-lane tree, and F32 vs F16 residual materialization" `[ledger
-§2b, 2026-08-24]`. The fixes (a versioned cross-vendor arithmetic ABI,
-commits `27b5790`/`80f294f`) cost 4–7 accelerator-hours of rework
-`[ledger §2b, 2026-08-24]` — and attempt 31 then passed 7/7 with **exact
+Why pay for two builds of the same source? Because **logit parity across
+the handoff demanded it** — and we learned that over the campaign we came
+to call the wizard's arithmetic-ABI chase. It is worth telling slowly,
+because it is the story that turned a compiler flag into a protocol.
+
+The setup: the consumer has to derive Q and K exactly as the producer did,
+or the KV planes arriving over the wire describe a subtly different model
+than the one the Mac is decoding. Our plan was the obvious one — compile
+the seam kernels strictly, check the logits, declare victory. Attempts
+10–30 of the combined-lane onboarding said otherwise. They kept failing on
+single-bit seam divergences: not garbage, not a crash, one bit in one
+element. That is the most exhausting failure mode there is, because
+everything *looks* right.
+
+So we stopped guessing and built a ladder. Comparing element by element
+from layer-0 forward, the first mismatch appeared at `attn_norm-0` element
+4 and propagated into K RoPE element 256 before surfacing downstream at
+`attn_out-0` element 4,096. Two **arithmetic-ABI splits** fell out of that
+trace: "CUDA's serial 128-dim attention reduction vs Metal's 32-lane tree,
+and F32 vs F16 residual materialization" `[ledger
+§2b, 2026-08-24]`. Neither is a bug in anybody's compiler. Both are legal,
+defensible choices that two teams made independently — which is exactly why
+no tolerance band would have found them for us; a tolerance would have
+hidden them.
+
+The fix was to stop treating the arithmetic as an implementation detail and
+write it down as an interface: a versioned cross-vendor arithmetic ABI,
+commits `27b5790`/`80f294f`, at a cost of 4–7 accelerator-hours of rework
+`[ledger §2b, 2026-08-24]`. Attempt 31 then passed 7/7 with **exact
 full logits** and payload rates 9.812/8.887/8.690 Gbps `[claims #9]`.
-That is what "the compiler is part of the ABI" costs when you refuse to
-paper over it with a tolerance.
+
+The lesson deserves saying twice, in two different registers. Put
+mechanically: the compiler is part of the ABI, so a build flag that
+reorders a reduction is as much a protocol change as renaming a field on
+the wire. Put another way: two machines do not agree because they were
+handed the same source. They agree because somebody pinned the order in
+which the source is permitted to add things up, and then refused to paper
+over the remainder with a tolerance.
 
 Notice what this contrast did *not* become: a search for bitwise CUDA↔Metal
 equality everywhere. Nobody achieves that — "that matches the state of
@@ -346,27 +439,49 @@ them.
 
 ## 29.9 Tradeoffs
 
-- **Re-express ggml kernels natively (rejected).** The measured
-  consequence of the pin instead: llama's own bytes became the parity gate
-  (the J0 anchor flip, [Ch 38](38-measuring-against-llama-cpp.md)), and the
-  one-reduction-DAG transplant (`flash_attn_ext_vec`) was adopted *as a
-  pinned kernel* rather than imitated `[ledger Stage A close-out]`. The
-  counterfactual cost is documented in the dispatch-gap hybrid postmortem:
-  even Muser's *own* fusion of adjacent norm ops breached the 1e-4 logprob
-  contract (3.197e-4) and was rejected `[docs/decode-dispatch-gap-20260815.md
-  §Rejected hybrid postmortem]` — re-expressing foreign kernels multiplies
-  exactly that risk class.
+Three roads we did not take. Each was a genuine option rather than a straw
+man, and none of them died against taste — each died against something
+measured, and the measurement is what the reader should walk away with.
+
+- **Re-express ggml kernels natively (rejected).** The case for it was
+  respectable: owning the source of every kernel you dispatch is a sane
+  default, and a native rewrite could in principle be tuned to Muser's own
+  dispatch shapes rather than to llama.cpp's. What stopped us was not a
+  benchmark but a correctness precedent from inside our own tree. When
+  Muser fused a pair of adjacent norm ops — its *own* kernels, its own
+  accumulation order, a change we were confident about — the fused path
+  breached the 1e-4 logprob contract, coming in at 3.197e-4, and was
+  rejected `[docs/decode-dispatch-gap-20260815.md
+  §Rejected hybrid postmortem]`. Generalize from that, and the argument
+  makes itself: if rearranging kernels *we* wrote can move the last digits,
+  re-expressing kernels a foreign project wrote multiplies exactly that
+  risk class, once per kernel, across the whole projection stack. So the
+  pin stayed, and the measured consequence was a good one — llama's own
+  bytes became the parity gate (the J0 anchor flip,
+  [Ch 38](38-measuring-against-llama-cpp.md)), and when we wanted
+  llama.cpp's one-reduction attention DAG (`flash_attn_ext_vec`) we adopted
+  it *as a pinned kernel* rather than imitating it
+  `[ledger Stage A close-out]`.
 - **One strict seam library vs strict everywhere (chosen: seam only).**
-  The in-tree comment records the cost of strict-f32 everywhere:
-  materially slower attention/FFN/norm "without changing the imported GGML
-  PSOs" `[crates/muser-engine/src/metal/context.rs:49-53]`; the win is
-  confined to the routes that must match CUDA scalar boundaries
-  (`context.rs:36-39`). The wizard chase (§29.8) is the measured price paid
-  when the seam discipline slipped by one f32-vs-f16 materialization.
-- **Mac-native batch GEMM for prefill-scale work (rejected).** 6.805 tok/s
-  native spec decode vs the 107.9 bar, 35.915 s of verify in a 37.619 s span
-  `[docs/nvfp4-fast-lane-evidence-20260817.md]` — the measured no-go that
-  keeps batch work on the producer and matvec work on the Mac.
+  The tidy answer to the chase above would be to switch fast math off across
+  the whole engine and never think about associativity again. The tree
+  records why we did not: strict-f32 everywhere means materially slower
+  attention/FFN/norm "without changing the imported GGML PSOs"
+  `[crates/muser-engine/src/metal/context.rs:49-53]` — you would pay over
+  the entire serving graph and buy nothing on the imported kernels that
+  dominate it. The win is confined to the routes that must match CUDA
+  scalar boundaries, so that is the only place strictness lives
+  (`context.rs:36-39`). Drawing that line has a price when you draw it
+  wrong, and we have the invoice: the wizard chase (§29.8) is what one
+  f32-vs-f16 materialization on the wrong side of the seam cost.
+- **Mac-native batch GEMM for prefill-scale work (rejected).** Told as a
+  story earlier in the chapter; here is the receipt on its own line. Native
+  spec decode reached 6.805 tok/s against the 107.9 bar, with 35.915 s of
+  verify inside a 37.619 s span
+  `[docs/nvfp4-fast-lane-evidence-20260817.md]`. That is the measured no-go
+  that keeps batch work on the producer and matvec work on the Mac — a
+  roofline argument that ended up encoded in a dispatch predicate rather
+  than in a paragraph of advice.
 
 ## 29.10 What comes next
 

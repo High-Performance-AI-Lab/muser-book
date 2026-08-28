@@ -28,6 +28,10 @@ Chapter 33's verification can stay exact.
 
 ## 8.1 Why a draft model at all
 
+Start with the question the rest of the chapter is an answer to: why run a
+*second* model at all, when the whole problem is that we already cannot
+afford to run the first one fast enough?
+
 Chapter 1's fourth lever: move the work somewhere cheaper. Decode is
 bandwidth-bound because each token reads the whole 16.76 GB model for one
 token's worth of math. Speculation attacks the *denominator*: if a cheap
@@ -47,6 +51,11 @@ retained fixed-window synthetic packets, kquant DFlash decode ratios
 the scope. We return to them in §8.6.
 
 ## 8.2 What DFlash is
+
+So what does a model small enough to be worth guessing with actually look
+like? Small enough to describe on one page — and odd enough that the
+description is worth reading slowly, because DFlash is not a miniature
+language model in the ordinary sense. It is a passenger.
 
 The module doc says it in five lines:
 
@@ -68,10 +77,13 @@ table Chapter 6 quoted:
 - **It reads the target's mind.** This is DFlash's defining trick and the
   reason it can be so small: it does not re-derive the target's thinking
   from raw tokens. It is *fed* the target's hidden states from five pinned
-  target layers (`DFlashConfig.dflash_config.target_layer_ids`,
-  `config.rs:66`), captured by the engine at
-  `DFlashHiddenCache::write_rows`, which accepts rows **only** for layers
-  in that list (`[crates/muser-engine/src/dflash/hidden.rs:44-52]`).
+  target layers, and the engine captures those rows as the target computes
+  them. The capture is gated rather than opportunistic:
+  `DFlashHiddenCache::write_rows` accepts a row **only** when its layer is
+  on the pinned list. The list itself lives in
+  `DFlashConfig.dflash_config.target_layer_ids` (`config.rs:66`), and the
+  gate that enforces it is
+  `[crates/muser-engine/src/dflash/hidden.rs:44-52]`.
 - **Its front door is `fc.weight`**, shape 33,280 → 6,656
   (`[crates/muser-bench/src/m16.rs:219-225]`). Do the arithmetic and the
   architecture falls out: 33,280 = 5 × 6,656 — five sampled target hidden
@@ -97,12 +109,26 @@ table Chapter 6 quoted:
   (`[docs/memory-footprint.md]` artifact manifest), "loaded only when
   configured."
 
+Read that front-door arithmetic once more, because it is the entire design
+compressed into a single projection. The draft's input is not text and not
+a summary of text; it is the target caught mid-thought, five times over.
+Every other economy in the list — the few layers, the narrow hidden stream,
+the borrowed embedding and LM head — is affordable only because that first
+matrix hands the assistant a running start it never had to earn for itself.
+A model that had to *understand* the conversation could not be this small.
+
 The draft runs **16-row blocks**: `block_size` defaults to 16
 (`config.rs:138-140`), and drafting produces up to 15 proposals in one
 block forward — which is exactly why the M=16 batch kernels of Chapter 6
 exist.
 
 ## 8.3 The context ABI: a 64-row sink plus a trained window
+
+Two questions govern this section, and the second is the dangerous one. How
+much of the conversation does the draft get to see? And *who is allowed to
+answer that question* — the artifact, or the machine that happens to be
+serving it? Hold the second one; the next section is a postmortem of what
+happened when the wrong party answered.
 
 The draft's attention does not see the full conversation. Its context is a
 fixed ABI: the first 64 rows are pinned forever, and a trailing window
@@ -182,19 +208,30 @@ when you *don't* read it:
 /// natural-text acceptance from 72.5% to 2.2%.
 ```
 
-For an entire campaign, Muser hardcoded sink 64 + window 1,024 and never
-read the key; the sidecar was trained at 2,048. The draft ran on **half
-its trained window**, and — this is the part to sit with — *the
-synthetic fixtures kept passing*, because a period-8 synthetic stream is
-predictable from token identity alone and cannot detect a conditioning
-defect `[ledger §ROOT CAUSE FOUND AND FIXED]`. The fix read the real
-window, took natural-text acceptance from 1.1% to 72.7% on the python
-suffix-8,192 cell, made natural-text cells token-exact, and *lowered*
-every synthetic spec number by ~5% — the draft had suddenly started doing
-real work `[ledger §Spec re-measurement at the fixed window]`.
+For an entire campaign, we never asked the artifact. Muser hardcoded sink
+64 + window 1,024 and never read the key; the sidecar had been trained at
+2,048. The draft was running on **half its trained window**, and nobody
+knew, because every instrument we owned said the lane was healthy.
 
-Two durable consequences landed in code. First, a sidecar without the key
-still loads, but **loudly**: `resolve_sliding_window` prints a warning
+That is the part to sit with. *The synthetic fixtures kept passing.* A
+period-8 synthetic stream is predictable from token identity alone, so a
+draft conditioned on the wrong stretch of history can still guess it
+perfectly; the fixture is structurally incapable of detecting a
+conditioning defect `[ledger §ROOT CAUSE FOUND AND FIXED]`. We had built a
+gate that could not fail for the one reason we most needed it to.
+
+When we finally read the real key, the numbers moved in two directions at
+once. Natural-text acceptance on the python suffix-8,192 cell went from
+1.1% to 72.7%, and natural-text cells became token-exact — the expected
+half of the result. The unexpected half: every synthetic spec number
+*dropped* by ~5%. A regression that is good news takes a moment to accept,
+and then it is the most convincing evidence in the postmortem. The draft
+had stopped coasting on a fixture and started doing real work
+`[ledger §Spec re-measurement at the fixed window]`.
+
+Two durable decisions came out of the postmortem, and both are still in
+the code. First, a sidecar without the key still loads, but **loudly**:
+`resolve_sliding_window` prints a warning
 that "draft conditioning may be wrong" rather than silently defaulting
 (`config.rs:109-125`). Second, the effective geometry now travels with
 every result — `DFlashSpecStats` carries `draft_sink_size` and
@@ -208,6 +245,12 @@ draft that is conditioned wrongly does not crash and does not fail parity
 on easy fixtures — it just gets quietly worse at the one job it has.
 
 ## 8.5 Loading: one validated loader, two artifacts
+
+The draft has to arrive from somewhere, and there are two somewheres: the
+artifact we ship and the artifact we debug against. The real question a
+loader like this answers is how to serve both honestly — how to keep the
+development export useful without ever letting it become the thing that
+ships.
 
 `DFlashWeights::load` dispatches on what you point it at — a *file* is the
 GGUF sidecar, a *directory* is the SafeTensors development export
@@ -245,20 +288,27 @@ Speculation is only lossless if the *target* makes every decision. The
 draft participates in exactness by guaranteeing four things.
 
 **1. It proposes; it never decides.** Acceptance runs on the CPU against
-**full target distributions** — every proposed token is scored against
-the target's complete probability row by
+**full target distributions**: every proposed token is scored against the
+target's complete probability row by
 `verify_full_speculative_mt_ordered`
-(`[crates/muser-engine/src/sampling.rs:1033]`), using the Leviathan-style
-rule `accept if rng ≤ min(p/q, 1)` with a residual-corrected resample on
-rejection, all on the source-pinned MT19937 draw stream
-(`sampling.rs:1051-1088`; the stream is deliberately isolated from the
-generic RNG so "a `rand` algorithm or conversion change" cannot alter
-tokens, `sampling.rs:1001-1007` — MT19937 being a reproducible random
-generator Muser re-implements bit-for-bit to match llama.cpp's,
-[Ch 21](21-sampling-argmax-and-grammar.md)). A draft can be *arbitrarily bad* and the
-output distribution stays exact — badness only costs speed. That single
-property is why the window bug (§8.4) was a performance catastrophe and
-not a correctness one.
+(`[crates/muser-engine/src/sampling.rs:1033]`). The rule is the
+Leviathan-style `accept if rng ≤ min(p/q, 1)`, with a residual-corrected
+resample whenever a proposal is rejected (`sampling.rs:1051-1088`).
+
+Every one of those coin flips is drawn from the source-pinned MT19937
+stream — MT19937 being a reproducible random generator that Muser
+re-implements bit-for-bit to match llama.cpp's,
+[Ch 21](21-sampling-argmax-and-grammar.md). Keeping it isolated from the
+engine's generic RNG is deliberate, so that "a `rand` algorithm or
+conversion change" cannot quietly alter which tokens come out
+(`sampling.rs:1001-1007`).
+
+Now the payoff, and it is the load-bearing property of the entire
+chapter: a draft can be *arbitrarily bad* and the output distribution
+stays exact — badness only costs speed. Say it the other way round and it
+is stranger still: nothing the assistant does can make the answer wrong,
+only slow. That single property is why the window bug (§8.4) was a
+performance catastrophe and not a correctness one.
 
 **2. Its rounds are deterministic and replayable.** Proposals are
 submitted "in deterministic round order. Qualification compares this
@@ -294,14 +344,21 @@ gated (§8.7).
 
 ## 8.7 The measured scope — and its honest edges
 
-Now the numbers, with their scope language intact.
+Now the numbers — and the harder question of what each one is allowed to
+mean. Every figure below is true of a fixture, a depth, and a date. Almost
+none of them is true of "DFlash" full stop. Carrying the scope along is not
+pedantry in this chapter; it is the difference between a result and a
+press release, and the section you just read is the evidence for why we
+became strict about it.
 
 **The synthetic matrix (current, post-window-fix).** "In retained
 fixed-window synthetic packets, exact-token decode ratios (llama/Muser
 means) are 1.23692× at 2,048, 1.20323× at 16,384, and 1.19616× at 32,768,
-with 5/5 exact reps per depth" `[claims #15]` (receipts:
+with 5/5 exact reps per depth" `[claims #15]`. The runs behind that row
+are retained rather than summarized —
 `muser-receipt://spec-prefill-fix-20260822/aggregate-a2/…`
-and `…/respec2-deep-20260822/aggregate-a1/…`). The claims row's own
+and `…/respec2-deep-20260822/aggregate-a1/…` — so anyone who doubts the
+means can go and recount them. The claims row's own
 instruction is part of the claim: *"Never generalize this to natural
 text, native NVFP4, or untested depths."* The deeper cells of the same
 family: exact-token in 5/5 reps at all four depths including 131,008
@@ -316,7 +373,11 @@ record only as the kquant spec *bar* that later lanes were judged against
 superseded numbers — quoting them as current performance is one of this
 book's standing landmines.
 
-**Natural text is a different regime.** On real corpora, cross-engine
+**Natural text is a different regime.** We expected the window fix to make
+the draft uniformly better. What it actually did was make the draft
+*legible*: once conditioning was right, the wins and losses stopped looking
+like noise and sorted themselves by the kind of text being written. On
+real corpora, cross-engine
 outputs diverge (so speed stands without an exactness gate), and the
 picture splits: spec decode *wins* python-like content (16,384: 1.186;
 8,192 suffix: 1.321) and **loses** high-acceptance shallow text (rust at
@@ -326,22 +387,36 @@ the serving verify-length at 7 while the comparison harness pins 15:
 "the best decode and the most robust acceptance on natural text"
 `[docs/benchmarks.md §2]`.
 
-**The engine distrusts its own draft.** Speculation can be disabled
-per-request when it stops paying. The gate reads only *recent* evidence —
-eight rounds, after a two-round warmup ("the rounds immediately after
-prefill are the coldest of the request"), requiring ≥32 proposals, and
-closing when windowed acceptance drops below 0.25
-(`[crates/muser-engine/src/dflash/spec.rs:117-133]`) — and a disabled
-request re-qualifies after a doubling cooldown (64 → 512 tokens) so cold
-starts don't permanently cripple a session (`spec.rs:199-230`). The
-comment on the windowed design records the one-way-latch failure that
-motivated it, dated like a scar: "a cumulative rate cannot recover once
+**The engine distrusts its own draft.** One question is left: what should
+the engine do when the draft stops paying for itself on a particular
+request? The obvious answer is to track acceptance across the request and
+switch drafting off once the rate falls too low. We built exactly that,
+and it carried a defect that only surfaces in production — a cumulative
+average that has sunk can never climb back, because once drafting stops
+there are no new proposals to lift it. Disabling speculation was
+therefore permanent. The comment on the redesign still records that
+one-way latch, dated like a scar: "a cumulative rate cannot recover once
 drafting stops… (2026-08-21 root cause)" (`spec.rs:184-190`).
+
+So the gate that shipped reads only *recent* evidence: eight rounds, after
+a two-round warmup, because "the rounds immediately after prefill are the
+coldest of the request". It requires ≥32 proposals before it will judge
+anything at all, and it closes when windowed acceptance drops below 0.25
+(`[crates/muser-engine/src/dflash/spec.rs:117-133]`). The latch is undone
+in the other direction too: a disabled request re-qualifies after a
+doubling cooldown (64 → 512 tokens), so a cold start costs a session some
+throughput instead of costing it speculation for the rest of its life
+(`spec.rs:199-230`).
 
 ## 8.8 Tradeoffs
 
-**Draft cost vs verify cost, measured.** In the L1 in-process
-qualification (five reps × 256 tokens, verify length 15): median cycle
+**Draft cost vs verify cost, measured.** Where should optimization energy
+go — into making the guess faster, or into making the guess right? The
+question sounds like a matter of taste until you look at the split, and
+then it answers itself.
+
+In the L1 in-process qualification
+(five reps × 256 tokens, verify length 15): median cycle
 ~157.2 ms, of which **draft ≈ 26.9 ms** (embed 0.04 + block forward 22.3
 + LM-head/argmax 4.5) and **verify ≈ 130.2 ms** (forward 128.4, decision
 1.8) `[ledger §Stage B L1]`. The draft is the *small* side of its own

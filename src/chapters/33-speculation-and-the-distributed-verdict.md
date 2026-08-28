@@ -31,6 +31,16 @@ why.
 
 ## 33.1 The local win, stated with its scope language
 
+Start with the question the whole lane has to answer: what does guessing
+ahead actually buy, and under exactly which conditions? Decode spends
+its life waiting on memory, so the only way to go faster without
+changing the answer is to get more decisions out of each pass over the
+weights. That is the entire bet. The rest of this section is about what
+the bet paid — on which fixtures, at which lengths, and with which
+caveat riding on each number, because in this lane the caveats are not
+decoration. Two of the figures below mean the opposite of what they
+look like.
+
 The mechanism in one paragraph, since [Ch 8](08-the-dflash-draft.md)
 §8.1 built it: decode is bandwidth-bound because each token reads the
 whole 16.76 GB artifact; speculation has a cheap draft propose k tokens
@@ -39,16 +49,20 @@ decision per weight read. The draft is pure overhead that pays only when
 its guesses are good; the target still makes every decision, which is
 what keeps the output exact.
 
-**The bar.** The campaign's Stage B verdict measured kquant DFlash
-speculative decode at **107.9136 tok/s median, CV 0.200%, against
-llama's 81.3047 — ratio 1.3273** (2,048+256 streamed, verify length 15,
-five reps) `[ledger §L2 Stage B verdict]`. That number was measured
-**before the 2026-08-21 draft-window fix** (§33.3), so it is a
-landmine: it survives in the record only as the *bar* later lanes were
-judged against, and the pre-fix ratios 1.3273/1.3012 are superseded
-`[measured-numbers §1b, §7]`.
+**The bar, and why it is a landmine.** The campaign's Stage B verdict
+measured kquant DFlash speculative decode at **107.9136 tok/s median,
+CV 0.200%, against llama's 81.3047 — ratio 1.3273** (2,048+256
+streamed, verify length 15, five reps) `[ledger §L2 Stage B verdict]`.
+For a while that was the headline of the whole campaign. Then the fix
+described in §33.3 landed and moved the ground under it: the run had
+been measured **before the 2026-08-21 draft-window fix**, on a draft
+that was quietly attending half the context it had been trained on.
+We did not delete the number, because every later lane in this chapter
+was judged against it. We demoted it. It survives in the record as a
+bar and nothing else, and the pre-fix ratios 1.3273/1.3012 are
+superseded `[measured-numbers §1b, §7]`.
 
-**The current synthetic scope.** After the fix, in retained fixed-window
+**What the lane wins now.** After the fix, in retained fixed-window
 synthetic packets, exact-token decode ratios are **1.23692× at 2,048,
 1.20323× at 16,384, and 1.19616× at 32,768, with 5/5 exact reps per
 depth** `[claims #15]`. The claims row's own instruction is part of the
@@ -62,14 +76,22 @@ and the picture splits: spec decode *wins* python-like content (16,384:
 1.186; 8,192 suffix: 1.321) and **loses** high-acceptance shallow text
 (rust at 2,048: 0.931, improving only to 0.945 at verify length 7) —
 llama's lighter draft wins where acceptance is nearly free
-`[docs/benchmarks.md §2]`. That asymmetry is why serving froze
-verify-length 7 while the comparison harness pins 15
-`[docs/benchmarks.md §2]`. And at the deepest tested scope, the funded
-131,008/48 packet crossed end-to-end **wall** parity for the first time
-at **1.02536×** `[claims #16]` — wall, because the tempting
-**1.64960× decode figure is barred**: its first-round split is not an
-accounting-neutral cross-engine per-round metric, per the 2026-08-23
-ledger amendment `[claims #16; measured-numbers §7]`.
+`[docs/benchmarks.md §2]`. Sit with that asymmetry for a moment,
+because it is the counterintuitive result of the section: the harder
+the text is to predict, the better our speculation looks, and the
+easier the text is, the more our heavier draft is just a tax. It is
+also why serving froze verify-length 7 while the comparison harness
+pins 15 `[docs/benchmarks.md §2]`.
+
+And at the deepest tested scope, the funded 131,008/48 packet crossed
+end-to-end **wall** parity for the first time at **1.02536×**
+`[claims #16]`. The word *wall* is carrying weight there. The same run
+offers a far more flattering **1.64960× decode figure**, and that one
+**is barred** — we may not quote it as a result, because its
+first-round split is not an accounting-neutral cross-engine per-round
+metric, per the 2026-08-23 ledger amendment. Both readings are
+retained, the barred one included, which is the point of retaining
+them `[claims #16; measured-numbers §7]`.
 
 So the local lane's honest headline is: *about 1.20–1.24× on three fixed
 synthetic fixtures with exact tokens, a wall-parity crossing at 131k,
@@ -77,6 +99,15 @@ wins and losses on natural text by content class* — and every clause of
 that sentence has a receipt.
 
 ## 33.2 The loop as code: propose, verify, accept — exactly
+
+How can an approximate guesser touch a model's output and leave that
+output provably unchanged? That is the question this section answers,
+and the answer is stranger than "we check the guesses." The draft never
+decides anything. It proposes; the target judges; and the judging rule
+is arranged so that the tokens leaving the loop are distributed exactly
+as if the draft had never run at all. Get this rule wrong in a subtle
+way and nothing crashes — you simply ship a different model than the
+one you qualified. So it is worth reading the code slowly.
 
 Chapter 8 pinned what the draft guarantees; here is the algorithm that
 consumes those guarantees. Acceptance happens **on the CPU, against full
@@ -160,6 +191,18 @@ once, slowly:
   `[crates/muser-engine/src/sampling.rs:1001-1007]`, and the ordered
   variant (`_mt_ordered`) walks each row in a precomputed token order so
   the cumulative sum is deterministic.
+
+If one sentence from this section survives the reading, make it the
+middle bullet, said again in different words. A rejection is not the
+loop failing; it is the loop's correction step doing its job. A round
+that accepts nothing still emits a token, and that token comes from a
+distribution built precisely so that the whole accept-or-correct
+procedure, averaged over its own coin flips, reproduces what the target
+would have produced alone. Which means the draft's quality is a
+*performance* parameter and never a correctness one. A brilliant draft
+and a broken draft give you the same text. Only one of them gives it to
+you quickly. Hold that thought; the next section is the story of what
+it cost us to learn it in production.
 
 The engine side overlaps draft work with the target's suffix
 (Figure 33.1). The Metal mirror-SD route splits the target graph at a
@@ -259,27 +302,52 @@ correctness, so *no exactness gate can detect a bad draft*. Detecting it
 requires fixtures whose acceptance depends on conditioning — natural
 text — which is why natural-text cells became a standing part of the
 matrix despite carrying no exactness gate `[ledger §"ROOT CAUSE FOUND
-AND FIXED", consequence 2]`. And before the root cause was found, two
-earlier hypotheses were falsified *with counters* and recorded as wrong
-(the governor — "correctly protecting throughput"; the "window
-eliminated" row — invalid because `reset()` rebuilt the cache at the
-hardcoded geometry, so the override never took effect) `[ledger
-§"ROOT CAUSE FOUND AND FIXED", consequence 3]`. Every retroactive
-restatement in §33.1 exists because of this table.
+AND FIXED", consequence 2]`.
+
+Getting to that table took two wrong turns, and the ledger keeps both
+with the counters that killed them. Our first suspect was the governor.
+Acceptance behaved like something being throttled, so we went after the
+throttle, expecting to find it clamping the draft too early — and the
+counters said the governor was "correctly protecting throughput,"
+doing exactly the job it was written to do. Our second suspect was the
+window, and we thought we had cleared it: a sweep row with the window
+*eliminated* changed nothing, which seemed to rule the geometry out
+entirely and sent us looking elsewhere. That row was invalid.
+`reset()` rebuilt the cache at the hardcoded geometry, so the override
+never took effect and we had carefully measured the same broken
+configuration twice `[ledger
+§"ROOT CAUSE FOUND AND FIXED", consequence 3]`. The habit that came
+out of it is cheap to state and expensive to learn: an override you
+have not watched take effect has not been tested, and a negative
+result from an inert knob is not a negative result. Every retroactive
+restatement in §33.1 exists because of the table that finally replaced
+those two guesses.
 
 ## 33.4 The first rejection: native NVFP4 speculation, fail-closed
 
-The draft is kquant-only, and the reason is the *target's* verify
-arithmetic, not the draft. [Ch 7](07-nvfp4-native-lane.md) §7.6 gave
-the full treatment; the receipts, once more, because they set the
-pattern for §33.5: a native NVFP4 W4A4 batched-verification diagnostic
-ran at **6.805 tok/s** against the 107.9 bar — one diagnostic,
-explicitly unqualified — with verification consuming **35.915 s of a
-37.619 s decode span** `[docs/nvfp4-fast-lane-evidence-20260817.md
-§Measured product numbers; ledger §F-series remediation]`. The claims
-register's wording discipline: the lane's verifier diagnostics "missed
-the qualified bar," and native NVFP4 speculative decode "has no launch
-claim and remains fail-closed" `[claims #4]`.
+Once the local lane worked, the obvious next move was to point it at
+the fast lane. The reasoning felt airtight: speculation multiplies the
+number of decisions you get per pass over the weights, and NVFP4 is the
+format that makes each pass cheaper, so the two should compound. We
+expected a win, or at worst a wash. What we got was a native NVFP4
+W4A4 batched-verification diagnostic running at **6.805 tok/s** against
+the 107.9 bar — one diagnostic, explicitly unqualified, and not close
+to anything.
+
+The autopsy is in the split. Verification consumed **35.915 s of a
+37.619 s decode span**, which means the lane was not decoding with a
+verify step attached; it was verifying, with a little decoding around
+the edges `[docs/nvfp4-fast-lane-evidence-20260817.md
+§Measured product numbers; ledger §F-series remediation]`. So the
+draft is kquant-only, and the reason is the *target's* verify
+arithmetic, not the draft at all. The lesson generalizes past this
+lane, and §33.5 shows us paying to learn it a second time at cluster
+scale: speculation is a multiplier, and a multiplier amplifies a slow
+verifier exactly as faithfully as it amplifies a fast one.
+[Ch 7](07-nvfp4-native-lane.md) §7.6 gives the full treatment. The
+claims register supplies the wording discipline: the lane's verifier
+diagnostics "missed the qualified bar," and native NVFP4 speculative
+decode "has no launch claim and remains fail-closed" `[claims #4]`.
 
 Fail-closed here means *code*, in two layers. A receiver configuration
 declaring `producer_mode: "native"` cannot even enroll a DFlash identity
@@ -317,10 +385,14 @@ to move 2,129,920 capture bytes, and ~0.01 ms for sparse q, full
 acceptance projects to **114.93 tok/s** — which established the
 preregistered requirement: **at least 99.151% IID per-edge acceptance**
 (99.229% at p95) to beat 107.9 `[docs/nvfp4-distributed-speculative-
-frontier-20260818.md §Decision]`. Read that number twice. The lane was
-only interesting if the draft was right 99 times out of 100.
+frontier-20260818.md §Decision]`. Read that requirement twice, because
+it is the whole experiment in one line: the lane was only interesting
+if the draft was right 99 times out of 100. Every round where it was
+not, the GX would stream a model's weights and emit nothing for them.
 
-**The end-to-end verdict.** The organic runs then rejected the lane
+**What the organic runs said.** We ran it anyway, and that was the
+right call — a preregistered bar is only worth writing down if you
+intend to run at it and let it decide. The runs rejected the lane
 (Figure 33.3) `[docs/nvfp4-distributed-speculative-frontier-20260818.md
 §End-to-end linear-lane verdict]`:
 
@@ -336,43 +408,76 @@ all-accept control; the three organic strata are real content. Every
 cell has retained Mac and GX service receipts (SHA-256 pairs in the
 frontier doc's receipt table).*
 
-The **verifier-only ceiling** is the decisive bound, and its definition
-is the whole trick: `output_tokens / sum(GX verifier wall)` — it grants
-**zero** time to DFlash drafting, feature decode, transport,
+One column in that table decides everything, and it is not the column
+of measured throughput. The **verifier-only ceiling** is the decisive
+bound, and its definition is the whole trick:
+`output_tokens / sum(GX verifier wall)` — it grants **zero** time to
+DFlash drafting, feature decode, transport,
 installation, and scheduling, i.e., "physically impossible zero-Mac-cost"
 assumptions `[docs/nvfp4-distributed-speculative-frontier-20260818.md
-§End-to-end linear-lane verdict; claims #14]`. All three organic strata
+§End-to-end linear-lane verdict; claims #14]`. Said another way: we
+started a stopwatch that runs only while the GX is doing arithmetic and
+kept it paused for every other part of the system — the drafting, the
+wire, the feature install, the scheduler — and then asked whether the
+lane could win under that fantasy accounting. All three organic strata
 stay below the 107.9 bar *even under that impossible grant* (20.15 /
 40.04 / 55.96 tok/s); documentation stays below even the 35.5 tok/s
-plain-decode floor. The measured end-to-end numbers (15.532 / 11.172 /
-15.412 tok/s) are point estimates only — the python and rust walls
-overlapped unrelated local validation work — but that cannot weaken an
-upper bound that was already under the bar `[frontier §End-to-end
-linear-lane verdict; measured-numbers §1g]`. And the 110.59 tok/s
-standard-trace cell is a **positive control under forced acceptance** —
-it proved the machinery worked (477/477 proposals committed, 34/34
-Mirror-SD speculative transactions retained), and it is *never* a
-serving result `[claims #14; measured-numbers §7]`. For contrast,
-llama's own draft-dflash accepted 65–81% on the same fixture families —
-the collapse was muser-side draft conditioning at the time (this was
-pre-window-fix, §33.3) — but the frontier's conclusion does not rest on
-that: the organic ceilings sit below the bar regardless
-`[measured-numbers §1g]`.
+plain-decode floor.
 
-**The fallbacks were measured too.** Adaptive width is safe but no
-escape: singleton verification — width reduced to the carried
-`[frontier]` token alone — costs one Dudeman weight stream per emitted
-token and runs "a roughly 9–10 tok/s safety mode" `[frontier §End-to-end
-linear-lane verdict]`. Silently switching
-to Mac plain decode is *not exact* — Mac/Metal and GX/vLLM are distinct
-target-engine epochs, and a legitimate switch would need a signed
-epoch seam plus replay of the accepted suffix; even granting that
-unbuilt handoff zero cost, one failed gamma-14 probe followed by the
-measured 35.491 tok/s Mac lane projects only ~35.16 tok/s over 512
-tokens, below the documented >35.5 fallback gate `[frontier §End-to-end
-linear-lane verdict]`. Mirror-SD itself missed on documentation and
-python's first attempts, and rust — "the adversarial classifier case" —
-passed its first 14 proposals and failed the second Mirror attempt, so
+This is why the softness in the measured column does not rescue
+anything. The measured end-to-end numbers (15.532 / 11.172 /
+15.412 tok/s) really are point estimates only — the python and rust
+walls overlapped unrelated local validation work, and we say so rather
+than quietly presenting them as clean. But a soft number sitting
+underneath a hard bound does not move the bound, and the bound was
+already below the bar
+`[frontier §End-to-end linear-lane verdict; measured-numbers §1g]`.
+
+Two cells in that table invite misreading, so both carry labels. The
+110.59 tok/s standard-trace cell is a **positive control under forced
+acceptance** — it proved the machinery worked end to end (477/477
+proposals committed, 34/34 Mirror-SD speculative transactions
+retained), and it is *never* a serving result
+`[claims #14; measured-numbers §7]`. And llama's own draft-dflash
+accepted 65–81% on the same fixture families, which reads like a
+damning contrast until you place it in time: the collapse was
+muser-side draft conditioning at the time, and this session ran
+pre-window-fix, §33.3. We keep the comparison in the record anyway,
+because the frontier's conclusion never rested on it — the organic
+ceilings sit below the bar regardless `[measured-numbers §1g]`.
+
+**Then we went looking for a way out.** A lane is only honestly
+rejected once you have tried the obvious rescues, so we tried three,
+and measured each one instead of arguing about it.
+
+The first rescue was adaptive width: when acceptance collapses, stop
+drafting wide and verify a single token at a time. It is safe, it
+degrades gracefully, and it is not an escape. Singleton verification —
+width reduced to the carried `[frontier]` token alone — still costs one
+Dudeman weight stream per emitted token, and the measurement puts it at
+"a roughly 9–10 tok/s safety mode" `[frontier §End-to-end linear-lane
+verdict]`. The safety net hangs an order of magnitude below the thing
+it was catching.
+
+The second was to bail out locally: if the remote lane stalls, finish
+the request on Mac plain decode. This one fails on exactness before it
+ever gets to speed. Mac/Metal and GX/vLLM are distinct target-engine
+epochs, so a silent switch mid-stream swaps the target out from under
+the exactness guarantee itself — a legitimate switch would need a
+signed epoch seam plus replay of the accepted suffix, machinery nobody
+has built. And even granting that unbuilt handoff zero cost, the
+arithmetic refuses to save us: one failed gamma-14 probe followed by
+the measured 35.491 tok/s Mac lane projects only ~35.16 tok/s over 512
+tokens, below the documented >35.5 fallback gate
+`[frontier §End-to-end linear-lane verdict]`.
+
+The third was to admit the lane per request rather than per
+deployment — run one probe round, and if it accepts, trust the
+stratum for the rest of the request. Mirror-SD missing on documentation
+and python's first attempts was survivable. Rust killed the idea: "the
+adversarial classifier case" passed its first 14 proposals and then
+failed the second Mirror attempt. A probe that passes and then fails
+is worse than no probe, because it buys confidence it cannot honor, so
 "a one-round admission probe is therefore unsafe" `[frontier §End-to-end
 linear-lane verdict]`.
 
@@ -387,7 +492,13 @@ against the draft's 26.9 ms `[ledger §Stage B L1]`.
 
 ## 33.6 The falsification ledger: a device worth porting
 
-The frontier doc's most durable artifact may be its *form*: every
+What should a rejected experiment leave behind for whoever tries it
+next? A verdict is nearly useless on its own — "we rejected the
+distributed lane" invites exactly one response, which is to try it
+again from scratch. What actually transfers is the shape of the search:
+which branches were entered, what killed each one, and which are merely
+untested rather than disproved. The frontier doc's most durable
+artifact may therefore be its *form* rather than its finding: every
 hypothesis carries its evidence class and its verdict, so the next
 experimenter inherits a map of the dead ends. A selection, verbatim in
 structure `[docs/nvfp4-distributed-speculative-frontier-20260818.md
@@ -413,8 +524,10 @@ already met with their receipts. It is the same discipline the
 decode-dispatch-gap note used when it reconciled the +196 closure gap
 into named families and then *rejected the numerically inexact fusion*
 (logprob error 3.197e-4 over the 1e-4 contract) rather than shipping it
-`[docs/decode-dispatch-gap-20260815.md]`, and the same discipline the
-offline GX trace analysis used when it refused to invent a fix from
+`[docs/decode-dispatch-gap-20260815.md]`.
+
+The discipline has a second face, which shows when the evidence simply
+runs out. The offline GX trace analysis refused to invent a fix from
 insufficient evidence: the retained hashes "cannot identify the first
 proposal token," so "inventing a rollback or serialization fix from
 these data would be guesswork" `[docs/gx-speculative-trace-offline-
@@ -427,10 +540,14 @@ output format: what was measured, what it cost, what ships instead
 
 ## 33.7 What survives: the V2 machinery, unwired
 
-A rejected lane leaves usable parts. The research record retains a
-**V2 typed protocol** whose pieces are individually tested even though
-"nothing is wired into the serving route" `[frontier §What was
-implemented]`:
+A rejected lane leaves usable parts, and the reason this matters for
+the handoff is specific: the lane died on economics, not on design. The
+protocol was never the thing that failed. So the research record
+retains a **V2 typed protocol** whose pieces are individually tested
+even though "nothing is wired into the serving route" `[frontier §What
+was implemented]`. Read the list below as a description of a machine
+that works and is switched off — each entry is there because it solves
+a problem the next attempt would otherwise have to rediscover:
 
 - **The carried-frontier state machine.** A target-selected token that
   is not yet evaluated or emitted; a round evaluates
@@ -466,10 +583,15 @@ that matters for readers of the shipped tree: the linear policy is
 rejected, and "the production authority, renderer, executor, and stream
 boundary remain unwired, so this research does not change the fail-closed
 lane" `[docs/muser-architecture.md, distributed-verifier paragraph]`.
-The only remaining performance experiment is the **hardware-aware token
-tree** — spend the GX's otherwise-idle batch arithmetic on covering
-near-miss branches rather than paying one weight stream per linear
-round — and even it enters through a preregistered admission screen: at
+
+One experiment is still alive, and it is worth seeing why it survived
+the same document that rejected everything around it. The linear policy
+pays a full weight stream every round, whatever that round returns; a
+tree spends the GX's otherwise-idle batch arithmetic on covering
+near-miss branches instead, so a round that would have been a total
+loss can still emit. That is the **hardware-aware token tree**, the
+only remaining performance experiment — and even it enters through a
+preregistered admission screen: at
 24/32/48/64 nodes the measured capture curves require mean emitted
 tokens per call of 15.77/16.18/17.01/17.84 (48 nodes is the first
 sensible target; 64 only if its extra nodes add ≥0.83 token/call), and

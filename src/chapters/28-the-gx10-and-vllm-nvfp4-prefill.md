@@ -20,7 +20,17 @@ culture than most servers you have owned — because
 failure, and because everything it computes crosses a trust boundary
 ([Ch 30](30-handoff-v2-transport.md), [Ch 32](32-precision-across-the-handoff.md)).
 
+Three questions organise everything that follows. What is the machine, and
+what wire does it hang on? What exactly runs on it, and how do we know it is
+still the same thing tomorrow? And — the long one — what does it do when
+something goes wrong?
+
 ## 28.2 The node and the wire it hangs on
+
+Start with the physical facts, because two of them decide whether any number
+in this chapter is admissible at all: what the machine is, and what path a
+measurement travels over. Get the second one wrong and every throughput
+figure you collect is fiction, however honestly you collected it.
 
 The producer is **one ASUS GX10** — a DGX Spark-class machine built around
 the **NVIDIA GB10** package, with an aarch64 host and an NVIDIA driver
@@ -59,12 +69,23 @@ Two disciplines are welded to this picture, and they will recur all through
 - **Wi-Fi is not a measurement path.** Mac Wi-Fi is `en1`; "a measurement is
   invalid if it routes there" `[scripts/gx10/README.md]`. Verify direct
   same-subnet routes in both directions before probing anything.
-- **Re-prove the raw ceiling before trusting it.** The pre-migration
-  reference was ~9.4 Gbps single-stream each way `[ledger T0]`; the
-  switched fabric measured 9.256 Gbps in the product direction and only
-  6.161 Gbps in reverse — an asymmetry retained as a deviation, not
-  promoted to a pass `[ledger GX10 return 2026-08-23, attempts 3–4 + readiness entries]`
-  `[docs/gx10-return-runbook-2026-08.md §Execution annotation, attempt 4]`.
+- **Re-prove the raw ceiling before trusting it.** A topology that was
+  characterised yesterday is not a measured ceiling today.
+
+The second rule earned itself during the migration. Before it, the direct
+link had been characterised at ~9.4 Gbps single-stream each way
+`[ledger T0]`, and we expected the switched fabric to land just under that
+in both directions — a switch is nominally direction-agnostic, so a
+symmetric result was the boring prediction. It was not what came back. The
+product direction measured 9.256 Gbps, close enough to the old reference to
+be unremarkable; the reverse direction measured 6.161 Gbps. We had no root
+cause, and the two honest options were to keep hunting or to write it down,
+so we wrote it down: the asymmetry is retained as a deviation, not promoted
+to a pass `[ledger GX10 return 2026-08-23, attempts 3–4 + readiness entries]`
+`[docs/gx10-return-runbook-2026-08.md §Execution annotation, attempt 4]`.
+The lesson outlives this particular link. A fabric change invalidates the
+ceiling in *both* directions until both directions have been re-measured,
+which is why the discipline is written as a rule and not as a number.
 
 The node also holds the lab's accelerator lease file — the *same* path the
 Mac side uses, `/tmp/ferrite.gpu.lock`
@@ -77,6 +98,12 @@ this is the lock being described
 `[docs/gx10-return-runbook-2026-08.md §1.3]`.
 
 ## 28.3 The resident producer: one pinned identity chain
+
+The question here sounds boring — what, exactly, is running over there? —
+and it is the question the whole lane rests on. The Mac will later refuse
+KV bytes that arrive from an identity it does not recognise, and for that
+refusal to mean anything, "the producer" has to name something far more
+precise than a hostname.
 
 What runs on the GX10 is the **resident pinned Muse Glimmer NVFP4 prefill
 producer** — a Python process living inside a docker container, running
@@ -104,30 +131,46 @@ checkpoint (`RedHatAI/Muse-Glimmer-30B-NVFP4`, revision `d5109a1…`,
 resident container at the pinned tree is `muser-redhat-native-f1-593b96a`
 with host work directory `/home/<user>/.muser/lane/gx10/work/<deployment>`
 `[docs/gx10-return-runbook-2026-08.md §Constants and evidence discipline]`.
-One identity fact ties both ends of the lane together: the checkpoint's
-`chat_template.jinja` is exactly 7,167 bytes with SHA-256
-`114f55eb…07965e` — the *same* template hash the Mac-side release test
-asserts against the kquant GGUF `[crates/muser-server/src/chat_template.rs:237-261]`
-`[scripts/gx10/vllm/native_onboarding_identity_v1.json]`. Two artifacts, two
-vendors' toolchains, one template identity — the receiver will not accept a
-handoff whose identities do not match to the byte ([Ch 30](30-handoff-v2-transport.md)).
 
-The process also carries hard expectations about the model it serves,
-asserted from its own constants — 39 RoPE modules, head size 128, context
-length 131,072 `[scripts/gx10/vllm/resident_producer.py:25-27]` — and a
-default watchdog of 900 s on every generate call
-`[scripts/gx10/vllm/resident_producer.py:24]`. Its vLLM KV-cache
+One fact in that chain ties both ends of the lane together, and it is the
+one worth carrying with you. The checkpoint's `chat_template.jinja` is
+exactly 7,167 bytes, with SHA-256 `114f55eb…07965e`. That is the *same*
+template hash the Mac-side release test asserts against the kquant GGUF:
+two artifacts, produced by two vendors' toolchains through two unrelated
+quantisation pipelines, agreeing on one template identity down to the byte.
+Both halves of that assertion live in the tree, and we kept them there
+deliberately — the Mac-side test at
+`[crates/muser-server/src/chat_template.rs:237-261]`, the frozen producer
+identity at `[scripts/gx10/vllm/native_onboarding_identity_v1.json]`. The
+receiver will not accept a handoff whose identities do not match to the
+byte ([Ch 30](30-handoff-v2-transport.md)).
+
+The process is just as unwilling to be vague about the model it serves. It
+asserts the shape from its own constants — 39 RoPE modules, head size 128,
+context length 131,072 `[scripts/gx10/vllm/resident_producer.py:25-27]` —
+so a checkpoint that quietly changed geometry fails at startup rather than
+at handoff time. Every generate call runs under a default watchdog of
+900 s `[scripts/gx10/vllm/resident_producer.py:24]`, and its vLLM KV-cache
 allocation is bounded to 1–8 GiB by argument validation
 (`1 << 30 <= args.kv_cache_memory_bytes <= 8 << 30`,
-`[scripts/gx10/vllm/resident_producer.py:582]`). Remember that number the
-next time you see a "~7 GB payload" figure for the deep cell — 7–8 GiB is
-the *producer's KV-cache allocation*, not the wire payload (1.82 GB;
-[Ch 27 §27.4](27-why-disaggregate.md) derived it).
+`[scripts/gx10/vllm/resident_producer.py:582]`).
 
-A small host-side daemon, `muser_native_prefilld.py`, owns lifecycle and
-the authenticated control channel while "the vLLM image owns the GPU and
-Handoff V2 data plane" — "No cache bytes cross the control connection"
-`[scripts/gx10/vllm/muser_native_prefilld.py:2-9]`.
+Hold on to that last bound, because it is the easiest number in the lane to
+misread. The next time you meet a "~7 GB payload" figure for the deep cell,
+remember what it is describing: 7–8 GiB is the *producer's KV-cache
+allocation* on its own GPU, not the wire payload. What actually crosses the
+wire for that cell is 1.82 GB, and
+[Ch 27 §27.4](27-why-disaggregate.md) derived it.
+
+One more process belongs in the answer to "what runs over there," and the
+line between the two is drawn on purpose. A small host-side daemon,
+`muser_native_prefilld.py`, owns lifecycle and the authenticated control
+channel, while "the vLLM image owns the GPU and Handoff V2 data plane" —
+and the daemon's own docstring states the boundary as a prohibition: "No
+cache bytes cross the control connection"
+`[scripts/gx10/vllm/muser_native_prefilld.py:2-9]`. Control authority in one
+process, cache bytes in the other, and no path by which a control message
+can quietly become a data path.
 
 ## 28.4 NVFP4 prefill on tensor cores
 
@@ -143,11 +186,13 @@ activations) via the FlashInfer/CUTLASS kernels of the pinned stack
 That is the [Ch 27](27-why-disaggregate.md) roofline made silicon: the
 512-chunk's ~1,619 FLOPs/byte intensity is unreachable in FP32 on a Mac,
 and trivially fed by dense FP4 matrix units. The measured consequence is
-the entire payoff band of Table 27.2 — e.g. the deep cell's producer
-compute finishing far inside the 137.405 s remote median
-`[claims #6]` (a 2,048-token integrated cell put native producer compute at
-1.87 s `[docs/nvfp4-fast-lane-evidence-20260817.md §Measured product
-numbers]` — dated packet, single cell, as scoped there).
+the entire payoff band of Table 27.2: the deep cell's producer compute
+finishes far inside the 137.405 s remote median `[claims #6]`. If you want
+a feel for *how* far inside, one integrated cell at 2,048 tokens put native
+producer compute at 1.87 s — a dated packet and a single cell, and it is
+scoped exactly that narrowly where it lives
+`[docs/nvfp4-fast-lane-evidence-20260817.md §Measured product
+numbers]`.
 
 One hardware honesty note the sealing plan carries, because [Ch 32](32-precision-across-the-handoff.md)
 needs it: on this GB10 generation the FP4 *conversion* path is emulated in
@@ -159,8 +204,11 @@ lane's trust chapter exists.
 
 ## 28.5 Exact and native: one process, two modes
 
-The producer process has exactly two lanes, selected by an environment
-variable at start:
+Why would one process need two personalities? Because the fast lane and the
+trustworthy lane are not the same lane, and the engine needs both: one to
+ship the product numbers, one to check the shipping lane against something
+that cannot drift. The producer therefore has exactly two modes, selected by
+an environment variable at start:
 
 ```python
 # scripts/gx10/vllm/resident_producer.py:31-36
@@ -196,16 +244,25 @@ pub enum Nvfp4ProducerMode {
 }
 ```
 
-The modes are not interchangeable, and the receiver knows it: exact and
-native producers **derive different target-cache identities**
-`[docs/muser-architecture.md §Durable and remote KV]`, the two modes cannot
-mix KV with a differently-modeled decode lane, and a native-mode enrollment
-cannot carry a DFlash identity at all — `native producer mode cannot enroll
-DFlash context geometry` is a hard config-validation error
-(`[crates/muser-cluster/src/config.rs:128-132]`). The mode split is also
-self-policing inside the producer harness: the *native* benchmark refuses
-to run with the exact flag set, because setting it "would invalidate the
-native-path claim" `[scripts/gx10/vllm/benchmark_native_prefill.py:99-102]`.
+It would be convenient if the two modes were interchangeable — take
+whichever producer happens to be warm, take its KV, decode. They are not,
+and the receiver is built to know it. Exact and native producers **derive
+different target-cache identities**, so a cache filled by one is not even
+addressable by the other
+`[docs/muser-architecture.md §Durable and remote KV]`; neither mode may mix
+KV with a differently-modeled decode lane; and a native-mode enrollment
+cannot carry a DFlash identity at all. That last one
+is not a warning in a doc, it is a hard config-validation error —
+`native producer mode cannot enroll DFlash context geometry`
+`[crates/muser-cluster/src/config.rs:128-132]`.
+
+The split polices itself on the producer side too. Run the *native*
+benchmark with the exact flag set and it refuses to start, on the grounds
+that setting it "would invalidate the native-path claim"
+`[scripts/gx10/vllm/benchmark_native_prefill.py:99-102]`. That is a
+benchmark guarding the meaning of its own result rather than the
+convenience of whoever is running it — the same instinct as the fail-closed
+exit in the next section, one layer up.
 
 ## 28.6 Fail-closed by construction: exit 75
 
@@ -222,7 +279,8 @@ death sites in the request loop:
                     os._exit(75)
 ```
 
-(the 900 s watchdog fired on a generate that never returned),
+The first is the watchdog: the 900 s ceiling elapsed on a generate that
+never returned. The second is where the interesting decision lives:
 
 ```python
 # scripts/gx10/vllm/resident_producer.py:786-795
@@ -238,10 +296,22 @@ death sites in the request loop:
                     os._exit(75)
 ```
 
-(an error crossed the engine boundary — the comment records *why* a soft
-retry is not safe: a half-registered vLLM request produced "a host-side
-busy loop with no GPU work"), and finally three consecutive non-engine
-errors also trip the exit `[scripts/gx10/vllm/resident_producer.py:796-797]`.
+That second site is the one with a story behind it, and the comment is the
+post-mortem. The instinct when a send fails is to log it, drop the request,
+and keep serving — the process is alive, the model is loaded, why throw
+away a warmup that took minutes? Because the engine does not come back
+clean. A connector or send failure can leave vLLM's synchronous V1 engine
+request registered even though `generate()` raised, and reusing that engine
+produced "a host-side busy loop with no GPU work": a producer that looked
+healthy from the outside, held its port, burned a core, and computed
+nothing. That is the worst possible state for a machine whose whole job is
+to be trusted. The resolution is not a cleverer retry — it is to hand the
+error back to the caller and then die, so an orchestrator can restart from
+the persistent compile cache.
+
+The third death site is quieter than the other two: three consecutive
+non-engine errors also trip the exit
+`[scripts/gx10/vllm/resident_producer.py:796-797]`.
 
 Why 75? It is the EX_TEMPFAIL convention — "temporary failure, distinguish
 me from a normal exit" — so a supervisor can tell "this producer died on
@@ -296,12 +366,22 @@ load (~2–3 min) is not a producer `[scripts/gx10/restart_resident_producer.py:
 The runbook makes this the only legal path: "For an exited resident with a
 free lease, use the node copy of `restart_resident_producer.py`; never use
 bare `docker restart`" `[docs/gx10-return-runbook-2026-08.md §1.3]`. The
-operator cheat sheet agrees (`[AGENTS.md §The GX10 lane]`), and adds the
-container-editing discipline that follows from the same pinned-identity
-thinking: **extract the file from the container, modify, verify, `docker cp`
+operator cheat sheet agrees (`[AGENTS.md §The GX10 lane]`), and adds a
+second discipline that comes from the same pinned-identity thinking — this
+one learned the expensive way. Patching a file inside the container looks
+like a solved problem: the repo has the corrected version, `docker cp` it
+in, restart, done. We did exactly that with `resident_producer.py`,
+expecting the container to behave like a checkout of the tree. It does not.
+The image was built from an older commit, the `muser_vllm` package inside it
+had drifted from HEAD in the meantime, and the copied file failed on
+`muser_vllm.native_capture`. The lesson is the one this chapter keeps
+teaching from new angles: a container here is not a working copy, it is a
+pinned identity that happens to contain files, and editing it as if it were
+a checkout silently unpins it. Hence the rule:
+**extract the file from the container, modify, verify, `docker cp`
 back — never copy a file from repo HEAD wholesale into a container built
-from an older commit** (the `muser_vllm` package drifts; a HEAD copy of
-`resident_producer.py` once failed on `muser_vllm.native_capture`)
+from an older commit** — and both the rule and the drift that taught it to
+us are written down where an operator will meet them
 `[AGENTS.md §The GX10 lane]` `[docs/disaggregated-prefill-sealing-plan-20260818.md §W1 finding 4]`.
 
 ## 28.8 The supervisor: recovery without flapping
@@ -338,31 +418,55 @@ active and not latched `[docs/gx10-return-runbook-2026-08.md §1.3]`.
 
 ## 28.9 What the evidence says about recovery
 
-The claims register rows for this machinery, with their boundaries
-`[claims #13]`:
+So the producer dies on purpose and a supervisor brings it back. Does that
+actually work — and how far can the lane be pushed before it stops working?
+The claims register keeps both answers, with their boundaries drawn
+`[claims #13]`.
 
-- **Kill/recovery**: a killed producer "was detected and recovered with no
-  operator action in testing, resuming bit-identical payloads"
-  `[docs/disaggregated-prefill.md §Operating it]`.
-- **Producer swap**: kvpack ladder stage 4 proved a *controlled* swap of
-  the resident producer and restoration to a healthy supervised resident
-  (`[receipt kvpack-ladder-20260820/attempt-13-…-stage4-naive/node-state-after-stage4.log]`).
-- **Bounded deep soak**: eight consecutive 130,815-token handoffs, back to
-  back — zero producer deaths, deterministic output, payload 6.87→3.47
-  Gbps with every rep ≥ the 3.0 floor `[ledger "eight-handoff deep soak",
-  2026-08-23]` `[receipt final-campaign-20260823/attempt-4/soak/run-attempt-3/SOAK_VERDICT.json]`.
-- **The open edge**: one producer died on the *ninth* consecutive deep
-  handoff during the EEE-off sequence. "Sustained-deep-load stability
-  remains open" `[claims #13]` — the register forbids claiming it, and the
-  return runbook pre-registers the bounded soak (N=12, chosen to cover the
-  observed ninth-handoff boundary) as the honest way to close the question
-  `[docs/gx10-return-runbook-2026-08.md §4]`.
+Take the cheapest test first: kill the producer outright and watch. It "was
+detected and recovered with no operator action in testing, resuming
+bit-identical payloads" `[docs/disaggregated-prefill.md §Operating it]` —
+recovery that restores not merely service but the *same bytes*, which is the
+only kind of recovery this lane can use. A harder case came out of the
+kvpack ladder, whose stage 4 swapped the resident producer under the lane
+and then restored a healthy supervised resident; we kept the node state
+captured after that stage
+`[receipt kvpack-ladder-20260820/attempt-13-…-stage4-naive/node-state-after-stage4.log]`.
 
-That last bullet is the fail-closed culture in miniature: a pass at N=8 and
-a death at N=9 are reported *together*, and neither is smoothed into
-"stable" or "unstable."
+Then we went after duration, because a lane that survives one kill can still
+be terrible at staying up. The bounded deep soak ran eight consecutive
+130,815-token handoffs, back to back. It passed on every axis we had
+pre-registered: zero producer deaths, deterministic output, payload
+throughput drifting 6.87→3.47 Gbps with every rep still at or above the
+3.0 floor `[ledger "eight-handoff deep soak",
+  2026-08-23]`
+`[receipt final-campaign-20260823/attempt-4/soak/run-attempt-3/SOAK_VERDICT.json]`.
+Reading that verdict, the temptation is obvious — the machinery works, call
+sustained load solved.
+
+Then, during the EEE-off sequence, a producer died on the *ninth*
+consecutive deep handoff.
+
+We do not know what the ninth handoff hit. What we do know is that eight was
+not the ceiling we had quietly credited ourselves with: the passing soak and
+the death sit on either side of one boundary, and only the death told us the
+boundary was there. So the register
+says "Sustained-deep-load stability remains open" `[claims #13]` and forbids
+claiming otherwise, and the answer is not to re-run the eight-handoff soak
+until it looks better — it is to design a run that would have caught this
+one. The return runbook pre-registers exactly that: a bounded soak at N=12,
+chosen to cover the observed ninth-handoff boundary
+`[docs/gx10-return-runbook-2026-08.md §4]`.
+
+That pairing is the fail-closed culture in miniature: a pass at N=8 and a
+death at N=9 are reported *together*, and neither is smoothed into "stable"
+or "unstable."
 
 ## 28.10 Tradeoffs
+
+Three decisions in this chapter had a live alternative on the table, and in
+each case the alternative was the more comfortable engineering choice. Here
+is what taking it would have cost.
 
 - **Fail-closed exit 75 vs serve-degraded.** The alternative — catch the
   error, keep the process, keep the port open — would hide the

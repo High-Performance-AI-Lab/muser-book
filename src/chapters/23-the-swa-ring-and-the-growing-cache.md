@@ -20,6 +20,12 @@ destroying the attention inputs, how the same bytes come back out as a
 snapshot, and what the server does when the context outgrows the model's
 limit.*
 
+Each of those is a junction where the obvious implementation is available,
+cheap, and wrong, and where the shipped answer only makes sense once you have
+watched the obvious one fail. So we walk them in that order: the fork first,
+then what breaks, then the code that survived. The receipts are kept where
+they were earned.
+
 The recurring lesson of this chapter is that the ring is not a storage
 detail. Its rotation is numerically observable (bitwise replay depends on
 it), its wrapped shape constrains which pinned kernels may read it, and its
@@ -30,23 +36,30 @@ the part of the cache that becomes a portable asset in
 [Ch 24](24-kvpack-the-format.md).
 
 One piece of background from [Ch 15 §15.2](15-kv-store-and-the-ring.md),
-kept to one paragraph: each layer's cache is a `MetalKvPlane` — two f16
-buffers plus five fields of explicit bookkeeping (`capacity`, `len`,
-`origin_logical`, `origin_physical`, `head_major`,
-`decode.rs:182-190`). Sliding layers get capacity
+kept to one paragraph: each layer's cache is a `MetalKvPlane`, two f16
+buffers plus five fields of explicit bookkeeping — `capacity`, `len`,
+`origin_logical`, `origin_physical`, `head_major`, declared together at
+`decode.rs:182-190`. Sliding layers get capacity
 `min(max_context, 2,048)` **token-major**; full layers get `max_context`
-**head-major** (`decode.rs:1346-1348`). Physical placement is never derived
-from an absolute token position — prefill's module doc states the invariant
-in one line ("physical placement is never derived from absolute position",
-`prefill.rs:15-17`).
+**head-major** (`decode.rs:1346-1348`). Keep one invariant in view above all
+the others, because most of this chapter is a consequence of it: physical
+placement is never derived from an absolute token position. Prefill's module
+doc says it in a line — "physical placement is never derived from absolute
+position", `prefill.rs:15-17`.
 
 ## 23.2 Reserving rows: `append` for one token, `append_batch` for a chunk
 
+Start with the smallest question the cache has to answer. Where does the next
+token's key and value actually go — and what stops that write from landing on
+a row that some query still needs? Get this wrong and nothing downstream can
+save you: a corrupted row is not detected by attention, it is silently
+attended to.
+
 [Ch 15 §15.5](15-kv-store-and-the-ring.md) walked the single-token
-`append` (`decode.rs:263-284`): fail-closed continuity against
-`origin_logical + len`, then either write at
-`(origin_physical + len) % capacity` (filling) or overwrite
-`origin_physical` and advance both origins (wrapping). Decode calls it once
+`append`, which lives at `decode.rs:263-284`. It checks continuity against
+`origin_logical + len` and fails closed, then either writes at
+`(origin_physical + len) % capacity` (still filling) or overwrites
+`origin_physical` and advances both origins (wrapping). Decode calls it once
 per layer per token (`decode.rs:5643`). Prefill chunks need the batched
 form, and its arithmetic is where the ring's edge cases live:
 
@@ -83,7 +96,8 @@ fn append_batch(
 }
 ```
 
-Walk the two regimes with numbers.
+Walk the two regimes with numbers. They look symmetric on the page; they are
+not, and the asymmetry is the whole chapter in miniature.
 
 **Wrapping (SWA, from the first chunk that crosses 2,048).** `len = 1,900`,
 chunk of 512, capacity 2,048: `total = 2,412 > 2,048` — this chunk *does*
@@ -101,6 +115,14 @@ own head has already scrolled out before the chunk ends, and
 `source_first > 0` names the first surviving source row. The
 `saturating_sub` is the guard that keeps that case a number, not a panic.
 
+Say the returned pair as a question and its answer, because it is the one
+part of `append_batch` that reads like bookkeeping and is not: *of the rows I
+just handed you, which are still inside the window now that the reservation
+is done?* In every geometry the production model can reach, the answer is all
+of them and the pair is a formality. It is written as arithmetic anyway, so
+that the geometry where the answer is *not* all of them returns a fact
+instead of crashing.
+
 **NoPE degenerates to pure append.** A growing plane's capacity is
 `max_context`, `total <= capacity` always holds inside valid context bounds,
 the `else` branch never runs, `origin_logical` stays 0, `origin_physical`
@@ -113,18 +135,29 @@ Both `append` forms fail closed before any GPU write happens:
 position {expected}, got {got}", `decode.rs:117-122`) means a skipped or
 replayed position can never silently alias a live row. When it trips, the
 operator sees the layer index and both positions — enough to find the caller
-that broke continuity.
+that broke continuity. That is the answer to the question this section opened
+with, and it is deliberately boring: a write cannot land on a row it does not
+own, because a request to do so is refused before the encoder is touched.
 
 ## 23.3 Crossing the wrap in prefill: the staging shadow
 
-A wrapped ring has a property that a contiguous buffer never has: **the
-live window is split across the physical array's seam.** Rows `[origin ..
-capacity)` hold the older half, rows `[0 .. origin)` hold the newer half.
-The attention kernels of [Ch 16](16-attention-decode-kernels.md) want one
-linear span of rows. And a chunk that wraps will *overwrite* the oldest live
-rows — the very rows this chunk's queries must still attend to. Writing
-in place would be a [WAR](../glossary.md#war-hazard) hazard committed against
-your own inputs.
+Reserving a row was the easy question. Here is the hard one: when a prefill
+chunk wraps the ring, what exactly is it allowed to write, and when?
+
+The obvious implementation is the one anybody writes first. Store the chunk's
+keys and values into the ring, then run attention over the ring, the way
+decode does it a token at a time. Follow that through a wrap and it comes
+apart. A wrapped ring has a property that a contiguous buffer never has:
+**the live window is split across the physical array's seam.** Rows
+`[origin .. capacity)` hold the older half, rows `[0 .. origin)` hold the
+newer half. The attention kernels of
+[Ch 16](16-attention-decode-kernels.md) want one linear span of rows, and the
+seam is not one. Worse, a chunk that wraps will *overwrite* the oldest live
+rows — the very rows this chunk's own queries must still attend to. Storing
+first is a [WAR](../glossary.md#war-hazard) hazard committed against your own
+inputs: the chunk eats its own context, and nothing in the output announces
+it. The lesson is a sequencing law, not a bug fix — on a ring, *attend before
+you overwrite* is a precondition, not a preference.
 
 So a wrapped SWA prefill does not write the ring at all until attention is
 done. It stages:
@@ -170,15 +203,26 @@ fallback branch keeps the ordering explicit with a comment — "Attend before
 overwriting any still-visible old rows" (`decode.rs:4356`) — the same law,
 stated for the route where the overwrite is partial.
 
-This staging is not free, and the campaign counted the cost: the batch
-graph's wrapped-ring work appears in the dispatch-gap accounting as **39 SWA
-wrapped-ring staging groups**, one per sliding layer, kept "until a
-bit-exact ring-aware replacement exists" `[docs/decode-dispatch-gap-20260815.md
-§Corrected closure-count diff]`. It is structure the exactness contract
-refuses to cheapen — same verdict as the 52 KV-publication splits of
+A shadow copy per sliding layer is not free, and rather than hide the cost we
+counted it. The batch graph's wrapped-ring work shows up in the dispatch-gap
+accounting as **39 SWA wrapped-ring staging groups**, one per sliding layer.
+The obvious saving is to teach attention to read a wrapped ring directly and
+delete the shadow; the reason that saving is still on the table and not in
+the tree is written into the accounting note itself, which keeps the groups
+"until a bit-exact ring-aware replacement exists"
+`[docs/decode-dispatch-gap-20260815.md
+§Corrected closure-count diff]`. A cheaper path exists. A cheaper path that
+reproduces the same reduction order bit for bit does not, yet — and where
+those two compete, exactness wins and we pay the groups. It is the same
+verdict, for the same reason, as the 52 KV-publication splits of
 [Ch 15 §15.9](15-kv-store-and-the-ring.md).
 
 ## 23.4 Snapshots: logical order going out, rotation preserved coming back
+
+What has to be true for a cache to leave the process and come back without
+changing a single logit? The going-out half of that question is plumbing. The
+coming-back half is where the ring taught us something we did not expect, and
+it is the one idea in this chapter worth slowing down for.
 
 To hand a plane to anything outside the engine — a durable pack
 ([Ch 24](24-kvpack-the-format.md)), a migration ([Ch 26](26-delta-handoff-and-migration.md))
@@ -204,13 +248,24 @@ for logical_offset in 0..self.len {
 }
 ```
 
-The reverse — `detached_from` (`decode.rs:351-417`) — is where the ring
-teaches its one numerics lesson, and [Ch 15 §15.6](15-kv-store-and-the-ring.md)
-quoted the load-bearing comment: attention scans rows in physical order,
-float accumulation is order-sensitive, so a restore "packed at origin 0 can
+Now the reverse, `detached_from` (`decode.rs:351-417`), and the fork we
+walked into. The tidy way to install a snapshot is to take the rows in
+ascending logical order and lay them down in ascending physical order
+starting at the front of the buffer. Every row is present, every row sits in
+the right sequence relative to its neighbours, and the plane's contents are
+by any structural test identical to the session you captured. We would have
+called that a correct restore. The bitwise replay test disagreed.
+
+[Ch 15 §15.6](15-kv-store-and-the-ring.md) quoted the load-bearing comment,
+and it is the explanation: attention scans rows in physical order, float
+accumulation is order-sensitive, so a restore "packed at origin 0 can
 never replay a wrapped live session's logits bitwise"
-(`decode.rs:376-380`). The fix is one line of arithmetic plus a
-layout-aware scatter:
+(`decode.rs:376-380`). Say it the other way round, because this is the part
+that trips people up: floating-point addition is not associative, the
+attention reduction sums over rows in the order they physically sit, and
+therefore *where a row sits is part of the answer*. A neatly packed restore
+is arithmetically tidy and numerically a different session. The fix is one
+line of arithmetic plus a layout-aware scatter:
 
 ```text
 rotation = origin_logical % capacity        (decode.rs:383)
@@ -241,15 +296,28 @@ starting at `position − count`, a NoPE plane exactly `position` rows from 0,
 with byte lengths checked to the element (`cache.rs:62-118`). Two
 consequences worth naming. First, the interchange never carries rotation —
 rotation is *reconstructed* on install by the formula above, so a pack's
-bytes are layout-stable while replay stays bitwise. Second, the CPU oracle
-is deliberately not a ring — it allocates f32 full-history planes and
-applies the window as a mask — so CPU and Metal snapshots are mutually
-uninstallable (`F32Le` vs `ProductionF16Required`,
-`cache.rs:14-17`; `muser-kvpack/src/session.rs:164-166`)
+bytes are layout-stable while replay stays bitwise. That is worth restating,
+because it is the trick: the rotation is not data, it is a function of the
+logical origin, so it can be thrown away on the wire and rebuilt on arrival.
+
+Second, the CPU oracle is deliberately not a ring. It allocates f32
+full-history planes and applies the window as a mask, which means its
+snapshots and Metal's are mutually uninstallable — one side is `F32Le`, the
+other demands `ProductionF16Required`, and each refuses the other's bytes at
+the gate. We kept the receipts for that refusal: `cache.rs:14-17`,
+`muser-kvpack/src/session.rs:164-166`, and
 `[docs/kvpack-merge-handoff §4]`. Exactness by incompatibility: the two
 backends cannot accidentally share state that only one of them defined.
 
 ## 23.5 The growing plane: why head-major suits append and relocation
+
+The ring has now spent three sections earning its complications. Put the same
+questions to the other plane — where does a row go, what happens at the
+boundary, what does it cost to move it somewhere else — and the answers come
+back suspiciously short. Why does the growing plane get the easier life? The
+answer reaches past this chapter: the plane whose rows can be moved without
+changing what attention computes is the plane that becomes a portable asset
+later in the book, and the one that cannot is the plane that stays home.
 
 The NoPE plane's layout — `[kv_head][capacity][head_dim]` — pairs with its
 job in three ways, each anchored in code you have already met:
@@ -284,6 +352,15 @@ stream during CUDA prefill; SWA groups ride along as window snapshots,
 ([Ch 26](26-delta-handoff-and-migration.md)).
 
 ## 23.6 The third interaction: speculative blocks and the checkpoint
+
+Speculation puts a question to the cache that nothing else in the engine
+asks: can you undo? Everything so far has been an append discipline, and an
+append is a commitment — but a rejected draft block needs its rows to have
+never happened. The naive answer is to copy the cache before each round and
+put it back on rejection, and the two curves this chapter opened with price
+that immediately: it is a multi-gigabyte copy per speculative round, which is
+to say it is not an answer. What the engine does instead splits along the
+same seam as everything else here.
 
 DFlash speculative decoding ([Ch 8](08-the-dflash-draft.md),
 [Ch 33](33-speculation-and-the-distributed-verdict.md)) proposes a block of
@@ -364,6 +441,12 @@ content, newest complete turn, and output reserve cannot fit"
 (`openai.rs:5311-5315`). The raw path keeps a configured prefix plus the
 newest suffix (`compact_raw_prompt`, `openai.rs:5338-5354`).
 
+So the server knows what to keep. The open question is how the retained
+conversation becomes a live cache again — and the cheap-looking move, editing
+the dropped turns out of the cache in place and sliding the survivors down,
+is the one that cannot work here. Hold that thought for a few paragraphs; the
+reason is worth earning rather than asserting.
+
 **The rebuild is a staging production with atomic publication.** The
 retained context is re-prefilled into the runtime's one hidden
 full-capacity session — `staging`, "deliberately outside `slots`, so it can
@@ -403,31 +486,46 @@ must validate their lineage against the stored replay plan — the retained
 turns must appear "as one exact ordered run under identical leading system
 content" (`openai.rs:5408-5413`).
 
-Why rebuild instead of truncating the live cache in place? The retained set
-is a prefix (system) plus a suffix (newest turns) with a hole in the middle:
-every token after the hole changes logical position, and on the 39 RoPE
-layers a changed position means changed key bytes ([Ch 14](14-qk-norm-and-rope.md))
-— the middle cannot simply be deleted. A fresh generation computes the
-retained context at its true positions, and the atomic swap makes the
-replacement all-or-nothing. The staging prefill is real work at real depth —
+Now the promised reason. Why rebuild instead of truncating the live cache in
+place? Because of the invariant we put in view at the start of the chapter,
+seen now from its other side. The retained set is a prefix (system) plus a
+suffix (newest turns) with a hole in the middle, and closing that hole moves
+every token after it to a new logical position. On the 39 RoPE layers a
+changed position means changed key bytes
+([Ch 14](14-qk-norm-and-rope.md)): those rows were rotated into their old
+positions at store time, so sliding the survivors down would leave a cache
+that is structurally plausible and numerically fiction. The middle cannot
+simply be deleted. A fresh generation computes the retained context at its
+true positions instead, and the atomic swap makes the replacement
+all-or-nothing. The staging prefill is real work at real depth —
 which is precisely the cost [Ch 25](25-warm-reuse.md)'s reuse ladder exists
 to skip when the prefix is *not* holed.
 
 ## 23.8 Tradeoffs
 
-**Explicit origins vs `position % capacity`.** The ancestor indexed KV by
-absolute position with the ring modulus "unwired/stubbed — a named OOB
-hazard muser fixed from day one" (`docs/extraction-manifest.md`, per
-[Ch 15](15-kv-store-and-the-ring.md)). Muser's two origin fields make the
-ring's rotation an explicit, checkpointable fact: restore can reproduce it
-(§23.4), speculative rollback can retain it (§23.6), and the route ladder
-can test it (below). The measured consequence of *not* having it is the
-ancestor's hazard record; the measured consequence of having it is the
-bitwise replay test named at `decode.rs:380`.
+**Explicit origins vs `position % capacity`.** The tempting design is the one
+the ancestor shipped: hold no origin state at all, index the cache by
+absolute token position, and let `position % capacity` find the row whenever
+the window has wrapped. It is one expression, there is nothing to keep in
+sync, and it looks like the modulus is doing the bookkeeping for free. The
+ancestor's own extraction manifest records where it ended up — the modulus
+arrived "unwired/stubbed — a named OOB hazard muser fixed from day one"
+(`docs/extraction-manifest.md`, per [Ch 15](15-kv-store-and-the-ring.md)).
+The lesson we took from that record is not "compute the modulus properly."
+It is that a rotation derived on demand is a rotation nobody can inspect,
+hand to a snapshot, or roll back — and this chapter needed all three. So
+Muser keeps the rotation as state: two origin fields make it an explicit,
+checkpointable fact, restore can reproduce it (§23.4), speculative rollback
+can retain it (§23.6), and the route ladder can test it (below). The measured
+consequence of *not* having it is the ancestor's hazard record; the measured
+consequence of having it is the bitwise replay test named at
+`decode.rs:380`.
 
-**The compact ring vs the pinned kernel's addressing.** The route predicate
-for llama's pinned SWA vec kernel accepts only rings the kernel can read
-safely:
+**The compact ring vs the pinned kernel's addressing.** This is the fork we
+keep re-walking, because it is where "store the fewest bytes" and "reproduce
+the comparator's arithmetic exactly" pull in opposite directions. The route
+predicate for llama's pinned SWA vec kernel accepts only rings the kernel can
+read safely:
 
 ```rust
 // crates/muser-engine/src/decode.rs:5646

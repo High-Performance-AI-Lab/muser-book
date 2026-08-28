@@ -21,9 +21,13 @@ a real walk of `encode_token` and its serving twin, not from a design doc.
 
 ## 10.1 Three regimes, one family of graphs
 
-An LLM generates text in regimes that differ enough that Muser compiles them
-as different routes over the same weights. Define them precisely, because
-every performance claim in this book is scoped to one of them:
+Before we can follow a token anywhere, we have to answer the question the
+engine itself answers first: what kind of work is this? An LLM generates
+text in regimes that differ enough that Muser compiles them as different
+routes over the same weights. Define them precisely, because every
+performance claim in this book is scoped to one of them — a throughput
+number quoted under the wrong regime is not a rounding error in the
+storytelling, it describes a different machine:
 
 - **[Prefill](../glossary.md#prefill)** — the first step of a generation: the
   entire prompt, all at once. Many query tokens hit each weight matrix, so
@@ -49,9 +53,11 @@ every performance claim in this book is scoped to one of them:
 
 ## 10.2 Two routes through the same 52 layers
 
-Here is the single most important routing fact in the engine, and it is
-stated in a code comment at the exact decision point. When serving hands the
-engine one token, `MetalMuseModel::forward_into` does this:
+So which graph does a single token actually run through — and why is the
+answer not simply "the fastest one we have"? Here is the single most
+important routing fact in the engine, and it is stated in a code comment at
+the exact decision point. When serving hands the engine one token,
+`MetalMuseModel::forward_into` does this:
 
 ```rust
 // crates/muser-engine/src/decode.rs:2077-2093
@@ -75,12 +81,22 @@ pub fn forward_into(
     }
 ```
 
-Read that comment twice. Muser *has* a single-token graph with fused
-residual/norm and fused gate-up kernels — Ferrite lineage, fast — and serving
-**refuses to use it**, because its floating-point rounding diverges from the
-pinned llama.cpp Metal graph by more than the public-logprob tolerance
-allows. Correctness gates speed. The consequences ripple through this whole
-chapter:
+Read that comment twice, because it records a fork we walked into with the
+opposite expectation. Muser inherited a single-token graph from Ferrite:
+fused residual/norm kernels, a fused gate-up kernel, fewer dispatches, less
+traffic. It was obviously the graph serving should use. We expected a free
+win and wired it into the hot path.
+
+What came back was arithmetic that no longer matched the comparator. Fusing
+a norm into an add changes the order the partial sums are accumulated in,
+and floating-point addition is not associative, so the same weights produced
+logits that were close — and not close enough. The divergence from the
+pinned llama.cpp Metal graph breached the public-logprob tolerance. The
+lesson we took was not "fusion is bad"; it was that on this engine a fused
+kernel earns the serving path by passing full-logit parity on its own,
+one kernel at a time, and until it does, its speed is unspendable.
+Correctness gates speed. So serving **refuses to use** the fast graph, and
+the consequences of that refusal ripple through this whole chapter:
 
 1. **The serving decode path is the one-row *batch* graph**: `forward_into`
    → `forward_batch` (`decode.rs:2857`) → `forward_batch_hidden`
@@ -92,10 +108,10 @@ chapter:
    policy (`forward_teacher_forced`, `decode.rs:2118-2137`) and the
    phase-profiling route (`MUSER_METAL_PHASE_PROFILE`, `decode.rs:5440`).
    Its op sequence is what Part IV narrates, because it is the cleanest
-   straight-line telling of the graph — and the batch route mirrors it
-   row-for-row (the packed multi-sequence encoder `encode_decode_group`,
-   `decode.rs:4954`, exists precisely to run "batch rows of the same op
-   sequence").
+   straight-line telling of the graph. Narrating it costs the reader
+   nothing: the batch route mirrors it row for row, and the packed
+   multi-sequence encoder `encode_decode_group` (`decode.rs:4954`) exists
+   precisely to run "batch rows of the same op sequence".
 3. **Multi-sequence decode packs up to four sequences into one graph**:
    `forward_decode_group` (`decode.rs:4869`) accepts `1..=4` models sharing
    one `MetalShared` executor, encodes all rows with one concurrent encoder,
@@ -103,17 +119,22 @@ chapter:
    the server's 250 µs `DecodeBatcher` coalesce window feeds
    [crates/muser-server/src/state.rs:231-254].
 
-Both routes acquire the scheduler before encoding — `AcceleratorWork::Decode`
-for one token, `AcceleratorWork::Prefill` per chunk (`decode.rs:2083-2084`,
-`decode.rs:2109`) — because one scheduler owns one accelerator, and decode
-outranks prefill when both want it [decode.rs:1040-1074].
+Whichever route runs, it stops at the same door before it encodes anything:
+it acquires the scheduler. A single token asks for `AcceleratorWork::Decode`,
+a prefill chunk asks for `AcceleratorWork::Prefill` per chunk
+(`decode.rs:2083-2084`, `decode.rs:2109`). The reason is ownership — one
+scheduler owns one accelerator — and when both kinds of work want that
+accelerator the contest is not a tie: decode outranks prefill
+[decode.rs:1040-1074].
 
 ## 10.3 The master diagram — one decode token, end to end
 
-This is the figure the rest of the book zooms into. Boxes are dispatch
-groups as the encoder actually issues them; **FUSED** marks a fusion that is
-live by default, and the two opt-in fusions are marked as such. The op order
-is `encode_token`'s, which the serving batch route mirrors.
+So far we have argued about *which* route runs. Now the walk itself: what
+happens to one token, in the order the GPU is actually told to do it? This
+is the figure the rest of the book zooms into. Boxes are dispatch groups as
+the encoder issues them; **FUSED** marks a fusion that is live by default,
+and the two opt-in fusions are marked as such. The op order is
+`encode_token`'s, which the serving batch route mirrors.
 
 ```mermaid
 flowchart TD
@@ -152,9 +173,11 @@ flowchart TD
 residual stream lives in two ping-ponging buffers (§10.4). Sampling is CPU
 work on the read-back row (§10.9).*
 
-**Read the fusions explicitly.** The route collapses several "logical" steps
-into single kernels; these are the fusions actually present in code, with
-their gates:
+**Read the fusions explicitly.** Fusions are where the diagram stops looking
+like the textbook, and they are where a reader gets lost: you go hunting for
+a step and it is not there, because it happens inside another one. So it is
+worth knowing exactly which logical steps the route collapses into single
+kernels, and what gates each collapse:
 
 - **(a) The dual-eps fused tails (boxes ⑩ and ⑬) — live by default.** One
   kernel, `muser_fused_norm_residual_rms_norm_32sg`
@@ -226,6 +249,12 @@ then "play" is pressed exactly once per token.
 
 ## 10.4 The residual stream — two buffers in a relay
 
+The master diagram moves a token through boxes. But where do the token's
+bytes actually sit while that happens, and who is allowed to overwrite them?
+Get this wrong and the symptom is not a crash — it is a layer reading a value one
+dispatch too late, which shows up much later as logits that are subtly, and
+unfixably, the wrong ones.
+
 In the ancestor book the residual stream was one buffer, mutated in place 56
 times. Muser's decode graph runs a two-buffer relay instead, and the code
 documents it at the top of the layer loop:
@@ -237,9 +266,10 @@ documents it at the top of the layer loop:
 // to `normed`, so no full-width copy dispatch is needed.
 ```
 
-(The `hidden`/`normed` in that comment are the *kernel parameters* of box
-⑩/⑬, not buffer names — the buffers are `activations.normed` and
-`activations.post_norm`.) Per fused tail — Figure 10.2 — the kernel does:
+One naming trap before the figure, because it costs an afternoon if you walk
+into it: the `hidden`/`normed` in that comment are the *kernel parameters* of
+box ⑩/⑬, not buffer names — the buffers are `activations.normed` and
+`activations.post_norm`. Per fused tail — Figure 10.2 — the kernel does:
 
 ```
     activations.normed        activations.post_norm       layer.post_attn_norm (w1)
@@ -275,8 +305,12 @@ layout is a consequence of the exactness contract, not a style choice.
 
 ## 10.5 The attention route ladder (box ⑦, up close)
 
-Attention is not one kernel but a ladder, selected per layer per token from
-the live KV plane's metadata. The predicates, verbatim from the route walk:
+Box ⑦ is the only box in the master diagram that hides a decision.
+Attention is not one kernel but a ladder: per layer, per token, the engine
+picks a rung by reading the live KV plane's metadata. Two questions settle it — is the
+pinned llama vec kernel *safe* on this plane, and does this layer's window
+let it run without padding? Here are the predicates that answer them,
+verbatim from the route walk:
 
 ```rust
 // crates/muser-engine/src/decode.rs:5646-5657
@@ -293,6 +327,17 @@ let llama_vec_rows = (strict_attention || self.kernels.has_llama_flash_attn_vec(
 // is a multiple of 32 so the vec kernel never pads.
 let llama_swa = llama_vec_rows && plane.len.is_multiple_of(32);
 ```
+
+Read that middle comment as the scar it is. The vec kernel is both the fast
+rung and the exact rung — it is the comparator's own arithmetic — so the
+tempting rule is "take it whenever it exists." A deliberately tiny raw
+session breaks that rule. The kernel rounds its KV reads up to a fixed block
+size; a session whose backing allocation is smaller than one block gets read
+past its end; and the failure does not announce itself as a crash. It comes
+back as NaNs spread across the full distribution, which is the worst failure
+mode there is — silent, and it looks like a model bug rather than a routing
+bug. So the predicate is fail-closed: the plane must *prove* the fast rung is
+safe, or the engine takes a rung it can defend.
 
 The four rungs the predicates select between (`decode.rs:5658-5792`):
 
@@ -320,6 +365,11 @@ so no physical placement is ever derived from absolute position
 [decode.rs:265-284].
 
 ## 10.6 Overlay one: the DFlash draft/verify/accept loop
+
+Everything so far buys exactly one token per trip through the master
+diagram. Can a trip be made to pay for more than one? That is the question
+the speculative lane asks, and its answer is a bet: guess ahead cheaply, then check the
+guesses against the real model instead of trusting them.
 
 Plain decode proposes one token at a time. The speculative lane wraps the
 same graph in a three-beat loop — draft, verify, accept — and its Metal
@@ -356,14 +406,16 @@ copying the complete multi-gigabyte cache on every DFlash round"
 Three properties of this loop carry the engine's exactness culture:
 
 1. **Verification is exact and CPU-side.** Acceptance compares every drafted
-   token against the target's *full distributions* — the same read-back
-   vocab rows plain decode samples from (`verify_full_speculative_mt_ordered`
-   [crates/muser-engine/src/sampling.rs:1033]; the engine entry points are
-   `Session::verify_batch` and `begin/finish_dflash_verify_suffix`
-   [crates/muser-engine/src/api.rs:913; decode.rs:3298, 3635]). No
-   approximate verifier ever touches the accept decision; the distributed
-   verifier lane that tried otherwise was measured and rejected
-   [Ch 33](33-speculation-and-the-distributed-verdict.md).
+   token against the target's *full distributions* — the very same read-back
+   vocab rows that plain decode samples from. Nothing cheaper is allowed
+   near the accept decision: no approximate verifier, no shortcut on the
+   logits. One lane did try the shortcut, and the distributed verifier was
+   measured and rejected for it; that war story is
+   [Ch 33](33-speculation-and-the-distributed-verdict.md). The code to read
+   is `verify_full_speculative_mt_ordered`
+   [crates/muser-engine/src/sampling.rs:1033], reached from the engine entry
+   points `Session::verify_batch` and `begin/finish_dflash_verify_suffix`
+   [crates/muser-engine/src/api.rs:913; decode.rs:3298, 3635].
 2. **The split point is a real command-buffer boundary with a correctness
    rule.** The suffix re-materializes its entry norm from the authoritative
    residual instead of trusting a cross-command-buffer temporary: *"Do not
@@ -373,13 +425,14 @@ Three properties of this loop carry the engine's exactness culture:
    rollback restores only what a ≤16-row block could have overwritten
    [decode.rs:1413-1419].
 
-What it buys, with the campaign's scope language: the kquant speculative
-lane is the engine's speed lane — the 107.9 tok/s figure survives as the
-qualification bar, and the current synthetic restatement at the fixed draft
-window is decode ratio 1.23692 at 2,048 context (five of five exact reps;
-synthetic only, never a natural-text workload claim) `[claims #15]`. The
-loop's deep treatment — including why native NVFP4 speculation is
-fail-closed by construction — is
+So what does the bet actually pay? The kquant speculative lane is the
+engine's speed lane: the 107.9 tok/s figure survives as the qualification
+bar, and the current synthetic restatement at the fixed draft window is
+decode ratio 1.23692 at 2,048 context. The scope language around that ratio
+matters as much as the ratio does — five of five exact reps, synthetic only,
+never a natural-text workload claim — and the row that holds that scope is
+retained: `[claims #15]`. The loop's deep treatment, including why native
+NVFP4 speculation is fail-closed by construction, is
 [Ch 33](33-speculation-and-the-distributed-verdict.md).
 
 ## 10.7 Overlay two: the handoff that plants KV before decode starts
@@ -427,29 +480,38 @@ local prefill of the same tokens. The delta variant
 prefixes: the held `[0, cut)` span is copied out of the live planes with the
 exact ring mapping and only suffix tiles are accepted.
 
-The wire schedule exploits Ch 9's two-class split deliberately: the 13 NoPE
-layers' tiles are position-free bytes, so they stream during CUDA prefill
-(one HMAC/TLS frame per 512-token NoPE tile, ~6.5 MiB), while the SWA tail
-groups ship in the last ubatches (micro-batches) [crates/muser-cluster/src/schedule.rs:1-12,
-20]. What it buys is the Part VI headline — TTFT (time to first token)
-4.149× faster than local prefill at 130,815 tokens (remote 137.405 s vs
-local 570.122 s, the EEE-off arm — Energy-Efficient Ethernet disabled on
-the link, [Ch 31](31-the-wire-discipline.md)'s invariant — five counted
-reps) `[claims #6]` — and the warm-reuse ladder of
-[Ch 25](25-warm-reuse.md). The transport itself (mTLS, the HMAC-sealed
-manifest, the replay ledger) is
-[Ch 30](30-handoff-v2-transport.md); the precision trust question is
+The wire schedule turns Ch 9's two-class split into a scheduling advantage.
+The 13 NoPE layers' tiles are position-free bytes — nothing in them depends
+on where in a ring they will eventually sit — so they need not wait for the
+producer to finish. They stream during CUDA prefill, one HMAC/TLS frame per
+512-token NoPE tile, ~6.5 MiB. The SWA tiles have no such freedom, and the
+tail groups ship in the last ubatches (micro-batches) [crates/muser-cluster/src/schedule.rs:1-12,
+20].
+
+What that overlap buys is the Part VI headline: TTFT (time to first token)
+4.149× faster than local prefill at 130,815 tokens, remote 137.405 s against
+local 570.122 s. The arm matters as much as the ratio — this is the EEE-off
+arm, Energy-Efficient Ethernet disabled on the link, which is
+[Ch 31](31-the-wire-discipline.md)'s invariant — and it is five counted
+reps. We kept the claims row that carries the whole scope: `[claims #6]`.
+Reusing a planted cache across requests is its own ladder, in
+[Ch 25](25-warm-reuse.md); the transport underneath — mTLS, the HMAC-sealed
+manifest, the replay ledger — is [Ch 30](30-handoff-v2-transport.md); and
+whether NVFP4-produced KV can be trusted at all is
 [Ch 32](32-precision-across-the-handoff.md).
 
 ## 10.8 Where every buffer lives
 
-Figure 10.1 names buffers; this section sizes them. Two scopes matter:
-**per-sequence** state (each of up to four slots owns one set) and the
-**shared** executor (`MetalShared`: one context, one kernel set, one mmap'd
-weight arena — *"retaining one context, pipeline set, mapped weight arena,
-and GPU vector set avoids loading the 16+ GiB target once per serving slot"*
-[decode.rs:954-957]). Sizes below are derived; the arithmetic is shown so
-you can re-derive it.
+Figure 10.1 names buffers; this section sizes them — and on a machine with
+unified memory, sizing *is* design. How many sequences a Mac can serve at
+once is settled less by the kernels than by which allocations every sequence
+must own and which can be paid for once. So two scopes matter here.
+**Per-sequence** state: each of up to four slots owns a full set.
+The **shared** executor `MetalShared`: one context, one kernel set, one
+mmap'd weight arena, retained deliberately because *"retaining one context,
+pipeline set, mapped weight arena, and GPU vector set avoids loading the
+16+ GiB target once per serving slot"* [decode.rs:954-957]. Sizes below are
+derived; the arithmetic is shown so you can re-derive it.
 
 **Table 10.2 — Per-sequence activation pool** (`Activations::new`,
 [decode.rs:897-952]; all GPU, all allocated once at session construction)
@@ -510,9 +572,11 @@ scheduling].
 
 ## 10.9 CPU vs GPU — the division of labor
 
-The GPU owns the entire arithmetic graph: embedding through softcap, one
-command buffer per token (§10.3). The CPU owns everything around it, and the
-serving loop shows the handoff explicitly:
+Where does the seam between the two processors fall, and who is holding the
+token when something goes wrong? The GPU owns the entire arithmetic graph —
+embedding through softcap, one command buffer per token (§10.3). The CPU owns
+everything around it. The serving loop shows both the handoff and the failure
+policy in the same few lines:
 
 ```rust
 // crates/muser-engine/src/api.rs:699-708
@@ -540,9 +604,12 @@ anyway to sample.
 
 ## 10.10 Prefill is a different graph
 
-Everything above is the decode route. When `forward_into` receives more than
-one token it becomes prefill, and the route changes shape at every joint
-(`decode.rs:2095-2113`):
+Everything above is the decode route. Prefill earns a section even in a
+decode book for a reason worth stating plainly: the remote lane above is an
+argument about *this* graph, and you cannot judge what shipping a cache
+across a wire saves until you know what the local prefill it replaces would
+have cost. When `forward_into` receives more than one token it becomes
+prefill, and the route changes shape at every joint (`decode.rs:2095-2113`):
 
 - **Chunking:** prompts stream through a 512-row physical batch
   (`PREFILL_BATCH_TOKENS`, `decode.rs:53`); once any decoder is queued the
@@ -569,40 +636,55 @@ remote lane that replaces Mac-side prefill entirely is Part VI.
 
 ## 10.11 Tradeoffs
 
-Three structural bets were made in this code, each with a measured
-consequence:
+Three structural bets shaped this code. None was obvious in advance, and
+each was settled by a measurement that contradicted what somebody — usually
+us — expected.
 
 **Bet 1 — route serving decode through the one-row batch graph, not the
-fused single-token graph.** The cost is giving up the Ferrite-lineage fused
-kernels on the hot path; the measured basis is the routing comment itself —
-the fused kernels' rounding *"breaches public logprob tolerance"* against
-the pinned llama graph [decode.rs:2085-2091] — and the dispatch-gap
-postmortem that quantified the class of problem: the hybrid
-retained-activation schedule reached max normalized-logprob error 3.197e-4
-against a 1e-4 contract (201,970 of 202,048 logits differing, first
-divergence one f16 ULP in layer-1 V) and was removed
-[docs/decode-dispatch-gap-20260815.md]. A verified-slow path beats an
+fused single-token graph.** The routing section told this fork from the
+code's side; here is what it cost and what settled it. The cost is real:
+the Ferrite-lineage fused kernels sit off the hot path, and the dispatch savings
+they were written for go unspent. The first piece of evidence is the routing
+comment itself — the fused kernels' rounding *"breaches public logprob
+tolerance"* against the pinned llama graph [decode.rs:2085-2091]. The second
+came from trying a variant and watching it fail. We ran a hybrid
+retained-activation schedule expecting the divergence to stay inside the
+parity contract, and it did not: max normalized-logprob error 3.197e-4
+against a 1e-4 contract, with 201,970 of 202,048 logits differing, and the
+first divergence traced to a single f16 ULP in layer-1 V. It was removed
+[docs/decode-dispatch-gap-20260815.md]. Sit with that ratio for a moment —
+one unit in the last place, in one tensor, in one early layer, and nearly
+the entire vocabulary row comes out different. A verified-slow path beats an
 unverified-fast path.
 
-**Bet 2 — keep the fused FFN gate-up kernel opt-in.** The imported
-`ffn_q4k_gate_up_silu_4r2s` fusion is *off* by default because the pinned
-baseline throughput packet regressed with it enabled on this model
-[decode.rs:980-983]. Fusing is not automatically faster; here the measured
-verdict went the other way, and the code preserves the experiment behind a
-flag rather than deleting it.
+**Bet 2 — keep the fused FFN gate-up kernel opt-in.** This one we expected
+to win outright. The imported `ffn_q4k_gate_up_silu_4r2s` reads both Q4_K
+weight matrices once rather than twice, which is strictly less traffic in
+the hungriest part of the layer, and on the ancestor engine it paid. So we
+enabled it and ran the pinned baseline throughput packet — and the packet
+regressed on this model [decode.rs:980-983]. Fusing is not automatically
+faster; the arithmetic on paper does not overturn a measurement. The code
+keeps the experiment behind a flag instead of deleting it, because what lost
+here is a result about this model on this machine, not a verdict on the
+kernel forever.
 
 **Bet 3 — one concurrent command buffer per token, explicit barriers, no
-scheduler surgery to close the dispatch gap.** The one-token diagnostic at a
-2,048-token fixture counted 760 profiling closures against the legacy
-graph's 564 — a +196 delta that reconciles exactly into 104 norm-boundary
-groups + 39 SWA staging groups + 52 KV-publication splits + 1 bookkeeping
-copy [docs/decode-dispatch-gap-20260815.md §label table]. Every cheap
-removal changed bits (Bet 1's numbers); the one *exact* removal — the last
-row copy — bought −0.136 ms GPU (−0.34 %) on a 40.330 ms token
-[docs/decode-dispatch-gap-20260815.md §Landed and rejected reductions]. The
-gap is structural, and the engine chose exactness over the ~3 % it could
-have stolen. [Ch 35](35-ordering-hazards-and-the-dispatch-gap.md) tells the
-whole story.
+scheduler surgery to close the dispatch gap.** The gap announced itself as
+waste. The one-token diagnostic at a 2,048-token fixture counted 760
+profiling closures against the legacy graph's 564 — and a delta that size
+looks like something you can simply delete. So we went hunting for what to
+remove, and the first surprise was that nothing was left over: the +196
+delta reconciles exactly into 104 norm-boundary groups + 39 SWA staging
+groups + 52 KV-publication splits + 1 bookkeeping copy
+[docs/decode-dispatch-gap-20260815.md §label table]. Every one of those
+groups exists because something must be ordered before something else. The
+second surprise was the price list. Every cheap removal changed bits — those
+are Bet 1's numbers — and the one *exact* removal, the last row copy, bought
+−0.136 ms GPU (−0.34 %) on a 40.330 ms token
+[docs/decode-dispatch-gap-20260815.md §Landed and rejected reductions]. That
+is what a structural gap looks like as opposed to a sloppy one: the engine
+chose exactness over the ~3 % it could have stolen.
+[Ch 35](35-ordering-hazards-and-the-dispatch-gap.md) tells the whole story.
 
 ## 10.12 What comes next
 

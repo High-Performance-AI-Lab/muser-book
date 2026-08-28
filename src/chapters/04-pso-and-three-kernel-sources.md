@@ -12,7 +12,14 @@
 
 In [Ch 2](02-metal-compute-model.md) we said the host API gives you "a
 bundle of compiled kernel functions, addressable by name," and deferred
-*how* a `.metal` text file becomes that bundle. There are **three** stages
+*how* a `.metal` text file becomes that bundle. That deferral is now due,
+and it turns out to matter for more than curiosity: Muser feeds three
+different kernel sources into one dispatch path, and a benchmark that
+cannot say which of the three ran is not a measurement of anything. So
+this chapter goes in two movements — first the machinery, then the
+discipline that keeps the machinery honest.
+
+Start with the machinery. There are **three** stages
 between "text a human wrote" and "a kernel the GPU can run":
 
 1. **`.metal` source text** — a C++ dialect a human writes. Pure text.
@@ -64,6 +71,11 @@ section (§4.9) costs this out.
 
 ## 4.2 Source 1: the concatenated fast-math library
 
+Begin with the library the engine actually serves tokens from. The
+question is a small one with a long shadow: what exactly gets compiled,
+under which compiler settings, and what could the *order* of the files
+possibly have to do with anything?
+
 The main library is one giant source string built from 24 `.metal` files
 with `include_str!` and `concat!`, compiled once at `MetalContext::new()`:
 
@@ -99,7 +111,8 @@ let library = device
 *(the elided lines are consecutive `include_str!` entries; nothing else is
 removed.)*
 
-Three knobs deserve a sentence each.
+Three choices are buried in those few lines, and each one is a place
+where the obvious alternative would have cost us something.
 
 **Fast math ON for the serving library.** `set_fast_math_enabled(true)`
 lets the compiler assume NaN/Inf never happen and reorder or fuse
@@ -109,12 +122,20 @@ floating-point operations. The comment records both the justification
 safety argument — "exact Muse parity is guarded at the token boundary,"
 i.e., the exactness contract is enforced by comparing generated tokens
 against the pinned comparator, not by hoping the arithmetic is bit-stable.
-The one thing fast-math must never touch in this engine — trigonometry at
-large angles in RoPE — was a real accuracy lesson in the ancestor
-(`precise::cos`/`precise::sin`, `[ferrite-book Ch 4 §10]`); Muser's RoPE
-kernels precompute the frequency table on the CPU at load
-(`[crates/muser-engine/src/decode.rs:1256-1263]`), which removes the
-in-kernel `powf`/trig hazard entirely.
+
+Fast math is not safe everywhere, though, and the ancestor found the edge
+the hard way. Ferrite let the fast-math compiler near RoPE's trigonometry,
+where the rotation angle grows with position; at large angles the fast
+approximations drift, and the repair was to force `precise::cos` and
+`precise::sin` on exactly those calls `[ferrite-book Ch 4 §10]`. Muser
+does not repeat the repair — it removes the hazard. The RoPE frequency
+table is precomputed on the CPU at load
+(`[crates/muser-engine/src/decode.rs:1256-1263]`), so no `powf` and no
+trig call survives into the kernel to be approximated in the first place.
+The distinction is worth holding on to: fast math is cheap insurance on a
+long chain of multiply-adds whose *result* you check at the token
+boundary, and a liability wherever the absolute accuracy of a single
+transcendental is the thing you depend on.
 
 **MSL V3.1, pinned.** `set_language_version(V3_1)` fixes the dialect the
 compiler accepts. A shader using a newer feature fails loudly at
@@ -132,6 +153,12 @@ Ferrite at `a85048a90` is readable straight from the concat
 per-file SHA-256 manifest in `[docs/extraction-manifest.md]`.
 
 ## 4.3 Source 2: the strict-f32 cross-vendor library
+
+Most engines have one shader library. Muser has a second copy of some of
+the same kernels, and the reason has nothing to do with this Mac — it has
+to do with a machine on the other end of a network cable. Watch for the
+inversion: here a compiler flag stops being a build setting and becomes
+part of an API.
 
 The second library is the *same two source files*, recompiled with fast
 math **off**:
@@ -171,12 +198,22 @@ the ops that must match the producer (e.g.
 `[crates/muser-engine/src/metal/encode/gate.rs:14-18]`,
 `[crates/muser-engine/src/metal/encode/norm.rs:257-260]`). One source, two
 compilation contracts, selected at dispatch — the compiler flag becomes
-part of the numerical API. [Ch 32](32-precision-across-the-handoff.md) is
+part of the numerical API. Put it the other way round, because this is
+the part that trips people up: a fast-math setting is normally something
+you choose once and never think about again, buried in a build file. Here
+it is a value the dispatch code reads at encode time, as consequential to
+the result as a dtype. [Ch 32](32-precision-across-the-handoff.md) is
 where this discipline earns its keep.
 
 ## 4.4 Source 3: the pinned llama.cpp metallib
 
-The third source is not Muser source at all. When `MUSER_GGML_METALLIB`
+The third source answers a question the first two cannot. What do you do
+about a kernel whose output you must reproduce *exactly*, when the thing
+you have to match is somebody else's compiled binary? Rewriting it in
+your own dialect gets you close, and close is the one answer this engine
+cannot use. So Muser does not rewrite it at all.
+
+Which is why the third source is not Muser source at all. When `MUSER_GGML_METALLIB`
 points at a prebuilt llama.cpp `.metallib`, the device loads it as a
 library:
 
@@ -244,7 +281,10 @@ This is a fail-closed no-fallback policy: the engine refuses to
 silently substitute *different arithmetic* for a dtype whose exactness is
 contractual.
 
-The metallib itself is built by
+None of that strictness means anything if the metallib is itself a
+mystery binary — pinning your arithmetic to a file whose origin nobody
+can state is not pinning at all. So the build of that file is the
+strictest step in the whole chain. The metallib itself is built by
 `[scripts/compile_llama_metallib.sh]`, and the script is almost a
 manifesto of provenance discipline: it refuses to run unless the llama.cpp
 checkout's HEAD equals the requested revision and the three Metal source
@@ -253,9 +293,17 @@ replace an existing output or receipt, making artifacts append-only
 (`:78-85`); and it writes a `muser.llama_metallib.source_receipt.v1` JSON
 binding the binary's SHA-256 and size to the source commit, the source
 tree hash, per-file SHA-256s, the merged-source hash, the SDK version,
-the Metal compiler, and the Xcode version (`:129-180`).
+the Metal compiler, and the Xcode version (`:129-180`). Two refusals and
+a receipt: the artifact cannot come from a dirty tree, cannot be quietly
+replaced by a newer one wearing the same name, and cannot be used without
+a record of which commit and which toolchain produced it.
 
 ## 4.5 From functions to PSOs: the registry and the cache
+
+A library is not runnable; the last stage turns named functions into
+machine code for this GPU. The interesting question about any cache is
+what it does when it misses, and this one answers it in a way most caches
+would not dare to.
 
 Once the libraries exist, every kernel is compiled to a PSO exactly once,
 at `MetalKernels::new`. The fixed serving set is a compile-time-checked
@@ -316,12 +364,16 @@ impl PsoCache {
 }
 ```
 
-Three things to notice. First, this cache is **in-process only** — there
-is no on-disk `MTLBinaryArchive`; every process start recompiles all 66
-PSOs plus the specialized families below. Second, the panic on a miss is
-the policy: a typo'd kernel name crashes at first use, loudly, instead of
-dispatching something else. Third, the comment about function constants
-teases the next section.
+Three decisions are visible in those forty lines. The first one costs
+time: the cache is **in-process only** — there is no on-disk
+`MTLBinaryArchive`, so every process start recompiles all 66 PSOs plus
+the specialized families below. The second buys safety at the price of
+politeness. The panic on a miss *is* the policy: a typo'd kernel name
+takes the process down at first use, loudly, rather than resolving to
+something else and dispatching it. In an engine whose correctness gate is
+"same logits as the comparator," running the wrong kernel successfully is
+the failure you least want to survive. The third decision is the comment
+about function constants, and it is the whole of the next section.
 
 Beyond the 66, `MetalKernels` holds *typed fields* for everything optional
 or specialized: the cross-vendor PSOs (one field each,
@@ -417,33 +469,52 @@ these `mul_mv_ext` kernels at batch size four. Keeping that dispatch
 boundary is required for numerical API parity as well as performance
 parity" (`[crates/muser-engine/src/metal/encode.rs:169-178]`).
 
-One lazy sibling: the multi-column matvec family
-(`matvec_multicol.metal`) is compiled by its own
-`new_library_with_source` call rather than living in the main concat —
-its constructor is called unconditionally for the always-on exact
-multi-sequence decode route, with the experimental DFlash verify route
-still gated by `MUSER_MULTI_COL_VERIFY`
+One family sits outside the concat, and we got it wrong on the first
+pass. The detour is worth taking, because the mistake is the kind this
+book exists to prevent.
+The multi-column matvec family (`matvec_multicol.metal`) is compiled by
+its own `new_library_with_source` call rather than living in the main
+source string. Its module doc at `multicol.rs:12-14` states plainly that
+"nothing here is compiled unless `MUSER_MULTI_COL_VERIFY` is set", and we
+took that at face value — an experimental family behind an env var is
+exactly what you would expect, and it meant this whole group could be
+left out of the startup accounting.
+
+Then we read the constructor, and it does not agree with the doc. The
+multicol builder is called unconditionally, because the exact
+multi-sequence decode route is always on; only the experimental DFlash
+verify route is still gated by that variable
 (`[crates/muser-engine/src/metal/encode.rs:294-297]`,
-`[crates/muser-engine/src/metal/encode/multicol.rs:90-132]`). (The
-module doc at `multicol.rs:12-14` still says "nothing here is compiled
-unless `MUSER_MULTI_COL_VERIFY` is set" — stale relative to the
-constructor; the code wins, as ever in this book.)
+`[crates/muser-engine/src/metal/encode/multicol.rs:90-132]`). The comment
+is simply stale. The lesson is the cheap one to learn here rather than
+downstream: a module doc describes an intent at the moment it was
+written, and the constructor describes what your process does tonight.
+The code wins, as ever in this book — and the multicol pipelines are
+counted in the cold-start tally of the next section, which they would not
+have been if we had trusted the prose.
 
 ## 4.7 Fingerprinted selection: making a silent fallback impossible
 
-Here is the chapter's real subject. An engine with three kernel sources
-has three ways to *not* use the kernel you think it is using: the env var
+Here is the chapter's real subject, and the question the machinery above
+exists to answer: when you run the engine, how do you *know* which
+kernels ran? An engine with three kernel sources
+has four ways to *not* use the kernel you think it is using: the env var
 is unset, the metallib failed to load, the flag is inert, the fallback
-route took over. Each of those silently changes the arithmetic — and
-therefore the numbers — of every benchmark that follows. Muser's answer
+route took over. None of those four announces itself. Each silently
+changes the arithmetic — and
+therefore the numbers — of every benchmark that follows, which means a
+performance result and a correctness result can both be true of a route
+nobody intended to measure. Muser's answer
 is layered.
 
-**Layer 1 — absence is loud where absence matters.** The Q6_K
-no-fallback policy of §4.4 (load aborts with
-`MissingProjectionKernel`). For kernels where a fallback *is* allowed,
-the tests that need the pinned kernels say so and skip honestly:
-`"skipping: MUSER_GGML_METALLIB is unset"`
-(`[crates/muser-engine/src/metal/encode/multicol.rs:462]`).
+**Layer 1 — absence is loud where absence matters.** We have already met
+the sharpest version of this in §4.4: a Q6_K projection with no metallib
+does not fall back, it aborts the load with `MissingProjectionKernel`.
+Where a fallback *is* permitted, the same honesty moves into the test
+suite. A test that needs the pinned kernels does not quietly pass on the
+fallback path and let you read its green tick as evidence about llama's
+kernels; it says `"skipping: MUSER_GGML_METALLIB is unset"` and declines
+to run (`[crates/muser-engine/src/metal/encode/multicol.rs:462]`).
 
 **Layer 2 — the record states what ran, by hashing it.** The benchmark
 harness resolves its *actual* route and records a SHA-256 of the metallib
@@ -477,10 +548,13 @@ qualifier binary goes further and *refuses ambiguity*: if
 argument, it errors out rather than running with either
 (`[crates/muser-bench/src/composite_dflash.rs:246-251]`).
 
-**Layer 3 — artifacts are append-only and receipted.** The metallib build
-script of §4.4 (refuses to overwrite; source receipt binding commit, tree,
-per-file hashes, toolchain). The receipt path can be threaded through the
-node-onboarding orchestrator via `MUSER_GGML_METALLIB_RECEIPT`
+**Layer 3 — artifacts are append-only and receipted.** A hash of the
+loaded file only helps if that file has a history, which is the job of
+the build script from §4.4: it will not overwrite an existing output, and
+it emits the source receipt that binds the binary to its commit, its
+tree, its per-file hashes, and its toolchain. That receipt is not just
+for whoever built the file. Its path travels — the node-onboarding
+orchestrator accepts it via `MUSER_GGML_METALLIB_RECEIPT`
 (`[crates/muser-server/src/node/mod.rs:80-83]`), so even the remote-lane
 qualification knows which provenance it measured.
 
@@ -502,19 +576,31 @@ qualification knows which provenance it measured.
 
 ## 4.8 What it costs to start the engine
 
-Adding up the chapter in wall-clock terms. At `MetalMuseModel` load, the
+Every choice in this chapter — compile at runtime, keep two contracts of
+the same kernels, load a third library from disk — is paid in the same
+currency, at the same moment: process start, while somebody waits. So
+what does the reader's engine actually do before the first token appears?
+
+At `MetalMuseModel` load, the
 engine compiles: the 24-file fast-math library, the 2-file strict-f32
 library, optionally loads the metallib, then builds **159 PSOs** — 66
 registry PSOs, 25 cross-vendor PSOs, 55 ggml/llama family PSOs (matvecs,
 matmuls, `mul_mv_ext`, and the flash-attention specializations), 9
 multicol PSOs, and 4 Ferrite f16 PSOs, counted from the constructor at
-`[crates/muser-engine/src/metal/encode.rs:202-315]` — before any weight
-page is touched ([Ch 3](03-unified-memory-and-buffers.md)'s mmap is
-demand-paged behind this). No Muser document measures the total
-cold-start compile time [unverified]; the design bet is that one-time
-compile at init is simpler than shipping and versioning a build artifact,
-and that bet is recorded in the module doc's "no Xcode step, pure-source
-checkout" (`[crates/muser-engine/src/lib.rs:163-171]`).
+`[crates/muser-engine/src/metal/encode.rs:202-315]`. All of that happens
+before any weight page is touched
+([Ch 3](03-unified-memory-and-buffers.md)'s mmap is demand-paged behind
+this) — the model file is barely being read while the compiler works.
+
+We went looking for the wall-clock figure that belongs at the end of that
+paragraph, and it does not exist: no Muser document measures the total
+cold-start compile time [unverified]. The absence is worth naming rather
+than papering over, because it is where this chapter's evidence runs out.
+What *is* recorded is the bet — that a one-time compile at init is
+simpler than shipping and versioning a build artifact — in the module
+doc's own words, "no Xcode step, pure-source checkout"
+(`[crates/muser-engine/src/lib.rs:163-171]`). The book can tell you the
+bet was taken deliberately; it cannot yet tell you the premium.
 
 ## 4.9 Tradeoffs
 
@@ -539,11 +625,14 @@ library everywhere — was measured by implication in the source comment:
 disabling fast math "materially slows attention, FFN, and the
 norm/tiny-op stack" (`[crates/muser-engine/src/metal/context.rs:49-52]`);
 the exact percentage is not recorded [unverified]. The deeper alternative
-— trust fast-math everywhere and rely on token-level tolerance for
-cross-vendor checks — is exactly what [Ch 32](32-precision-across-the-handoff.md)
-shows this program cannot accept: one f16 ULP in a layer-1 V tile was
-enough to cascade into 51.7 M differing logits during the wizard's
-arithmetic-ABI chase `[ledger §2b, attempts 10–31]`.
+is tempting enough to name plainly: trust fast-math everywhere and rely
+on token-level tolerance for cross-vendor checks, and the second library
+disappears entirely. [Ch 32](32-precision-across-the-handoff.md) is the
+chapter that closes that door. During the wizard's arithmetic-ABI chase,
+one f16 ULP in a layer-1 V tile was enough to cascade into 51.7 M
+differing logits `[ledger §2b, attempts 10–31]`. A tolerance wide enough
+to absorb a divergence like that is a tolerance wide enough to absorb a
+bug, which is the same as having no gate at all.
 
 **Pinning llama's kernels vs re-expressing them.** Muser could have
 rewritten the Q6_K matvec or the flash-attention family in its own source

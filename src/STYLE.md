@@ -176,3 +176,24 @@ when..."*, *"Fusing is generally faster"* — without a measurement.
 - A number with no source tag.
 - A missing entry/exit segue.
 - Ferrite-lineage numbers presented as Muser measurements.
+
+## Narrative: receipts need a story
+
+The governing essay is ["Notes on the Synthesis of
+Labyrinths"](https://qa.increment.com/documentation/notes-on-the-synthesis-of-labyrinths/):
+present the labyrinth of the work — the forks, the dead ends, the reasoning
+at each junction — not a flattened list of outcomes. Receipts stay, always;
+what changes is how they enter the prose.
+
+- Open a section on the question it answers before any apparatus appears.
+- A failed attempt is a war story, in order: the fork, what we tried, what
+  we expected, what happened, what it taught, and only then what shipped.
+  Never a staccato list of verdicts with citations.
+- Weave evidence into the sentence ("the run that proved this is retained:
+  [...]") instead of stacking bracket tags mid-thought. One tag per
+  sentence is a good ceiling; the rest can close the paragraph.
+- A digression must announce its own relevance in its first sentence.
+- Restate the one or two genuinely hard ideas of a chapter in fresh words;
+  pay for it by abbreviating inventory.
+- The voice is "we": we tried things, expected things, and were surprised,
+  and the reader is walking beside us.

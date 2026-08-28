@@ -18,18 +18,27 @@ care lives: in declared policies, sealed bounds, mode-separated
 identities, an integer-dot anchor, and a drift record that is published
 even when one row of it is unflattering.
 
-The demand is not sentimental. When the GX10 prefills, a different
-machine — CUDA kernels, NVFP4 tensor cores, cuBLAS reduction orders,
-Blackwell software E2M1 rounding — computes the KV cache that the Mac's
-decoder will treat as ground truth for every subsequent token. The two
-engines do not even agree on *how to sum*: the wizard campaign traced one
-mismatch to "CUDA's serial 128-dim attention reduction vs Metal's
-32-lane tree, and F32 vs F16 residual materialization," fixed only after
-a layer-0 ladder chase (`attn_norm-0` element 4 → K RoPE 256 →
-`attn_out-0` element 4,096) isolated two arithmetic-ABI splits
-`[measured-numbers §2 Arc 4; ledger §2b, 2026-08-24]`. Nobody in the
-field achieves bitwise CUDA↔Metal equivalence — llama.cpp itself uses
-tolerance-based backend diffs `[docs/disaggregated-prefill-sealing-
+The demand is not sentimental. Ask first what breaks if this is wrong.
+When the GX10 prefills, a different machine — CUDA kernels, NVFP4 tensor
+cores, cuBLAS reduction orders, Blackwell software E2M1 rounding —
+computes the KV cache that the Mac's decoder will treat as ground truth
+for every subsequent token. Not for one token: for all of them. A
+producer that is slightly wrong does not announce itself with a crash.
+It hands over a plausible cache, and the Mac then generates fluent,
+confident text on a foundation nobody checked.
+
+We went in expecting the disagreements to be rounding noise. They were
+not even the same *kind* of arithmetic. The two engines do not agree on
+*how to sum*: the wizard campaign traced one mismatch to "CUDA's serial
+128-dim attention reduction vs Metal's 32-lane tree, and F32 vs F16
+residual materialization," and that only surfaced after a layer-0 ladder
+chase (`attn_norm-0` element 4 → K RoPE 256 → `attn_out-0` element
+4,096) isolated two arithmetic-ABI splits. We kept the trail:
+`[measured-numbers §2 Arc 4; ledger §2b, 2026-08-24]`.
+
+Nor is this a Muser embarrassment that trying harder would fix. Nobody
+in the field achieves bitwise CUDA↔Metal equivalence — llama.cpp itself
+uses tolerance-based backend diffs `[docs/disaggregated-prefill-sealing-
 plan-20260818.md §4]`. So "good enough" has to be a *contract*, and the
 contract has to be checkable. This chapter is about the three contracts
 Muser actually runs.
@@ -38,9 +47,12 @@ Muser actually runs.
 
 ## 32.1 The trust ladder
 
-Before the details, the shape. Muser's disaggregated lanes form a
-three-rung ladder, and every rung names what it costs and what it rules
-out (Figure 32.1):
+Before the details, the shape. The question to carry through the rest of
+the chapter is not "is the handoff correct" — that is unanswerable as
+posed — but *how much agreement did we buy, and what did each level of
+agreement cost?* Muser's disaggregated lanes answer it as a three-rung
+ladder, and every rung names its price and what it rules out
+(Figure 32.1):
 
 ```
                 THE TRUST LADDER (strictest at the top)
@@ -89,8 +101,16 @@ the reason the Mac never *trusts* when it can re-check (§32.12).
 
 ## 32.2 Declaring the policy: the rule is written before the run
 
-The native/text lane's contract is not a wiki page or a convention; it
-is a field in the frozen onboarding identity that both peers pin:
+Start with the question this section answers: *when two engines cannot
+agree exactly, who decides how much disagreement is acceptable — and
+when do they decide it?* The second half is the part with teeth. A rule
+invented once the outputs are in hand is not a rule; it is a description
+of what happened, wearing a rule's clothes. So Muser's rule is written
+down first, and written somewhere it cannot be quietly edited later.
+
+The native/text lane's contract is therefore not a wiki page or a
+convention; it is a field in the frozen onboarding identity that both
+peers pin:
 
 ```json
 // scripts/gx10/vllm/native_onboarding_identity_v1.json:57
@@ -157,31 +177,47 @@ const NATIVE_SEALED: SealedNativeIdentity = SealedNativeIdentity {
 ```
 
 *(lines 188–210 and 472–488 elided in the middle: the digest pins; see
-file)*. An operator who "relaxes" the rule to 12.0 in the JSON now fails
-onboarding against the compiled constant — the tolerance can only change
-through a code change that says so. The bounds themselves are not
-arbitrary: the measured fast-vs-exact envelope on the 2,048/256
-five-repetition comparator was max/mean **10.884401 / 1.233789** with
-100% token agreement in all five runs, and 7.270581 / 1.040619 on the
-32-token standard fixture `[docs/nvfp4-fast-lane-evidence-20260817.md
-§Determinism]` — the rule sits a hair above the measurement, which is
-why the claims register prohibits the opposite framing: the fixture "may
-be described as deterministic and token-identical only with its scope;
-zero drift … remain[s] prohibited" `[claims #10]`.
+file)*. Notice what that closes off. An operator who "relaxes" the rule
+to 12.0 in the JSON now fails onboarding against the compiled constant —
+the tolerance can only change through a code change that says so, in a
+commit, in front of a reviewer. Widening a bound stops being a
+configuration decision and becomes an edit to the product.
+
+Where did the two ceilings come from, then? Not from taste. We measured
+the lane first and set the rule a hair above what we saw. The
+fast-vs-exact envelope on the 2,048/256 five-repetition comparator was
+max/mean **10.884401 / 1.233789** with 100% token agreement in all five
+runs, and 7.270581 / 1.040619 on the 32-token standard fixture
+`[docs/nvfp4-fast-lane-evidence-20260817.md
+§Determinism]`. Sitting the ceiling that close to the observed envelope
+is a trap we set for ourselves on purpose: a lane that drifts even
+slightly worse than the lane we measured does not squeak through, it
+fails onboarding. It is also why the claims register prohibits the
+flattering framing — the fixture "may be described as deterministic and
+token-identical only with its scope; zero drift … remain[s] prohibited"
+`[claims #10]`. We are allowed to say the drift is bounded. We are not
+allowed to say there is none.
 
 ## 32.3 Checking the policy: three ordered handoffs, per sample and per summary
 
-A declared rule is only as good as its enforcement. The wizard's smoke
-step runs the qualifier three times — "three ordered 2,048/256
-exact-token handoffs with bounded full-logit drift" is the progress
-label the operator watches `[crates/muser-server/src/node/smoke.rs:43-52]`
-— with the native recipe's flags wired in
-(`--onboarding-native --drift-graded --reference-once`
-`[crates/muser-server/src/node/smoke.rs:644-650]`). `--drift-graded` is
-what turns the qualifier's default behavior — *refuse* on any logit
-digest mismatch `[crates/muser-bench/src/remote.rs:690-694]` — into
-"retain the comparison and measure the deltas." Then the wizard checks
-the rule twice, once per sample and once over the summary arrays:
+A declared rule is only as good as its enforcement, so the next question
+is: *who reads the rule at run time, and what happens to a run that
+misses it?*
+
+The wizard's smoke step runs the qualifier three times. What the
+operator watches scroll past is the contract restated in English —
+"three ordered 2,048/256 exact-token handoffs with bounded full-logit
+drift" `[crates/muser-server/src/node/smoke.rs:43-52]` — driven by the
+native recipe's own flags,
+`--onboarding-native --drift-graded --reference-once`
+`[crates/muser-server/src/node/smoke.rs:644-650]`. The middle flag is
+the interesting one. Left alone, the qualifier *refuses* on any logit
+digest mismatch at all `[crates/muser-bench/src/remote.rs:690-694]`,
+which is the correct default for a lane claiming equality and useless
+for a lane claiming a bound. `--drift-graded` trades refusal for
+measurement: retain the comparison, compute the deltas, then judge them.
+And the wizard judges twice — once per sample, once over the summary
+arrays:
 
 ```rust
 // crates/muser-server/src/node/smoke.rs:451
@@ -211,26 +247,43 @@ agree on token rate exactly 1.0, that every per-repetition maximum and
 mean sits inside the rule, and that the fast generated-token digest is
 present `[crates/muser-server/src/node/smoke.rs:538-569]`. A missing
 field is a refusal, not a zero ("native sample omits maximum full-logit
-drift") — absent evidence is failed evidence, the same fail-closed
-posture as everywhere else in this book.
+drift"). Put the same idea the other way round, because it is the one
+readers hand-wave past: a sample that forgot to report its drift is not
+a sample with no drift. Silence is not a measurement. Absent evidence is
+failed evidence — the same fail-closed posture as everywhere else in
+this book.
 
-The measured result of running exactly this gate live: native/text
-attempt 9 passed all seven progress labels with three exact-token
-handoffs under the bounded-logit rule (deltas inside 10.884401 /
-1.233788776) at payload rates 6.866 / 6.976 / 6.708 Gbps, and the node
-reached `healthy` `[claims #9; measured-numbers §1l; receipt
+All of which is machinery until it meets a real node. The measured
+result of running exactly this gate live: native/text attempt 9 passed
+all seven progress labels with three exact-token handoffs under the
+bounded-logit rule (deltas inside 10.884401 / 1.233788776) at payload
+rates 6.866 / 6.976 / 6.708 Gbps, and the node reached `healthy`. The
+run that proved it is retained: `[claims #9; measured-numbers §1l; receipt
 wizard-validation-20260823/attempt-9-native-live-20260824T051305Z/validation-summary.json]`.
 
 ## 32.4 Rung 3: what bit-exact costs
 
-One rung up, the combined kquant lane demands the whole Figure 32.1 top
-box: exact target tokens, exact *full* logits — the digests equal, deltas
-zero — and exact DFlash tokens and trace. The wizard needed **attempts
-10 through 31** to get there, and the blocker was never the transport;
-it was arithmetic. One F16 ULP of divergence in layer-1 V snowballed into
-51.7 M differing logits `[ledger §2b, 2026-08-24]`; the two root causes
-were the reduction-order splits named in this chapter's opening; the fix
-was a versioned cross-vendor arithmetic ABI, costed at 4–7
+One rung up sits the combined kquant lane, and it asks for the whole top
+box of Figure 32.1: exact target tokens, exact *full* logits — the
+digests equal, deltas zero — and exact DFlash tokens and trace. This is
+the rung we assumed would be a scheduling problem. It was not, and the
+story of finding that out is the most useful thing in the chapter.
+
+With the transport already trustworthy, we expected the remaining work
+on the combined lane to be plumbing: line the sequence up, pin the
+fixtures, watch the digests agree. The digests did not agree, and the
+wizard spent **attempts 10 through 31** finding out why. The trigger was
+as small as a divergence can be — a single F16 ULP in layer-1 V, the
+last place anyone wants to go hunting — and by the time it had
+propagated through the stack it had become 51.7 M differing logits
+`[ledger §2b, 2026-08-24]`. That escalation is the point: at the top of
+the ladder there is no such thing as a small disagreement, because
+nothing downstream damps it.
+
+What the chase found underneath were the two reduction-order splits
+named in this chapter's opening, and no amount of retrying was going to
+dissolve them. They had to be *specified*. So the fix was a versioned
+cross-vendor arithmetic ABI, and we know what it cost: 4–7
 accelerator-hours `[measured-numbers §1l]`. Attempt 31 then passed 7/7
 with bit-exact logits and payload rates 9.812 / 8.887 / 8.690 Gbps
 `[claims #9; receipt wizard-validation-20260823/attempt-31-combined-full-20260824T132639Z/validation-summary.json]`.
@@ -246,10 +299,12 @@ and the receipt chain is what makes the spend auditable.
 
 ## 32.5 Rung 1: parity-within-noise, never "faster"
 
-At the bottom of the ladder, the plain decode lanes. The paired P1.3
-cells measured native NVFP4 decode at **35.490711722 tok/s** (CV 0.130%)
-against an adjacent kquant control at **35.439527527 tok/s** (CV 0.037%)
-— a +0.1444% split inside the noise of cells whose CVs bracket it
+At the bottom of the ladder, the plain decode lanes — where the question
+is not whether the two lanes agree, but whether either one is entitled
+to brag. The paired P1.3 cells measured native NVFP4 decode at
+**35.490711722 tok/s** (CV 0.130%) against an adjacent kquant control at
+**35.439527527 tok/s** (CV 0.037%) — a +0.1444% split inside the noise
+of cells whose CVs bracket it
 `[ledger §P1.3]`. The claims register's standing instruction is three
 words long: "Never call decode faster" `[claims #11]`. The trust-relevant
 content of rung 1 is that neither lane is entitled to be called the
@@ -259,6 +314,8 @@ other's quality fallback by speed arguments — the native lane's
 
 ## 32.6 The soft cap is part of the contract's units
 
+A tolerance is a number *and* a unit, and the unit is the part everyone
+forgets. So before trusting a bound, ask what it is measured in.
 Chapter 20 §20.7 proved the soft cap is order-preserving (greedy tokens
 cannot move) but gap-compressing — by hand, a 6.00 raw gap becomes 4.915
 capped, a 20.0 gap becomes 4.049. Carry that into this chapter: every
@@ -278,10 +335,13 @@ uncapped logit tolerance is comparing different units — do not.
 
 ## 32.7 The integer-dot anchor: a producer that exists to be compared against
 
-Every ladder needs a plumb line. Muser's is the **exact producer mode**:
-the same GX10 node, the same transport, but a producer whose NVFP4
-arithmetic is integer-dot deterministic — built to be *compared
-against*, not served. The shipped lane matrix gives it its own row:
+Every ladder needs a plumb line. "Bounded drift" is a claim of the form
+*no farther than this from something* — and the something has to be an
+engine we can re-run on demand, or the bound is unfalsifiable. Muser's
+plumb line is the **exact producer mode**: the same GX10 node, the same
+transport, but a producer whose NVFP4 arithmetic is integer-dot
+deterministic — built to be *compared against*, not served. The shipped
+lane matrix gives it its own row:
 
 | Lane | Prefill | Decode | Speculative | Intended use |
 |---|---|---|---|---|
@@ -320,10 +380,13 @@ bit-for-bit — generated-token SHA, full-logit digests, payload SHA, all
 
 ## 32.8 Mode-separated cache identities, and refusing the unknown
 
-Bounded drift is only safe if native KV and exact KV can never be
-mistaken for each other — a cache entry produced by tensor cores must
-not be served to a session whose contract says "integer-dot anchor." The
-fast-lane evidence note states the rule in one line: exact and native
+An anchor is only an anchor if you can tell it apart from the thing it
+anchors. Bounded drift is safe only when native KV and exact KV can
+never be mistaken for each other — a cache entry produced by tensor
+cores must not be served to a session whose contract says "integer-dot
+anchor," because such a session would then be measuring drift against
+drift and reporting the answer as ground truth. The fast-lane evidence
+note states the rule in one line: exact and native
 producers "use mode-separated target-cache identities, so exact and
 native KV entries cannot alias" `[docs/nvfp4-fast-lane-evidence-20260817.md
 §Product route]`. Concretely, the receiver configuration carries a
@@ -367,10 +430,11 @@ additionally cannot enroll a DFlash identity at all
 
 ## 32.9 The measured drift record: what bounded actually means
 
-The bounded-drift rule would be empty theater without a published record
-of the drift it bounds. The fast-lane evidence note's determinism section
-is that record (Figure 32.2), for the standard 2,048-token prompt with
-32 greedy tokens `[docs/nvfp4-fast-lane-evidence-20260817.md
+A bound with no published measurement behind it is empty theater: it
+tells the reader what we promised, never what actually happened. So here
+is the drift the rule bounds. The fast-lane evidence note's determinism
+section is that record (Figure 32.2), for the standard 2,048-token
+prompt with 32 greedy tokens `[docs/nvfp4-fast-lane-evidence-20260817.md
 §Determinism]`:
 
 | Quantity | Measured envelope (fast vs exact) |
@@ -402,9 +466,12 @@ can only fear.
 
 ## 32.10 Deep content controls: the sensitivity that was published, not hidden
 
-A 2,048-token fixture is a shallow probe of a 131,072-position model.
-The deep ladder added calibrated content controls, and this is where the
-record contains a row that fails. Three stages, in order:
+A 2,048-token fixture is a shallow probe of a 131,072-position model. So
+the honest next question was the uncomfortable one: what is happening
+further out, where we had not yet looked? The deep ladder went looking,
+and this is the stretch of the record that contains a row that fails. We
+walked into it in three stages, and the order we walked them in matters
+as much as the outcome:
 
 - **E1 calibrated the yardstick first.** Before judging native against
   kquant, the campaign measured an *accepted alternate quant* (Q6) against
@@ -414,13 +481,20 @@ record contains a row that fails. Three stages, in order:
   by 1.746–1.996 points at 8k/16k/32k `[docs/nvfp4-fast-lane-evidence-
   20260817.md §E1]`. A tolerance derived from a second real quantization
   cannot be accused of being tuned for convenience.
-- **E2 isolated content, not length.** On three fixed nested documents
-  (rust, python/shell, docs), rust and python passed every disagreement
-  row at every length 2k–32k; only the **docs** document exceeded its
-  gate at 8k/16k/32k, and the 512-token position profiles kept the
-  sensitive regions localized rather than showing a length transition —
-  so the preregistered replicated-length criterion was false
-  `[docs/nvfp4-fast-lane-evidence-20260817.md §E2/E3]`.
+- **E2 asked whether length was the culprit, and the answer was no.**
+  The natural hypothesis — written down before the run, which is what
+  makes the answer worth anything — was that native drift grows with
+  context: past some length the lane goes bad, and you route around it
+  with a number. E2 held content fixed across three nested documents
+  (rust, python/shell, docs) and varied length. Rust and python passed
+  every disagreement row at every length 2k–32k; only the **docs**
+  document exceeded its gate at 8k/16k/32k, and the 512-token position
+  profiles kept the sensitive regions localized rather than showing a
+  length transition — so the preregistered replicated-length criterion
+  was false `[docs/nvfp4-fast-lane-evidence-20260817.md §E2/E3]`. The
+  tidy story we expected was not on offer. What we had instead was a
+  *content* effect, which is far harder to route around than a length
+  threshold, because content is not a knob on the request.
 - **The stage-3 yardstick published the exceedance.** At 65,536 tokens
   on the docs corpus, native-vs-kquant top-token disagreement was
   **15.134% against a calibrated gate of 13.339%** (relative PPL +4.227%)
@@ -429,19 +503,26 @@ record contains a row that fails. Three stages, in order:
   131,008 could not be tested because the corpus is too short `[claims
   #10; receipts kvpack-ladder-20260820/attempt-5-…-stage3-compact/stage3-e2-quality/]`.
 
-The disposition is the interesting part. No context cap was imposed
-through the measured 32k range; the sensitivity was published instead —
-and the route-exhaustion matrix checked eight native vLLM runtime
-variants (chunked prefill, BF16, Triton, batch-invariant CUTLASS,
-FlashInfer B12X/cuDNN, engine ceiling) against the docs 65,536 row, all
-failing identically or worse, with no runtime change promoted
-`[ledger §"native-route exhaustion"; measured-numbers §1i]`. Compare the
-cheap alternatives the record *rejected*: hiding the row would violate
-the publish-the-sensitivity rule `[measured-numbers §6 rule 9]`; capping
-context would have silently included the failing 8k cell while failing
-to cover the passing deeper cells — the non-monotonicity that killed
-the "native up to N, kquant beyond N" policy in the D1 routing ladder
-`[docs/nvfp4-fast-lane-evidence-20260817.md §D1]`.
+So what do you do with a row like that? Before publishing it, we tried
+to make it go away. The route-exhaustion matrix put eight native vLLM
+runtime variants (chunked prefill, BF16, Triton, batch-invariant
+CUTLASS, FlashInfer B12X/cuDNN, engine ceiling) against the docs 65,536
+row, on the expectation that one of them was the real culprit and the
+sensitivity was a configuration mistake wearing a numerics costume. All
+of them failed identically or worse, and no runtime change was promoted
+`[ledger §"native-route exhaustion"; measured-numbers §1i]`. There was
+nothing left to out-configure.
+
+That left two cheap ways out, and the record rejected both. Hiding the
+row would violate the publish-the-sensitivity rule
+`[measured-numbers §6 rule 9]`. Capping context — the "native up to N,
+kquant beyond N" policy — sounds principled right up until you look at
+which cells actually fail: a cap would have silently included the
+failing 8k cell while failing to cover the passing deeper cells, the
+non-monotonicity that killed exactly that policy back in the D1 routing
+ladder `[docs/nvfp4-fast-lane-evidence-20260817.md §D1]`. So no context
+cap was imposed through the measured 32k range, and the sensitivity was
+published instead.
 
 ## 32.11 The reference lock: an explicit lane, not an automatic proxy
 
@@ -475,8 +556,11 @@ producer/transport phase times needed to prove real overlap"
 `[crates/muser-bench/src/remote.rs:3-8]`. The trust direction matters:
 the remote-installed KV is decoded *and compared* against a local cold
 recompute, token by token and logit row by logit row, before a lane is
-called qualified. Serving inherits the disposition, not the measurement:
-once enrolled, the lane's correctness lives in its identity and gates —
+called qualified. The producer is not asked to certify itself; it is
+checked against a computation the Mac performed on its own.
+
+Serving then inherits the disposition, not the measurement: once
+enrolled, the lane's correctness lives in its identity and gates —
 and the one machinery that must never trust a *draft* in flight,
 speculative decoding, is under an absolute rule: "DFlash drafts are
 always verified by target distributions" `[docs/muser-architecture.md

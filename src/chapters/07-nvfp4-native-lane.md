@@ -25,7 +25,13 @@ to claim — and the one claim it must never make.
 
 ## 7.1 The format in one line — and its price tag
 
-Muser's own CPU oracle states the entire format contract in its module doc:
+What does a weight format actually have to promise before anyone can trust
+it? Three things: how to read the payload, how to scale it, and in what
+order to multiply the pieces back together. Skip the third and you do not
+have a format, you have a suggestion — two implementations can agree on
+every byte on disk and still disagree on the answer.
+
+Muser's own CPU oracle states all three in its module doc, order included:
 
 ```rust
 // crates/muser-engine/src/quant/nvfp4.rs:1
@@ -94,6 +100,9 @@ scale2`, never regrouped.*
 
 ## 7.2 A worked dequant, using the repo's own fixture
 
+A codebook you have only read about is a codebook you do not yet trust. So
+before the loader, before the kernels, before any measurement, we decode a
+real group by hand and then check our answer against the repo's own.
 Muser's unit test for the loader carries a canonical group, and we will
 dequantize its first bytes with every multiply shown. The fixture: eight
 packed bytes `10 32 54 76 98 BA DC FE`, one scale byte `0x38`, and
@@ -128,7 +137,9 @@ dedicated fixture kernel `muser_nvfp4_dequant_fixture` computes
 element and is tested bit-exact against this CPU oracle **for every finite
 E4M3FN byte** — all 254 of them
 (`[crates/muser-engine/src/shaders/nvfp4.metal:775-788]`,
-`[crates/muser-engine/src/metal/encode/qkv.rs:674-699]`).
+`[crates/muser-engine/src/metal/encode/qkv.rs:674-699]`). The sweep is
+exhaustive on purpose: a decode table this small can be checked completely
+instead of sampled, and anything that can be checked completely should be.
 
 Two format details worth internalizing before the loader:
 
@@ -143,6 +154,13 @@ Two format details worth internalizing before the loader:
   (`[crates/muser-engine/src/weights.rs:263-267]`).
 
 ## 7.3 The loader path: fail-closed companions
+
+The format promises a payload, a scale, and an order. What breaks if one
+of those pieces is missing, mis-shaped, or hiding a NaN? Nothing loud, and
+that is exactly the danger. A wrong scale tensor does not crash the model.
+It makes it quietly and unevenly worse, in a way no smoke test catches and
+no user can report precisely. The native lane's answer is to refuse to
+start at all.
 
 NVFP4 tensors never stand alone. Each weight matrix carries two (or three)
 companion tensors, named by suffix (`[crates/muser-engine/src/weights.rs:25-27]`):
@@ -187,6 +205,11 @@ code — `dequant_row` for a NVFP4 tensor slices `n_in/2` packed bytes and
 the same row-major contiguity kquant enjoys.
 
 ## 7.4 The Metal lane, end to end
+
+Bytes on disk are only half the contract; the other half is which kernel
+reads them. And that choice is not the kernel author's to make at runtime —
+it was already settled at load time, by the presence or absence of the
+optional fourth companion tensor.
 
 On the Metal side, every projection routes through
 `encode_projection`, which dispatches on exactly the dtype set Chapter 6
@@ -267,9 +290,21 @@ comment names the lineage: "the same half-bit embedding used by MLX's
 native NVFP4 kernels." This is how you turn a 16-entry float LUT into pure
 bit-slicing on a GPU.
 
+Turn that around, because it is the kind of trick that only clicks the
+second time: the kernel never looks a value up. It shifts nibbles straight
+into half-precision bit patterns, which is fast, but leaves every decoded
+value shrunk by one fixed power of two. The kernel pays that debt back
+exactly once per block, folded into the block scale, where it costs a
+single multiply instead of one per element.
+
 ### 7.4.2 The weight-only contraction (`muser_nvfp4_a16_q8_matvec`)
 
-The product lane's decode kernel is stricter than floats: it makes the
+Ask what can go wrong inside a dot product and the pedantic answer turns
+out to be the right one: the order in which you add the terms. On a single
+machine that order is a rounding footnote nobody reads. Across two
+machines it becomes a disagreement nobody can debug.
+
+So the product lane's decode kernel is stricter than floats: it makes the
 whole block contraction **integer-exact**. Per 256-value activation
 super-block, the threadgroup quantizes the activation to a Q8-K-style
 integer grid *once* — signed first absolute maximum, `iscale =
@@ -309,15 +344,20 @@ total = fma(1.0f, contribution, total);                           // sequential 
 linear layers write F16 results and "otherwise Q/K RMS normalization
 amplifies hidden low bits" (`[crates/muser-engine/src/quant/nvfp4.rs:331-337]`).
 The CPU oracle `dot_nvfp4_a16_q8_f32` performs the identical sequence
-(`[crates/muser-engine/src/quant/nvfp4.rs:349-379]`). Why this fanaticism
-about integers? Because this lane must match a *CUDA producer* whose
-reduction topology no Metal `simd_sum` can reproduce — so the design makes
-the parallel part exactly associative and confines every rounding decision
-to four named scalar FMAs. Chapter 32 tells the full trust story; file the
-technique now.
+(`[crates/muser-engine/src/quant/nvfp4.rs:349-379]`).
+
+Now the question this section opened with has its answer. The lane must
+match a *CUDA producer* whose reduction topology no Metal `simd_sum` can
+reproduce — so rather than chase that topology, the design removes the need
+for it. Make the parallel part exactly associative, and the only rounding
+decisions left are the four named scalar FMAs above, in an order both
+machines can agree to in writing. Chapter 32 tells the full trust story;
+file the technique now.
 
 ### 7.4.3 The W4A4 contraction and the F16 tail
 
+The other mode is the one the producer speaks, and the Mac keeps it so the
+two machines can be compared on identical arithmetic rather than on faith.
 When `input_scale_inv` is present, the kernel quantizes each 16-value
 activation group to its own E2M1 + E4M3FN pair (the CPU oracle at
 `[crates/muser-engine/src/quant/nvfp4.rs:174-238]`), then contracts
@@ -339,6 +379,10 @@ by byte length or dtype (`[crates/muser-engine/src/metal/encode/qkv.rs:348-360]`
 this artifact, recorded in the ledger (§7.5).
 
 ## 7.5 The measured lane: parity within noise — never "faster"
+
+So: is the native lane faster? That is the question the whole format was
+supposed to answer, and answering it honestly turns out to require the most
+carefully worded sentence in this chapter.
 
 Here is the lane's headline measurement, quoted from the ledger's P1.3
 decode gate — five-rep cell, same 66-token prefix, 32 teacher-forced
@@ -369,30 +413,60 @@ integer-exact kernel fly? The ledger's retained diagnostics answer:
 "the NVFP4 layer stack is faster, but this checkpoint mandates an
 unquantized F16 language head (about 3.46 ms/token versus the kquant
 head's 1.75 ms)" `[ledger §P1.3]`. The F16 head alone eats most of what
-the 52-layer FP4 stack saves. Two further anchors for the lane's quality
-side (the gates, not the speed):
+the 52-layer FP4 stack saves. So much for speed. The lane's other two
+anchors are about quality, and they are gates rather than boasts.
 
-- The **standard 2,048-token fixture is deterministic and token-identical**
-  versus the exact anchor, with bounded nonzero logit drift — max/mean
-  absolute error 7.270581/1.040619 at 32 tokens, 10.884401/1.233789 over
-  the five-rep 2,048/256 comparator `[docs/nvfp4-fast-lane-evidence-20260817.md §Determinism]`.
-  "Zero drift" is explicitly *prohibited* wording `[claims #10]`.
-- At depth, one content class (documentation/digest text at 65,536 tokens)
-  exceeds its calibrated top-token band — 15.134% vs a 13.339% gate —
-  published as a **content-local sensitivity**, not replicated
-  cross-document, with the kquant lane selectable as the reference route
-  `[claims #10]`. The cost of this quantization is real, measured, and
-  localized — Chapter 5's §5.8 promise, kept.
+The first is determinism. The **standard 2,048-token fixture is
+deterministic and token-identical** versus the exact anchor, with bounded
+nonzero logit drift: max/mean absolute error 7.270581/1.040619 at 32
+tokens, and 10.884401/1.233789 over the five-rep 2,048/256 comparator
+`[docs/nvfp4-fast-lane-evidence-20260817.md §Determinism]`. *Nonzero* is
+the load-bearing word. The tokens match; the logits underneath them do
+not, and saying "zero drift" — the easier, rounder sentence — is
+explicitly *prohibited* wording `[claims #10]`.
+
+The second anchor is where the cost of the format finally becomes visible.
+At depth, one content class — documentation and digest text at 65,536
+tokens — exceeds its calibrated top-token band, 15.134% against a 13.339%
+gate. It did not replicate across documents, so it is published as exactly
+what it is: a **content-local sensitivity**, with the kquant lane
+selectable as the reference route `[claims #10]`. The cost of this
+quantization is real, measured, and localized — Chapter 5's §5.8 promise,
+kept.
 
 ## 7.6 Speculative NVFP4: measured, rejected, fail-closed
 
-The lane's one forbidden fruit is speculation. The measurement that
-settled it: a native NVFP4 W4A4 batched-verification diagnostic ran at
-**6.805 tok/s** against the kquant speculative bar of 107.9 tok/s — "one
-diagnostic, explicitly unqualified" (`[docs/nvfp4-fast-lane-evidence-20260817.md
-§Measured product numbers]`) — with verification consuming 35.915 s
-of a 37.619 s decode span `[ledger §F-series remediation]`. The disposition is
-recorded as **Fallback B**: "speculative serving stays on the qualified
+The lane's one forbidden fruit is speculation — and how we found that out
+teaches more than the verdict does.
+
+The fork looked inviting from both sides. Speculative decoding earns its
+speed by checking many drafted tokens in a single batched forward pass, and
+batched verification is precisely the shape W4A4 was built for: the
+activations already arrive quantized in groups, and it is the arithmetic
+the Blackwell producer runs natively on its tensor cores. Every argument
+pointed the same direction. So we ran the diagnostic — native NVFP4 W4A4
+batched verification, measured against the kquant speculative bar of 107.9
+tok/s — expecting, at worst, the same neighborhood.
+
+It came back at **6.805 tok/s**. That is not a regression you tune away; it
+is a different order of magnitude, and the retained run says plainly where
+the time went. Verification alone consumed 35.915 s of a 37.619 s decode
+span `[ledger §F-series remediation]` — the drafting was effectively free
+while the verify pass ate the whole budget. We kept the run and labeled it
+for what it is, "one diagnostic, explicitly unqualified"
+(`[docs/nvfp4-fast-lane-evidence-20260817.md
+§Measured product numbers]`). Both halves of that label are load-bearing:
+one measurement is enough to stop a launch claim, and not enough to
+characterize a lane.
+
+The lesson was about shape, not about format. A lane can sit at
+parity-within-noise in plain decode, as this one does, and still be
+unqualified the moment the batch shape changes underneath it. Nothing in
+the decode gate above was ever evidence about verification, and reading it
+as such is how a slow route ships quietly.
+
+So the disposition is recorded as **Fallback B**: "speculative serving
+stays on the qualified
 kquant lane; native NVFP4 plus DFlash is rejected by the receiver
 configuration rather than silently serving the measured 6.81 tok/s route"
 `[docs/nvfp4-fast-lane-evidence-20260817.md §Product route]`, and the
@@ -426,7 +500,10 @@ diagnostic still proved nothing about throughput.
 
 ## 7.7 Exact vs Native: the producer-mode preview
 
-The `Nvfp4ProducerMode` enum you just saw is this chapter's bridge to Part
+That refusal leaves one question dangling. If the Mac decodes weights that
+someone else's GPU also understands, who decides what the numbers are
+*supposed* to be? The `Nvfp4ProducerMode` enum you just saw is where that
+decision is written down, and it is this chapter's bridge to Part
 VI, so meet it on its own terms (`[crates/muser-cluster/src/config.rs:10-18]`):
 
 ```rust
@@ -461,6 +538,9 @@ logit envelopes, exact-token policies, the wizard's gates — is
 [Ch 32](32-precision-across-the-handoff.md), the trust chapter.
 
 ## 7.8 Tradeoffs
+
+Four decisions in this lane could each plausibly have gone the other way.
+What follows is what choosing cost — measured, not argued.
 
 **Float codebook vs integer codebook at the same 4.5 bits.** Chapter 5's
 two families meet head-on here. E2M1 spends its 16 codes as 15 magnitudes
@@ -501,7 +581,9 @@ silently-slow.
 
 ## 7.9 Where the gap lives
 
-For the native lane, "the gap" in the dispatch-gap sense barely exists —
+Every kernel chapter owes the same accounting: where does this component's
+time go, and is it the deficit? For the native lane, "the gap" in the
+dispatch-gap sense barely exists —
 plain decode sits at parity-within-noise with both the kquant lane and the
 comparator (§7.5), and the format is not the deficit. Where this lane's
 *own* numbers diverge from its hopes is quantization-shaped but not

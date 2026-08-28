@@ -18,7 +18,12 @@
 vector: `activations.attention`, the concatenation of 32 head outputs of 128
 elements each — `attn_dim = 32 × 128 = 4,096` floats
 (`config.rs:268-270`). In most transformer families that vector goes straight
-to the output projection. Muse Glimmer does something extra first. A fourth
+to the output projection. Muse Glimmer does something extra first: before the
+attention result is allowed to rejoin the residual stream, the layer asks a
+second, learned question about every one of those channels — *should this one
+be heard at all?*
+
+The answer arrives as another vector. A fourth
 attention projection — the **gate**, sibling of Q, K, and V from
 [Ch 13](13-the-qkv-gate-matvec-family.md) — produced a second 4,096-vector,
 and this chapter's kernel multiplies the two element-wise:
@@ -61,10 +66,19 @@ residual ← residual + post_norm(delta)     (the fused tail — §17.7)
 ```
 
 Two operations, one chapter: a pointwise gate and a matvec you already know.
+Keep an eye on the asymmetry between them, because it is the chapter's point.
+The cheap operation is the one that turned out to need a careful safety
+argument; the expensive one is the one with nothing to confess.
 
 ## 17.2 Why it exists — a gated attention output
 
-The verifiable facts first. The gate is part of the model contract, asserted
+There are two questions hiding in this section's title, and they have very
+different evidence behind them. *What is the gate, mechanically?* is settled by
+reading the tree. *Why did somebody train a model to want one?* is not in the
+tree at all. Separating them is the whole discipline of this book, so we do it
+out loud: the verifiable facts first, the honest shrug second.
+
+The gate is part of the model contract, asserted
 in the engine's own header — "Parameterless QK-RMSNorm, **sigmoid
 attention-output gate**, Gemma-2-style sandwich norms"
 (`crates/muser-engine/src/lib.rs:12`). It is a real learned projection with
@@ -92,7 +106,8 @@ matmul(
 );
 ```
 
-**Why gate the attention output at all?** The structural reading — the same
+Now the second question. **Why gate the attention output at all?** The
+structural reading — the same
 decoupling you will meet again in the FFN of [Ch 18](18-swiglu-ffn.md) — is
 that the gate separates *whether* a channel's attention result flows onward
 from *what* that channel carries. A sigmoid-squashed multiplier in (0, 1) can
@@ -113,8 +128,11 @@ before the heads are mixed by `W_o`.
 
 ## 17.3 The operation, explained — a worked gate by hand
 
-The gate itself is as simple as GPU work gets: element-wise, no reduction, no
-mixing. A hand example with a 4-element slice of the two vectors:
+Before trusting a kernel, it is worth doing its job once by hand, at a size
+small enough to check on paper. The gate makes that easy: it is as simple as
+GPU work gets — element-wise, no reduction, no mixing, every output element
+depending on exactly one attention value and one gate value. A hand example
+with a 4-element slice of the two vectors:
 
 ```
   i :    0      1      2      3
@@ -129,7 +147,8 @@ Every element is independent — element 3's attention value of 8.0 is large,
 but its gate is nearly closed (σ(−4) = 0.018), so 98.2 % of it is suppressed.
 That is the whole gate.
 
-The `o_proj` after it is the [matvec](../glossary.md#matvec) of
+The operation that follows is where all the bytes are, and it asks nothing new
+of you. The `o_proj` after the gate is the [matvec](../glossary.md#matvec) of
 [Ch 13](13-the-qkv-gate-matvec-family.md) at a new shape — 6,656 output rows,
 each a dot product over 4,096 inputs, which is `4096/256 = 16` Q4_K
 super-blocks of 144 bytes = 2,304 bytes of weight per row. No new math; the
@@ -150,7 +169,9 @@ of activation traffic.*
 
 ## 17.4 The Metal kernel — `sigmoid_gate_inplace`
 
-The whole kernel, verbatim — it is nine lines and worth reading as one piece:
+How much Metal does a per-channel volume knob need? Less than the paragraph
+that describes it. Here is the whole kernel, verbatim — it is nine lines and
+worth reading as one piece before we take it apart:
 
 ```metal
 // crates/muser-engine/src/shaders/ferrite/sigmoid_gate.metal:4
@@ -186,25 +207,40 @@ Line by line:
 
 That `*=` is the only subtlety, and §17.7 is about why it is safe.
 
-One documentation drift to flag, code-wins style: the header comment says
-`dispatch: (ceil(n/1024), 1, 1) × (1024, 1, 1)`, but the Rust wrapper below
-uses `dispatch_1d`, which calls `dispatch_threads` with threadgroup width
-`min(n, 256)` (`crates/muser-engine/src/metal/encode.rs:1337-1342`). The
-*contract that matters* — one thread per element, ragged-tail guarded — holds
-either way; the comment's threadgroup size is stale
+Now back to the top of that listing, because its header comment is a small
+trap and it is worth walking into deliberately once. We read
+`dispatch: (ceil(n/1024), 1, 1) × (1024, 1, 1)` as a specification and went to
+the Rust wrapper expecting to find threadgroups of that width being launched.
+They are not there. `dispatch_1d` calls `dispatch_threads` with threadgroup
+width `min(n, 256)` (`crates/muser-engine/src/metal/encode.rs:1337-1342`), so
+the comment describes a dispatch shape the engine no longer uses. The detour
+taught more than the discrepancy is worth on its own: the half of the comment
+that constrains correctness — one thread per element, ragged-tail guarded —
+holds either way, and the half that drifted is the half nothing checks. So we
+flag it code-wins style and move on. A kernel header is a hypothesis about the
+code, dated the day it was typed; we kept the pointer to both sides of this one
 [crates/muser-engine/src/shaders/ferrite/sigmoid_gate.metal:5 versus
 crates/muser-engine/src/metal/encode.rs:1337].
 
-A strict-arithmetic sibling exists for the cross-vendor comparison lane:
-`muser_cross_vendor_sigmoid_gate` (`shaders/muse_reference.metal:680`)
-computes the same thing through the no-fast-math library's controlled `expf`
-so a CUDA producer's bytes can be matched bit for bit — same formula,
-different compile flags (`gate.rs:14-15` selects it under
-`MUSER_CROSS_VENDOR_QK`).
+One digression before the wrapper, and it announces its own relevance: the
+pattern it shows up in recurs in nearly every kernel chapter after this one.
+This kernel has a twin. A strict-arithmetic sibling exists for the
+cross-vendor comparison lane: `muser_cross_vendor_sigmoid_gate`
+(`shaders/muse_reference.metal:680`) computes the same thing through the
+no-fast-math library's controlled `expf` so a CUDA producer's bytes can be
+matched bit for bit — same formula, different compile flags
+(`gate.rs:14-15` selects it under `MUSER_CROSS_VENDOR_QK`). That is what an
+exactness lane looks like throughout Muser: never a different algorithm,
+always the same algorithm with the fast paths refused.
 
 ## 17.5 The Rust dispatch
 
-The wrapper is four statements:
+The kernel is trivial, so the interesting question moves to the encoder: what
+must the wrapper guarantee before it is allowed to launch anything? Two things.
+The two vectors have to be the same length, or the element-wise product is
+quietly meaningless; and the launch has to land between attention and `o_proj`
+and nowhere else, because that is the order the CPU oracle fixed. The wrapper
+is four statements:
 
 ```rust
 // crates/muser-engine/src/metal/encode/gate.rs:7
@@ -298,9 +334,19 @@ same one [Ch 13](13-the-qkv-gate-matvec-family.md) introduced; the o_proj is
 Q4_K on the release artifact (`attn_output 4096->6656 q4k`,
 `crates/muser-bench/src/m16.rs:163-166`).
 
+Put that another way, because it matters for everything the rest of the chapter
+argues: the expensive half of this stage is not a Muser kernel. Muser computes
+the shape arguments, binds three buffers, picks a grid — and then hands the
+actual arithmetic to a pipeline state compiled from someone else's pinned
+metallib. Whatever the engine can be blamed for here happens before
+`set_compute_pipeline_state`, never inside the loop.
+
 ## 17.6 The access pattern — where the bytes go
 
-The gate kernel, per layer per token:
+Where does the time go in this stage? For every decode kernel in this book the
+honest first answer is bandwidth rather than arithmetic, so the way to read a
+stage is to count what it drags across the bus. Start with the cheap half. The
+gate kernel, per layer per token:
 
 ```
   read  gate[4096]        16,384 B   (16 KiB)
@@ -355,7 +401,10 @@ lives or dies on weight bandwidth, and the gate barely moves bytes.
 
 The `attn_out[gid] *= …` is a read-modify-write on a shared buffer. Two
 questions: can two threads collide *inside* the dispatch, and can another
-dispatch read `attention` while the gate is still writing it?
+dispatch read `attention` while the gate is still writing it? Both are worth
+answering carefully, because a wrong answer does not crash — it produces a
+plausible token, sometimes, on some runs, which is the most expensive kind of
+bug this engine can have.
 
 **In-dispatch: no collision by construction.** Each global thread index `gid`
 touches exactly one element, `attn_out[gid]`, and no two threads share a
@@ -376,10 +425,22 @@ all 52 layers inside *one* command buffer on *one* concurrent compute encoder
 ```
 
 Muser's buffers are allocated `StorageModeShared` *with* Metal's automatic
-hazard tracking (the deliberate default; the untracked experiment was
-reverted because it "empirically changed DFlash conditioning"
-[crates/muser-engine/src/metal/buffer.rs, `shared_tracked`]), so a dispatch
-that reads `attention` after the gate's write is ordered by the driver's
+hazard tracking. That is a deliberate default, and we know it is deliberate
+because the other branch of the fork was taken first. Untracked buffers promise
+less driver bookkeeping between dispatches, and this graph already declares its
+dependencies explicitly, so we expected the tracking to be redundant work that
+could simply be switched off — free latency, no behaviour change. It was not
+redundant. With tracking off, the engine "empirically changed DFlash
+conditioning" — no kernel had been edited, and the observable behaviour moved
+anyway — so the experiment was reverted. The allocator still carries the name
+of the mode that survived
+[crates/muser-engine/src/metal/buffer.rs, `shared_tracked`]. The lesson
+generalizes well past this kernel, which is why it belongs in a chapter about
+a nine-line gate: in a fail-closed engine, an optimization that changes bits
+is not an optimization.
+
+So the tracking stays, and a dispatch that reads `attention` after the gate's
+write is ordered by the driver's
 tracked-resource dependencies; where the graph needs finer control it issues
 targeted `memory_barrier_with_resources` calls (you saw them around the KV
 store in [Ch 16](16-attention-decode-kernels.md), `decode.rs:5669-5670`).
@@ -390,25 +451,37 @@ whole decode graph ([Ch 35](35-ordering-hazards-and-the-dispatch-gap.md)
 formalizes the taxonomy).
 
 **What Muser deliberately does *not* do here** is fold the residual add into
-the o_proj matvec itself. The ancestor Ferrite book taught exactly that
+the o_proj matvec itself. This is a real fork, and the ancestor took the
+other branch of it: the Ferrite book taught exactly that
 device — a `y[row] += dot` write-back in the matvec kernel
-[ferrite-book Ch 16] — and Muser's gate fuses nothing into the pinned
+[ferrite-book Ch 16] — and it is a good device, cheaper by a dispatch and a
+buffer. Muser's gate fuses nothing into the pinned
 matvec. The o_proj writes to a scratch buffer, `activations.projected`, and
 the residual add happens one dispatch later inside the fused dual-eps tail
 (`encode_fused_norm_residual_rms_norm_32sg`, `decode.rs:5806-5818`),
 where the *in-place* mutation actually lives: that kernel reads
 `activations.normed` (the running residual), adds the post-normed projection
-into it, and writes the result back in place. The reason for this shape is
-the book's recurring one, stated in the source: the legacy one-token graph
+into it, and writes the result back in place.
+
+Why give up the cheaper shape? The reason is the book's recurring one, and the
+source states it outright: the legacy one-token graph
 with its Ferrite-lineage fused kernels "diverges from the source-pinned
 llama Metal graph enough to breach public logprob tolerance", so serving
 routes one-token work through the batch graph that "dispatches the exact
 pinned kernels" (`decode.rs:2085-2091`). Keeping the o_proj a *stock*
 pinned-metallib matvec — unmodified write-back, `=` not `+=` — is what makes
-its bytes match llama.cpp's. The fusion temptation is paid for elsewhere
+its bytes match llama.cpp's. Turn that around and it becomes the sentence to
+carry into the rest of the book: Muser buys exactness with dispatches. Every
+fusion the ancestor took for free, this engine pays for at the encoder,
+because it does not own the kernel it has to agree with. The fusion temptation
+is paid for elsewhere
 ([Ch 19](19-downproj-and-residual.md) prices it).
 
 ## 17.8 Tradeoffs
+
+Three forks meet at this stage. Two of them were the engine's to decide; the
+third was decided by whoever trained the checkpoint, and knowing which is which
+saves an afternoon of re-litigating a choice you cannot touch.
 
 **In-place gate vs materialized sigmoid buffer.** The alternative — write
 `σ(gate)` to a fresh buffer, then a separate multiply — would traffic
@@ -427,19 +500,28 @@ be below noise by construction.
 **A separate gate closure vs fusing the gate into attention or o_proj.** The
 gate could in principle be folded into the attention kernel's epilogue
 (compute `σ(gate[h·128+d])` while writing the head) or into the o_proj's
-input load. Muser keeps it a standalone closure on every route — teacher
+input load. The intuition pulls hard toward doing it: this book's whole gap
+story is told in dispatch counts, and here is a dispatch that moves rounding
+error and computes one exponential per channel. Muser keeps it a standalone
+closure on every route anyway — teacher
 forced (`decode.rs:5793-5799`), batched serving, and the packed decode group
 (`decode.rs:5112-5116`, where per-row attention/gate buffers are gathered
-into shared batch buffers and one gate serves all rows). The measured
+into shared batch buffers and one gate serves all rows).
+
+We went to the closure-count accounting expecting to find the gate implicated
+somewhere, and it is not there. The measured
 consequence is structural rather than a timing number: in the one-token
 dispatch-gap accounting, the sigmoid-gate closures fall in the "common math
 closures" family that is *identical* in both the production and legacy graphs
 — 406 closures on each side, delta 0 [docs/decode-dispatch-gap-20260815.md,
-closure-count table] — so the gate contributes nothing to the +196-closure
-gap, and fusing it would change bits for zero dispatch-count benefit on the
-serving route. It stays separate because separate is exact.
+closure-count table]. So fusing the gate would trade a bit-exact match against
+the pinned graph for no reduction in the +196-closure
+gap at all, on the route that actually serves traffic. It stays separate
+because separate is exact.
 
-**Gate before o_proj vs gate after o_proj.** The model applies the gate in
+**Gate before o_proj vs gate after o_proj.** The third fork was never ours to
+take, and it is worth saying so before anyone spends a week on it. The model
+applies the gate in
 attention space (4,096 channels, pre-mixing) rather than in residual space
 (6,656 channels). This is the checkpoint's choice, mirrored by the oracle at
 `reference.rs:446-464`; an engine has no say in it. The consequence for the
@@ -449,6 +531,11 @@ matvecs of [Ch 13](13-the-qkv-gate-matvec-family.md), not a fifth sequential
 one.
 
 ## 17.9 Where the gap lives
+
+Every kernel chapter in this part owes the same answer, and the question
+behind it is one of suspicion: does this stage help explain the extra dispatch
+closures the campaign is hunting? Here the answer is short, and it is the
+boring one.
 
 **This kernel is not the gap.** Both of this chapter's operations appear in
 the "Common math closures (including LM head/softcap)" row of the corrected

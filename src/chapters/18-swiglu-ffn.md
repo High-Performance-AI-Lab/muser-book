@@ -14,6 +14,12 @@
 
 ## 18.1 What it computes
 
+Attention has just folded its result back into the residual stream and
+handed the layer a vector. What does the layer do with it next? Half the
+layer's work is still ahead, and it is the half that owns most of the
+weights on disk — so before any kernel, the question to settle is what shape
+that computation has and what it does to the vector it is given.
+
 Each Muse Glimmer layer does two things to the
 [residual stream](../glossary.md#residual-stream-hidden-state): attention
 ([Ch 13](13-the-qkv-gate-matvec-family.md)–[Ch 17](17-sigmoid-gate-and-oproj.md))
@@ -99,6 +105,10 @@ projection that consumes `ffn_mid` is [Ch 19](19-downproj-and-residual.md).*
 
 ## 18.3 The matrix operation, by hand
 
+Trusting a fused kernel gets easier once you have done its arithmetic by
+hand. So: what exactly is computed for a single output coordinate, and where
+is the redundancy that a fusion could take away?
+
 For output element `j` (`0 ≤ j < 19,968`):
 
 ```
@@ -129,6 +139,11 @@ One kernel that loads `x[k]` once and updates **two accumulators in
 lockstep** eliminates both — Figure 18.2 shows the loop shape.
 
 ## 18.4 SiLU — the sigmoid linear unit
+
+Two branches go in and one comes out, and the function on the gate branch is
+the only nonlinearity in the whole block. It decides how much of the up
+branch survives. So it is worth a section of its own: what is it, and how
+does it behave at the edges where it will actually be asked to decide?
 
 The activation on the gate branch is **SiLU** (a.k.a. *Swish*,
 [arxiv:1710.05941]):
@@ -169,18 +184,21 @@ for (a, b) in ffn_a.iter_mut().zip(ffn_b.iter()) {
 }
 ```
 
-with `silu_fast(x) = x / (1.0 + (−x).exp())` — the one-liner of the formula
-(`crates/muser-engine/src/quant/helpers.rs:70-74` per the extraction
-manifest's Ferrite lineage [docs/extraction-manifest.md]).
+The helper it calls is `silu_fast(x) = x / (1.0 + (−x).exp())` — this
+section's formula written as a one-liner, inherited from Ferrite along with
+the rest of the shader lineage. We kept the provenance:
+`crates/muser-engine/src/quant/helpers.rs:70-74`, tracked through the
+extraction manifest [docs/extraction-manifest.md].
 
 ## 18.5 The Metal kernel — `ffn_q4k_gate_up_silu_4r2s`
 
 There are two gate+up routes in the tree, and which one *runs* is the
 chapter's real story (§18.6). The fused kernel first — it is the cleanest
 expression of the SwiGLU fusion, a wholesale port of Ferrite's accepted
-`897a6256b` kernel (`decode.rs:5823-5825`, `ffn.rs:7-8`). The signature, the
-x-load, and the lockstep MAC, verbatim; the Q4_K decode helper it calls is
-summarized after:
+`897a6256b` kernel, and both the call site and the wrapper say so in their
+own comments (`decode.rs:5823-5825`, `ffn.rs:7-8`). Below: the signature,
+the x-load, and the lockstep MAC, verbatim; the Q4_K decode helper it calls
+is summarized after.
 
 ```metal
 // crates/muser-engine/src/shaders/ferrite/ffn_fused_tail.metal:485
@@ -337,7 +355,12 @@ function-constant mechanism).
 
 ## 18.6 The Rust dispatch — and the opt-in flag story
 
-The wrapper:
+Two questions decide what this section owes you. How does the host launch
+that kernel? And — since the tree carries both routes — which one actually
+runs when the engine serves a token? The first has a short answer. The
+second is this chapter's war story.
+
+The wrapper first:
 
 ```rust
 // crates/muser-engine/src/metal/encode/ffn.rs:7
@@ -376,9 +399,13 @@ weight views are bound at their offsets into the mmap'd GGUF
 ([Ch 3](03-unified-memory-and-buffers.md)); `rows`/`cols` ride as inline
 constants.
 
-Now the part that separates this book from a kernel tour: **the fused kernel
-is opt-in, and the default is the unfused control.** The gate at the call
-site:
+Now the fork. We had a kernel that was better on paper in every dimension we
+knew how to count — fewer dispatches, fewer bytes moved, the same algebra —
+and it arrived as a port of something Ferrite had already accepted and run.
+The obvious move was to make it *the* FFN path and move on. We expected to
+do exactly that. Instead: **the fused kernel is opt-in, and the default is
+the unfused control.** The gate at the call site shows both branches side by
+side, which is why it is worth reading whole:
 
 ```rust
 // crates/muser-engine/src/decode.rs:5819
@@ -452,8 +479,12 @@ kernel void muser_silu_mul_inplace(
 
 dispatched one-thread-per-element over 19,968 (`ffn.rs:38-60`).
 
-Why is the beautiful fused kernel behind a flag? The source answers in the
-routing comment that governs serving decode:
+So why is the better kernel the one that does not run? Because when the
+fused tail was put on the serving route, the numbers coming out of the model
+stopped matching the numbers the pinned comparator produced. Not wrong —
+*different*, and different by more than the public tolerance allows. That
+result is written down where it belongs, in the routing comment that governs
+serving decode:
 
 ```rust
 // crates/muser-engine/src/decode.rs:2085
@@ -466,18 +497,40 @@ routing comment that governs serving decode:
 // parity.
 ```
 
-That is the contract discipline in one comment: the fused kernel's
-reduction order (two interleaved accumulators folded per super-block) is
-*mathematically* SwiGLU but not *bit-* the same as llama.cpp's graph of
-independent `mul_mv` nodes plus a pointwise silu-mul, and Muser's public
-commitment is logprob parity with the pinned comparator. The fused kernel is
-therefore a qualified-off fast path — runnable under the flag for the
-teacher-forced/diagnostic route (`encode_token`), not the serving default.
-(The dtype guards in the `if` also mean any non-Q4_K FFN tensor would fall
-back automatically; on the release artifact `ffn_gate`/`ffn_up` are Q4_K —
-`ffn_gate/up 6656->19968 q4k`, `crates/muser-bench/src/m16.rs:171-175`.)
+That is the contract discipline in one comment. The fused kernel's reduction
+order — two interleaved accumulators folded per super-block — is
+*mathematically* SwiGLU, but it is not *bit-* the same as llama.cpp's graph
+of independent `mul_mv` nodes plus a pointwise silu-mul, and Muser's public
+commitment is logprob parity with the pinned comparator.
+
+Say it the other way round, because this is the sentence the rest of the
+book keeps coming back to. Floating-point addition is not associative, so
+changing *when* you add changes *what* you get; a contract written against a
+specific graph is therefore a contract against a specific order of
+additions, not against the algebra those additions approximate. A kernel
+that computes the same function by a different schedule is, by that measure,
+a different kernel — and the measure is the one the public promise is
+written in.
+
+The lesson we kept is the uncomfortable one: fusion is never free, even when
+it is free, because what it spends is exactness, and here exactness is the
+product. The fused kernel therefore lives on as a qualified-off fast path,
+runnable under the flag for the teacher-forced/diagnostic route
+(`encode_token`) and never on the serving default. The dtype guards in the
+`if` are a smaller version of the same care — any non-Q4_K FFN tensor falls
+back automatically, and on the release artifact `ffn_gate`/`ffn_up` are
+Q4_K. We kept that evidence too: `ffn_gate/up 6656->19968 q4k`,
+`crates/muser-bench/src/m16.rs:171-175`.
 
 ## 18.7 The access pattern — the largest weight read in the layer
+
+Where does the time go in this block? Not into the silu, and not into the
+Hadamard: both are pointwise, and both vanish into the write. It goes into
+dragging two very large matrices past the arithmetic units, once for every
+token the model emits. It is worth knowing exactly how large, and worth
+knowing what the fusion actually buys against that background — because the
+answer decides whether the flag we just described gave up something
+expensive or something cheap.
 
 All arithmetic derived from the verified shapes, shown step by step:
 
@@ -510,34 +563,46 @@ Activation traffic, fused vs unfused (per layer):
     extra activation traffic vs fused:    ≈ 345,856 B ≈ 338 KiB/layer
 ```
 
-Same lesson as the ancestor's FFN chapter [ferrite-book Ch 17], re-derived
-for this geometry: the x-read-once is mostly a cache effect (`x` is 26 KiB);
-the *hard* saving is never materializing the two 19,968-wide intermediates.
-338 KiB/layer × 52 layers ≈ **18.0 MB/token** of avoided activation traffic
-— about 12 % of one layer's FFN weight read, i.e. real but second-order;
-and on the serving route it is *deliberately not taken* (§18.6). The weight
-stream — 149.5 MB per layer, 7.78 GB across 52 layers — is irreducible at
-Q4_K bitrate no matter which route dispatches it, and that is the number
+Hold the two ledgers side by side and the same lesson falls out that the
+ancestor's FFN chapter [ferrite-book Ch 17] drew, re-derived here for this
+geometry. Reading `x` once is mostly a cache effect — `x` is 26 KiB and
+would have been sitting in cache for the second matvec anyway. The *hard*
+saving is the one that never shows up as a load at all: in the unfused
+route the two 19,968-wide intermediates are born, written, and read back;
+in the fused route they simply never exist.
+
+Then scale it up before deciding how much to care. 338 KiB/layer × 52 layers
+≈ **18.0 MB/token** of avoided activation traffic — about 12 % of one
+layer's FFN weight read. Real, then, but second-order; and on the serving
+route it is *deliberately not taken* (§18.6). What is neither second-order
+nor optional is the weight stream underneath it: 149.5 MB per layer,
+7.78 GB across 52 layers, irreducible at Q4_K bitrate no matter which route
+dispatches it. That is the number
 [Ch 1](01-why-inference-is-a-memory-problem.md)'s bandwidth argument leans
 on.
 
 ## 18.8 Tradeoffs
 
 **Fused 4r2s vs the unfused control — bytes versus bits.** The fusion saves
-~338 KiB/layer of activation round-trips and one dispatch (three closures
-become one); the control preserves llama.cpp's exact per-node arithmetic and
-therefore the public logprob contract. Muser ships the control as default
-and gates the fusion behind `MUSER_FERRITE_FFN_GATE_UP`
-(`decode.rs:5819-5836`, `:1334`), with the reason documented at
-`decode.rs:2085-2091`: the fused kernels' rounding divergence "breache[s]
-public logprob tolerance" against the source-pinned llama Metal graph. The
-discipline is the one the dispatch-gap investigation made explicit — the
-hybrid fusions were "removed, not hidden behind a tolerance"
-[docs/decode-dispatch-gap-20260815.md, Rejected hybrid postmortem]. No
-retained A/B quotes an end-to-end tok/s delta for this specific flag
-**[unverified]** — the burden the fused route must clear is full-logit
-parity first, per the comment, and that gate has not been recorded as
-passed at the pin.
+~338 KiB/layer of activation round-trips and one dispatch: three closures
+become one. The control gives up both of those and buys back llama.cpp's
+exact per-node arithmetic, and with it the public logprob contract. Muser
+ships the control as the default and gates the fusion behind
+`MUSER_FERRITE_FFN_GATE_UP`, and the reason lives in the source, where the
+fused kernels' rounding divergence "breache[s] public logprob tolerance"
+against the source-pinned llama Metal graph (`decode.rs:5819-5836` and
+`:1334` for the flag, `decode.rs:2085-2091` for the reason).
+
+That verdict was not invented here. The dispatch-gap investigation had
+already made the discipline explicit for a whole family of these fusions:
+they were "removed, not hidden behind a tolerance"
+[docs/decode-dispatch-gap-20260815.md, Rejected hybrid postmortem]. A flag
+is the gentlest form of that same judgement — the code survives, the default
+does not move. What we still cannot tell you is what the flag would be worth
+end to end: no retained A/B quotes a tok/s delta for this specific flag
+**[unverified]**. The burden the fused route has to clear is full-logit
+parity first, per the comment, and at the pin that gate is not recorded as
+passed.
 
 **Two accumulators in lockstep vs two kernels.** The 4r2s design doubles
 down on the V4 pattern of [Ch 13](13-the-qkv-gate-matvec-family.md): the
@@ -547,11 +612,14 @@ The cost is register pressure (`yl[16]`, `yh[16]`, `sumy`, four running
 accumulators) and a kernel that only exists for Q4_K (the `q4k_v4_…` helper
 is Q4_K-specific; Q5_K/Q6_K tensors would need their own decoders — hence
 the dtype guard at `decode.rs:5820-5821`). The payoff is the traffic ledger
-of §18.7. An older 4-SIMD-group variant (`ffn_q4k_gate_up_silu_4sg`,
-one row per threadgroup, 128 threads) sits in the same shader file at
-`ffn_fused_tail.metal:295` (with a threadgroup-x-cache sibling at `:392`) —
-lineage of the same idea with a coarser x-reuse; the 4r2s port at `:496` is
-the one Muser wired.
+of §18.7.
+
+The design did not arrive in that shape, either. An older 4-SIMD-group
+variant — `ffn_q4k_gate_up_silu_4sg`, one row per threadgroup, 128 threads —
+sits in the same shader file at `ffn_fused_tail.metal:295`, with a
+threadgroup-x-cache sibling at `:392`. Both are the same idea at a coarser
+grain of x-reuse, and both were kept rather than deleted; the 4r2s port at
+`:496` is the one Muser wired.
 
 **SiLU vs GELU vs ReLU.** The choice is the checkpoint's, not the engine's;
 the function-constant mechanism (§18.5) exists so one `.metal` source could
@@ -559,16 +627,20 @@ serve either at zero runtime cost. Muse Glimmer is SiLU — every route
 (fused `apply_activation`, control `muser_silu_mul_inplace`, CPU oracle
 `silu_fast`) implements `x·σ(x)`.
 
-**The normed-quant tail variants — present but unwired.** The shader
-library carries a family that goes one step further than 4r2s: fuse the
-*norm* into the gate+up read (`ffn_q4k_gate_up_silu_normed`,
+**The normed-quant tail variants — present but unwired.** The shader library
+carries a family that goes one step further than 4r2s: fuse the *norm* into
+the gate+up read, so that the FFN would consume the raw residual and
+normalize in-kernel. The kernel is `ffn_q4k_gate_up_silu_normed`, at
 `shaders/ferrite/ffn_fused_normed_quant.metal:296`, with Q5_K siblings at
-`:1` and `:190`), so the FFN would consume the raw residual and normalize
-in-kernel. At the pinned commit **no Rust wrapper binds any kernel from
-that file** (verified: no reference in `crates/muser-engine/src`), so it is
-not on a live path — retained as Ferrite-lineage research material. Its
-fate is the same story as §18.6 taken further: the more arithmetic you fold
-across a norm boundary, the harder bit-exactness becomes
+`:1` and `:190`. We went looking for whoever calls it, and found nobody: at
+the pinned commit **no Rust wrapper binds any kernel from that file**
+(verified: no reference in `crates/muser-engine/src`). It is not on a live
+path — retained as Ferrite-lineage research material.
+
+The reason that belongs in a tradeoffs section rather than a footnote is
+that it names the ceiling of the whole fusion strategy. Its fate is the
+story of §18.6 taken one step further: the more arithmetic you fold across a
+norm boundary, the harder bit-exactness becomes
 ([Ch 19](19-downproj-and-residual.md) §19.9 makes that tradeoff precise).
 
 ## 18.9 Where the gap lives

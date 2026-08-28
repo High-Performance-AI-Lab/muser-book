@@ -80,11 +80,17 @@ verifies (step 7) and the generation is durably reserved (step 8).*
 
 ## 30.3 The mTLS layer: TLS 1.3, exact ALPN, pinned leaves
 
-The security module builds both sides of the connection with three
-non-negotiable properties. First, **TLS 1.3 only** — the client config is
-built `with_protocol_versions(&[&rustls::version::TLS13])`
-(`[crates/muser-cluster/src/security.rs:122-124]`), and the server side
-likewise (`[crates/muser-cluster/src/security.rs:172-174]`). Second, an
+Take the threat-model questions in order. The first one is *who*: when a
+socket opens, how does the receiver know the machine on the far end is the
+producer it enrolled, and not something else that happens to hold a
+certificate? The security module answers with three non-negotiable
+properties, built symmetrically into both sides of the connection.
+
+First, **TLS 1.3 only**. The client config is built
+`with_protocol_versions(&[&rustls::version::TLS13])`, and the server side
+likewise, so there is no older version on offer for a downgrade to fall
+back to (`[crates/muser-cluster/src/security.rs:122-124]`,
+`[crates/muser-cluster/src/security.rs:172-174]`). Second, an
 **exact ALPN** string — Application-Layer Protocol Negotiation, the
 protocol name agreed inside the TLS handshake:
 
@@ -135,18 +141,31 @@ fail-closed: the key loader rejects symlinks, group/other-readable modes,
 and files that change while being opened, closing the
 validate-then-reopen race `[crates/muser-cluster/src/security.rs:289-335]`.
 
-One more channel, deliberately separate: the **control plane**. The Mac
-asks the resident producer daemon to prefill one exact token sequence over
-its own mTLS connection with ALPN `muser-prefill-control-v1`
-(`[crates/muser-cluster/src/control.rs:10]`) — and "cache bytes never ride
+One more channel, and it is worth a paragraph here rather than later,
+because it is what keeps the data path the *only* path bytes travel: the
+**control plane**. The Mac asks the resident producer daemon to prefill one
+exact token sequence over its own mTLS connection, with its own ALPN
+`muser-prefill-control-v1` (`[crates/muser-cluster/src/control.rs:10]`).
+The rule attached to that channel is absolute — "cache bytes never ride
 this channel; the daemon connects back over Handoff V2"
-`[crates/muser-cluster/src/control.rs:1-3]`. Control is small canonical
-JSON with closed bounds; data is the TLS stream of the next section.
+`[crates/muser-cluster/src/control.rs:1-3]`. Say it the other way round:
+control is small canonical JSON with closed bounds, and every byte of cache
+arrives on a connection the producer opened *back* to the receiver, after
+proving itself again. Ask for the work on one wire; receive the artifact on
+another. That second wire is the subject of the next section.
 
 ## 30.4 The HMAC-sealed manifest
 
-Inside the mTLS stream, the payload itself is framed as a transaction (the
-wire format is §30.5). The transaction's anchor is the **begin manifest**:
+mTLS answers *who is on the far end of this socket*, and that answer dies
+with the socket. The KV cache does not: it gets installed into an engine,
+re-checked against a delta witness, quoted in receipts, kept as evidence.
+So the second threat-model question is about the artifact rather than the
+channel — what proves *these bytes* are the ones the producer sealed, long
+after the connection that carried them is gone?
+
+Inside the mTLS stream, then, the payload itself is framed as a
+transaction (the wire format is §30.5). The transaction's anchor is the
+**begin manifest**:
 a typed structure carrying the transfer id, a **generation number**, the
 exact model identity digests, the full prompt token ids, the component
 list, and the segment descriptors
@@ -177,19 +196,29 @@ declared identity and prompt cannot change after the fact), the *concatenated
 canonical descriptors*, and the *entire payload stream* — every KV byte —
 hashed in order as segments arrived. One tag covers all of it.
 
-The word **canonical** is doing cryptographic work. The tag is computed
-over bytes, so both sides must serialize the core identically — across
-Rust *and* Python (the producer side). `canonical_json` sorts object keys
-recursively and emits compact JSON, "so Rust and Python (`sort_keys=True`,
-compact separators) emit identical bytes"; the recursive sort is
-"load-bearing" because a Cargo feature flag (`preserve_order`) would
-otherwise silently change the wire form
+The word **canonical** is doing cryptographic work, and this is the part
+that trips people up. An HMAC is computed over bytes, not over meaning. Two
+JSON documents that any parser would call equal — same fields, same values,
+different key order or different spacing — are two *different* messages to
+the tag. So the seal only works if the producer and the receiver serialize
+the core to the same bytes, and here they are not even the same language:
+the producer is Python, the receiver is Rust. `canonical_json` is what makes
+the two agree. It sorts object keys recursively and emits compact JSON, "so
+Rust and Python (`sort_keys=True`, compact separators) emit identical
+bytes"; the recursive sort is "load-bearing" because a Cargo feature flag
+(`preserve_order`) would otherwise silently change the wire form
 (`[third_party/kvpack/crates/kvpack-handoff/src/canonical.rs:8-17]`).
-Byte-layout contracts across ecosystems do not happen by accident; the
-vendoring record even carries a deliberate one-file patch for exactly this
-concern (canonical-json sorted keys, independent of serde's
-`preserve_order` feature — `third_party/kvpack/provenance.json`, audited
-by `scripts/audit_vendored_kvpack.py`).
+
+Notice what kind of failure that flag would produce, because it is the
+reason the next detail matters. A dependency change nobody reviewed as a
+protocol change would reorder some keys, the tag would stop matching, and a
+perfectly honest handoff would be refused as tampering — a security
+mechanism firing on a build-configuration bug. Byte-layout contracts across
+ecosystems do not happen by accident, so the vendoring record carries a
+deliberate one-file patch for exactly this concern: canonical-json sorted
+keys, independent of serde's `preserve_order` feature
+(`third_party/kvpack/provenance.json`, audited by
+`scripts/audit_vendored_kvpack.py`).
 
 Verification is streaming, not retrospective. The receiver's
 `AtomicReceiverV2` hashes descriptors and payloads *as each segment
@@ -228,6 +257,12 @@ proven live (the exact `replayed or stale generation` message in a
 retained command log; `[docs/gx10-return-runbook-2026-08.md §2]`).
 
 ## 30.5 The wire format
+
+The seal is checked at the *end* of the transaction. That leaves an
+uncomfortable stretch of time in between, and the question the wire format
+has to answer is: what can a peer make the receiver do before the seal
+arrives to vindicate or condemn it? The design's answer is to keep the
+pre-seal surface as small and as bounded as it can be made.
 
 On the TLS stream, frames are length-prefixed JSON headers with binary
 payloads. The constants and the frame set:
@@ -276,11 +311,20 @@ that `key_id:epoch`; generation 0 is refused unconditionally
 is between "engine prepared" and "engine published": a crash there must
 not allow the same generation to install twice. So the reservation is
 made durable *before* anything live changes, with the full
-write-fsync-rename-dir-fsync dance. (**fsync** is the operating-system call
-that forces buffered writes out of volatile caches onto the storage device
-itself; the *directory* variant is what makes a rename survive power loss —
-a renamed file whose directory entry never landed is a file that never got
-renamed.) The sequence:
+write-fsync-rename-dir-fsync dance.
+
+Two words in that dance need unpacking, because the whole guarantee rests
+on them. **fsync** is the operating-system call that forces buffered writes
+out of volatile caches onto the storage device itself. Put the other way
+round: without it, "written" means only that the kernel intends to write it
+soon, and a power cut turns that intention into nothing. The *directory*
+variant is the one people forget. A rename is a modification of the
+directory, not of the file, so a renamed file whose directory entry never
+landed is a file that never got renamed. Together the two give the property
+the ledger actually needs — the new high-water mark either exists after a
+crash or it does not, and there is no state in between.
+
+The sequence:
 
 ```rust
 // crates/muser-cluster/src/security.rs:472-486
@@ -329,16 +373,44 @@ handoff replayable again.
 ## 30.7 What lives where: the durability lesson
 
 That directory-fsync in step 4 is where a whole failure class was
-discovered. On 2026-08-18 the fast lane's qualification config pointed the
-replay ledger at the **evidence volume** (`muser-receipt://`,
-an external disk optimized for append-only writes). The volume's
-directory-fsync had a bimodal tail — median 0.22 ms, observed ~0.7 s —
-"sit[ting] between prepare_commit and commit — delaying ACK and first
-decode." With the ledger moved to the internal disk: "TTFT median 1.596 s,
-CV 0.56% (was 2.699 s / 21.40%)" `[docs/disaggregated-prefill-sealing-plan-20260818.md §W1 finding 1]`.
+discovered, and the fork is worth walking slowly, because the wrong turn
+was the *reasonable* one.
 
-The lesson, now codified in two places. In the operator rules: "operational
-state (replay ledger, sockets, locks) belongs on the internal disk — the
+Look at the replay ledger and it presents itself as evidence. It is an
+append-only record of which generations were admitted — precisely the sort
+of file this campaign keeps forever. And the fleet has a disk for exactly
+that: the **evidence volume**, `muser-receipt://`, an external disk
+optimized for append-only writes. So on 2026-08-18 the fast lane's
+qualification config pointed the replay ledger there. The premise was
+sound; only the conclusion was wrong. This file is not evidence, it is
+*operational state*, and what a receiver needs from it is not cheap appends
+but a fast, boring, predictable rename.
+
+The symptom was time-to-first-token that would not sit still. Not uniformly
+slow — *bimodal*. Most handoffs were fine; some stalled by most of a second,
+apparently at random, on identical work. When a decode arrives late, the
+expensive machinery is the natural suspect: the network transfer of a
+multi-gigabyte cache, or the Metal install on the far side. Neither
+explains a stall that comes and goes on runs that are otherwise the same.
+
+The cheap step was the culprit. Measured directly, the evidence volume's
+directory-fsync had a bimodal tail of its own — median 0.22 ms, observed
+~0.7 s — and that tail sat exactly where it could do maximum damage,
+"sit[ting] between prepare_commit and commit — delaying ACK and first
+decode." A sub-millisecond call in the common case was, in its tail, the
+single longest step in the critical path.
+
+Moving the ledger to the internal disk settled it: "TTFT median 1.596 s,
+CV 0.56% (was 2.699 s / 21.40%)" `[docs/disaggregated-prefill-sealing-plan-20260818.md §W1 finding 1]`.
+Read the coefficient of variation before the median. The median improved,
+but the real result is that the run stopped being erratic — which is the
+lesson worth carrying out of this section. What a latency budget spends on
+a durability primitive is not its average cost; it is its tail.
+
+The lesson is now codified in two places, and the pairing is the point: one
+rule for the humans, one gate in the code that would otherwise suffer.
+In the operator rules: "operational state (replay ledger, sockets, locks)
+belongs on the internal disk — the
 evidence volume's directory-fsync tail produces bimodal ~1 s stalls in
 commit paths" `[AGENTS.md §Hard rules]`. And in the receiver itself — the
 **ledger-volume gate**: at bind time, the receiver probes its own ledger
@@ -407,8 +479,10 @@ fail-closed stance as everything else in this chapter. Only after the
 three passes *and* the 3.0 Gbps median is `state=healthy` durably written
 `[docs/one-button-onboarding.md §6b smoke]`.
 
-The wizard's own validation is the evidence that the whole chapter works
-end to end `[claims #9]`:
+Does any of this actually run, end to end, against real hardware? Two
+retained wizard packets say yes, and they are worth reading side by side,
+because the second one holds itself to a strictly harder contract than the
+first `[claims #9]`:
 
 - **Attempt 9 (native/text)**: all seven labels; three 2,048/256 handoffs
   with exact tokens (digest `42f09900…`) under the bounded-logit rule —
@@ -420,17 +494,42 @@ end to end `[claims #9]`:
   **9.811736 / 8.886919 / 8.689889 Gbps**; `state=healthy`, canonical
   resident restored afterward `[receipt wizard-validation-20260823/attempt-31-combined-full-20260824T132639Z/validation-summary.json]`.
 
-Getting from attempt 9 to attempt 31 took attempts 10–30 — the
-arithmetic-ABI chase of [Ch 29 §29.8](29-cuda-versus-metal.md). And
-behind attempt 9 stood eight failed attempts, each failing closed on a
-real defect (stale geometry residuals, a wrong-route `flash_attn_ext`
-override, a stale RoPE-cache manifest, a 3.0 Gbps gate computed from the
-wrong clock) `[ledger Arc "The wizard: attempts 9 and 31"]`. That is the
-pattern of this whole Part: the channel is trustworthy exactly because
+Two clean packets. That is what the record shows, and it is not what the
+work looked like — the attempt numbers give that away before anything else
+does.
+
+Behind attempt 9 stood eight earlier attempts, and the useful thing
+about them is *how* they ended. Not one hung, and not one produced quietly
+plausible output that someone had to catch by eye later. Each failed
+closed, on a real defect the gates were built to find: stale geometry
+residuals; a wrong-route `flash_attn_ext` override; a stale RoPE-cache
+manifest; and a 3.0 Gbps gate computed from the wrong clock
+`[ledger Arc "The wizard: attempts 9 and 31"]`. Sit with that last one for
+a moment, because it is the most instructive of the four. The gate did not
+wrongly admit a bad node — it wrongly *rejected* a good one, by measuring
+the sender's own optimism instead of the wire. We expected a failing gate
+to mean "the node is not ready." What it meant that time was "the
+instrument is not ready," and nothing but going and looking will tell those
+two apart. The next chapter turns that particular scar into a standing rule
+about which clock is allowed to time a transfer.
+
+Getting from attempt 9 to attempt 31 then took attempts 10–30 — the
+arithmetic-ABI chase of [Ch 29 §29.8](29-cuda-versus-metal.md), a long
+stretch of runs spent making two vendors' arithmetic agree when both
+believed they already did.
+
+So read the two passing packets the right way. They are not evidence that
+the pipeline worked on the first try; they are the runs that came out the
+far side of a gate that had been refusing everything before them. That is
+the pattern of this whole Part: the channel is trustworthy exactly because
 its refusals kept firing.
 
-One operational requirement the wizard leaves with you: the enrolled
-consumer must run the matching strict Metal graph — `MUSER_CROSS_VENDOR_QK=1`
+One operational requirement survives the wizard and lands on the operator,
+and it matters because it is the seam where all of this could still be
+undone by a default: a cache sealed under strict cross-vendor arithmetic is
+only meaningful if the machine that decodes from it does the same
+arithmetic. So the enrolled consumer must run the matching strict Metal
+graph — `MUSER_CROSS_VENDOR_QK=1`
 — and "both modes refuse startup when `MUSER_CROSS_VENDOR_QK` is absent or
 not exactly `1`; they never install a strict CUDA cache into the ordinary
 Metal math route" `[docs/one-button-onboarding.md §Starting the production
@@ -438,11 +537,23 @@ consumer]`.
 
 ## 30.9 Scatter-on-arrival: the engine side of the transaction
 
-The last piece is what the receiver does *while* bytes stream in. The
-`MuseCacheShadow` sink "writes authenticated target tiles into a detached
+The last piece is what the receiver does *while* bytes stream in — and
+there is a real tension to resolve there. Waiting for the seal before
+touching anything is the safe order, but a receiver that waits idly until
+the last frame has thrown away the whole prefill window it could have spent
+installing. The resolution is to do the work early and make it
+*unobservable* until the seal clears.
+
+The `MuseCacheShadow` sink "writes authenticated target tiles into a detached
 Metal generation as they arrive. Live decode state is replaced only in
 `commit`, after the HMAC seal has been verified"
-(`[crates/muser-cluster/src/muse_sink.rs:41-43]`). The wire order that
+(`[crates/muser-cluster/src/muse_sink.rs:41-43]`). A detached generation is
+a staging area with the shape of the real thing: bytes land in it during
+the transfer, and if the seal fails they are discarded having never been
+visible to a decode.
+
+If the sink can install as tiles land, the next question belongs to the
+producer: what can it send before prefill has finished? The wire order that
 makes streaming productive is fixed by the transfer schedule — the 13 NoPE
 layers `[3, 7, …, 51]` as 512-token tiles (~6.5 MiB each), three SWA
 groups of 13 layers, **layer-major** so "every SWA group is sendable as

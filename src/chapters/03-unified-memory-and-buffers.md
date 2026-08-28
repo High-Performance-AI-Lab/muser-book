@@ -12,9 +12,12 @@
 
 Chapter 2 closed on `set_buffer(slot, buffer, offset)` and deliberately
 deferred the memory story — what an `MTLBuffer` is on this machine, and why
-one buffer can hold the whole 16.76 GB model. This chapter is that story,
-and it starts from the single most important fact about Apple Silicon for
-inference.
+one buffer can hold the whole 16.76 GB model. That deferral leaves a
+question standing, and it is the question this chapter answers: where do
+the weights actually live while the GPU is reading them, and what does it
+cost to put them there? On this machine the answer is short enough to be
+surprising, and it starts from the single most important fact about Apple
+Silicon for inference.
 
 On a discrete GPU — an NVIDIA card in a desktop — the CPU and the GPU do
 **not** share memory. The CPU sits next to one pool of memory chips
@@ -66,6 +69,12 @@ what Metal calls its buffers.
 
 ## 3.2 The three Metal storage modes, and the one Muser uses
 
+Unified memory settles *where* bytes can live. It does not tell Metal what
+you intend to do with them, and Metal insists on being told: every
+allocation carries a declaration. So the question for this section is which
+declaration Muser makes — for every buffer in the engine, without exception
+— and why a faster-looking alternative was tried and then handed back.
+
 When you ask the `MTLDevice` for a buffer, you must tell it a
 **[storage mode](../glossary.md#storage-mode)** — where the bytes physically
 live and who can see them. Metal defines three `[Metal-PG, "Resource
@@ -98,33 +107,56 @@ fn shared_tracked() -> MTLResourceOptions {
 }
 ```
 
-Read that comment carefully — it is a design decision with a scar attached
-(and the return value is deliberately just `StorageModeShared`, *without*
-any `HazardTrackingModeUntracked` flag).
+A function that returns one enum constant should not need a paragraph of
+commentary above it. This one does, because the interesting part is what
+the return value *omits*: it is just `StorageModeShared`, with no
+`HazardTrackingModeUntracked` flag beside it. The comment is a scar, and
+the story behind it is worth telling in full, because the failure it
+records is one this book will keep meeting: a change that produces
+correct-looking output and is wrong anyway.
 
-> **Lineage — the untracked-hazards gamble, and why Muser declined it.**
+> **Lineage — the untracked-hazards gamble, and why we declined it.**
 > Metal can optionally mark buffers **untracked** (`HazardTrackingModeUntracked`),
 > which tells the driver to skip its automatic dependency tracking between
-> dispatches. The ancestor Ferrite engine ran untracked and made that safe
-> with its own conflict-driven barrier planner — measured there at a real
+> dispatches. Bookkeeping you skip is work you do not pay for, and we had
+> reason to expect a win: the ancestor Ferrite engine ran untracked and made it safe
+> with its own conflict-driven barrier planner, measured there at a real
 > but modest win `[ferrite-book Ch 3]` (Ferrite-lineage numbers, ~2–4 % on
-> that lab's A18-class hardware). Muser tried the global switch once: commit
-> `b9678d4` enabled untracked mode "before that contract existed" — before
-> every cross-encoder dependency had an explicit fence — and it
+> that lab's A18-class hardware). So we took the fork. Commit `b9678d4`
+> flipped the switch engine-wide — and, in the comment's own words, did it
+> "before that contract existed": before every cross-encoder dependency in
+> Muser had an explicit fence standing in for the tracker we had just
+> turned off.
+>
+> What we expected was a small speedup and byte-identical output. What we
+> got was identical output and *different internal state*. The build
 > *empirically changed DFlash [speculative-draft] conditioning while leaving
 > final greedy IDs unchanged* (`[crates/muser-engine/src/metal/buffer.rs:7-14]`).
-> A silent conditioning change with correct-looking output is precisely the
-> failure this engine exists to prevent, so Muser runs Metal's default
-> **tracked** storage plus the explicit `memoryBarrierWithScope` groups you
-> met in [Ch 2 §2.9](02-metal-compute-model.md). The general rule survives
-> from the ancestor book: turning off a safety net is safe *if and only if*
-> something else provably enforces the ordering — and here the cheaper
-> provable thing was to keep the net on.
+> Read that twice. The tokens matched — so every greedy-output test we had
+> would have gone green. What moved was the speculative draft's
+> conditioning, which is watched on its own precisely so that a change like
+> this has somewhere to show up.
+>
+> A silent conditioning change with correct-looking output is exactly the
+> failure this engine exists to prevent, so the switch went back. Muser runs
+> Metal's default **tracked** storage plus the explicit
+> `memoryBarrierWithScope` groups you met in
+> [Ch 2 §2.9](02-metal-compute-model.md). The general rule survives from the
+> ancestor book, and it is worth stating in the abstract because it recurs
+> for the rest of the engine: turning off a safety net is safe *if and only
+> if* something else provably enforces the ordering. Ferrite had that
+> something — a barrier planner. Muser, at that commit, did not, and the
+> cheaper provable thing was to keep the net on.
 
 ## 3.3 The buffer substrate: three types, one view
 
-Muser's buffer module is small enough to read in one sitting. Three concrete
-buffer types and one view type carry the whole engine:
+Unified memory decides where bytes live; it says nothing about what they
+*mean*. An engine that keeps f32 activations, f16 KV planes and immutable
+quantized weights in a single address space needs some way of stopping
+itself from confusing them — and it has to do that without a runtime type
+tag on the hot path, because the hot path runs per token. That is the job
+of the buffer module, and it is small enough to read in one sitting. Three
+concrete buffer types and one view type carry the whole engine:
 
 ```rust
 // crates/muser-engine/src/metal/buffer.rs:28
@@ -184,12 +216,22 @@ Walk them:
 If you know the ancestor Ferrite book: its `GpuBuffer` was a six-field
 struct with a dtype, a view length, and an arena offset. Muser's substrate
 is deliberately flatter — three typed wrappers instead of one typed field,
-and views only where views are needed (byte storage). The engine is
-one-model, so the dispatch code knows each buffer's type statically
-(`[crates/muser-engine/src/lib.rs:163-171]` describes the
-"pull-and-simplify" provenance of this module).
+and views only where views are needed (byte storage). It can afford to be:
+the engine serves one model, so the dispatch code already knows every
+buffer's type statically, and a dtype field would only be describing at
+runtime what the compiler could have enforced. That simplification was made
+on purpose when the substrate was pulled across from the ancestor, and the
+crate documentation records the "pull-and-simplify" provenance
+`[crates/muser-engine/src/lib.rs:163-171]`.
 
 ## 3.4 Zero-init is policy, not luck
+
+What is in a buffer at the moment you receive it, and who is allowed to
+read it before anyone has written it? That sounds like a pedant's question
+until you notice what the wrong answer looks like in an inference engine:
+not a crash, but a plausible token. Garbage that happens to be zero is
+indistinguishable from a real value, and a stale row in a KV cache is a
+sentence the model half-remembers from someone else's conversation.
 
 Metal's `new_buffer` does **not** zero the memory it hands you; contents
 are undefined. Inference is full of buffers that are *partially* written
@@ -223,10 +265,14 @@ tail rows are not yet meaningful), so Muser makes initialization explicit:
     pub fn uninitialized(context: &MetalContext, len: usize) -> Result<Self, MetalError> {
 ```
 
-That last paragraph is the elegant part: in debug builds the unwritten
-rows are filled with `0xDEAD` (`buffer.rs:270-275`), so a contract
-violation reads conspicuously poisoned values instead of plausible zeros —
-the bug is *loud* in exactly the builds where anyone is looking.
+That last paragraph is the elegant part, and it is the answer to the
+question this section opened with. In debug builds the unwritten rows are
+filled with `0xDEAD` (`buffer.rs:270-275`), so a contract violation reads
+back conspicuously poisoned values instead of plausible zeros. Put the
+other way round: the fast path is allowed to leave stale bytes behind
+precisely *because* the slow path refuses to leave believable ones. A bug
+that lets a read reach a not-yet-written row cannot hide as a slightly odd
+number — it is loud, in exactly the builds where somebody is looking.
 
 Where each path is used, precisely:
 
@@ -243,16 +289,26 @@ Where each path is used, precisely:
   a bulk-write-then-publish pattern where the write-before-read guarantee
   is structural.
 
-One correction while we are here, because an earlier revision of a Muser
-doc got it backwards and the book inherits the fix, not the error:
-`docs/memory-footprint.md`'s "Metal KV buffers are allocated without a CPU
-memset" is **wrong for live planes** — they zero-fill, as above; only the
-detached remote-install generations skip the memset
-`[docs/kvpack-merge-handoff.md §3 D2, the 2026-08-20 audit]`.
+One correction while we are here, because we nearly walked into it
+ourselves. Writing this section we started where you would start — from the
+engineering doc — and `docs/memory-footprint.md` says flatly that "Metal KV
+buffers are allocated without a CPU memset." Taken at face value that
+inverts everything above: it makes the fast path the default and the
+zero-fill the exception, and this section would have been a footnote.
+The two constructors above say otherwise, and an audit had already caught
+the same discrepancy. The doc sentence is **wrong for live planes** —
+those zero-fill, as above — and right only about the detached
+remote-install generations. We kept the receipt for the correction
+`[docs/kvpack-merge-handoff.md §3 D2, the 2026-08-20 audit]`. The book
+inherits the fix, not the error; the general lesson is that source outranks
+prose about source, including prose written by the same people.
 
 ## 3.5 Page alignment: the 16 KB contract
 
-Before the mmap story, one piece of arithmetic. Apple Silicon uses a
+Before the mmap story, one piece of arithmetic — the kind that works for
+years and then doesn't. The question is narrow, and it is the one to ask
+whenever you hand a driver a pointer to memory you did not allocate: what
+exactly are you promising it about that memory? Apple Silicon uses a
 **16 KB virtual-memory page** (not the 4 KB you may know from x86). The
 Metal call that wraps external memory — `new_buffer_with_bytes_no_copy` —
 requires a page-aligned pointer *and* a page-aligned length. A file's byte
@@ -307,14 +363,24 @@ careful about *why* that is safe:
 *(the allocation-size check at `buffer.rs:122-124` is elided; everything
 else is verbatim.)*
 
-The paragraph of comment is doing real epistemic work: it distinguishes
-what Metal *guarantees* (page-aligned length required) from what merely
-*happened to work* (raw lengths "working" because the kernel zero-fills
-the tail anyway — "an undocumented tolerance, not a guarantee"), and then
-makes the code obey the documented contract. A unit test pins the behavior
-down (`from_mmap_rounds_metal_length_up_to_the_page_boundary`,
+That paragraph of comment is doing real epistemic work, and it is worth
+slowing down for, because the bug it fixes had never once fired. Passing
+the raw file length straight to Metal *worked*. It worked because `mmap`
+reserves whole pages under the hood and zero-fills the tail of the last
+one, so the bytes past the file's end were always mapped and always zero —
+and no test we could write would tell that apart from being right. The comment
+separates the two anyway: what Metal *guarantees* (a page-aligned length is
+required) from what merely *happened to work* ("an undocumented tolerance,
+not a guarantee"). Then the code goes and obeys the documented contract.
+Nothing was failing when that change was made; the point is that the
+alternative was a load path resting on an OS behaviour nobody ever promised
+us, and a future macOS is under no obligation to keep providing it.
+
+Two details finish the section. A unit test pins the rounding down
+(`from_mmap_rounds_metal_length_up_to_the_page_boundary`,
 `buffer.rs:347-376`): a 10-byte file yields `len() == 10` and a
-Metal-facing length that is a page multiple. The page size itself comes
+Metal-facing length that is a page multiple — the logical length stays
+exact, only the allocation grows. And the page size itself comes
 from POSIX `getpagesize()` via a one-line `extern "C"` — avoiding a `libc`
 dependency for one constant (`buffer.rs:16-26`).
 
@@ -324,8 +390,11 @@ gets wrapped — the next section.
 
 ## 3.6 Zero-copy at 16.76 GB scale: mmap → one buffer → offset views
 
-The payoff of unified memory, end to end. Three code locations tell the
-whole story.
+This is the payoff, end to end — the section where "the CPU and the GPU
+share memory" stops being an architecture diagram and becomes a load path
+that copies nothing. Hold the question a discrete-GPU engineer would ask
+first while you read it: *when do the weights get uploaded?* The answer is
+that there is no upload, and three code locations are enough to show why.
 
 **1. The engine mmaps the whole GGUF once.** Loading does not read the
 weights into RAM; it maps the file and records where each tensor lives:
@@ -404,6 +473,12 @@ explain — hands the GPU "which buffer" and "where in it" in a single call:
 encoder.set_buffer(0, Some(weights.metal()), weights.offset() as u64);
 ```
 
+Put the three together and the discrete-GPU question dissolves rather than
+gets answered. There is no upload step because there is nowhere to upload
+*to*: the file's pages, the Metal buffer, and the bytes a kernel dereferences
+are one region of physical memory wearing three names. The figure below is
+the entire load path — a mapping, a wrapper around it, and arithmetic.
+
 ```text
    GGUF file on disk (16,756,681,056 B)
    ┌──────────────────────────────────────────────────────────────────────┐
@@ -436,14 +511,16 @@ translations; each buffer consumes entries). With one arena there is
 exactly one mapping, and the per-tensor "allocation" is a 24-byte struct.
 The ancestor book demonstrated the same trade on its engine's arena
 `[ferrite-book Ch 3]`; Muser's version is the same idea expressed through
-`GpuByteView` over `GpuBytes`. (llama.cpp's Metal backend makes the same
-choice — mapping the whole file and slicing — corroborated in the ancestor
-book's audit of `ggml_metal_buffer_map` `[ferrite-book Ch 3]`; this book
-has not re-read llama.cpp source and marks that corroboration lineage.)
+`GpuByteView` over `GpuBytes`. We are not alone in the choice: llama.cpp's
+Metal backend maps the whole file and slices it the same way. That
+corroboration reaches us second-hand, through the ancestor book's audit of
+`ggml_metal_buffer_map` `[ferrite-book Ch 3]` — this book has not re-read
+llama.cpp's source, so we mark it lineage rather than verification.
 
 ### Keeping 16 GB resident: the residency set
 
-One more substrate piece, specific to this scale. The mapped arena is
+One more substrate piece, and it exists only because of the scale — at a
+few hundred megabytes nobody would bother. The mapped arena is
 bound by *every* projection in *every* command buffer — per token. Rather
 than let Metal redo residency bookkeeping for a 16+ GiB allocation each
 time, Muser attaches it to an `MTLResidencySet` once at load:
@@ -462,13 +539,22 @@ time, Muser attaches it to an `MTLResidencySet` once at load:
 `objc::msg_send!` calls — the `metal` crate does not wrap this API — adds
 the arena's buffer, commits, requests residency, and attaches the set to
 the queue. On any macOS release without the API it returns `None` and the
-engine proceeds on Metal's ordinary residency path: an optimization that
-*fails open*, never a correctness dependency.
+engine proceeds on Metal's ordinary residency path. That distinction
+matters more than it looks: this is an optimization that *fails open*.
+Lose it and tokens still come out, correct, with Metal doing the residency
+bookkeeping the long way — which is exactly the opposite of the untracked
+gamble earlier in this chapter, where dropping the safety net changed
+behaviour silently. Both are engine paths that may not be taken; only one
+of them is permitted to be quiet about it.
 
 ## 3.7 What 96 GB buys, revisited from the buffer side
 
 [Ch 1 §1.5](01-why-inference-is-a-memory-problem.md) budgeted the 96 GB by
-artifact. From the substrate's point of view the same budget reads:
+artifact — how much each thing takes. Now that you know what a buffer
+actually *is*, the same budget answers a sharper question: which of these
+bytes does the engine own, and which is it merely borrowing from the
+operating system? From the substrate's point of view the same budget
+reads:
 
 - **Weights are not "used" memory in the ordinary sense** — they are a
   read-only file mapping, page-cache backed
@@ -489,17 +575,17 @@ artifact. From the substrate's point of view the same budget reads:
 
 ## 3.8 Tradeoffs
 
-**Tracked storage vs the untracked gamble.** Covered in §3.2's lineage
-box; the measured Muser fact is that the global-untracked experiment
-(`b9678d4`) "empirically changed DFlash conditioning while leaving final
-greedy IDs unchanged" (`[crates/muser-engine/src/metal/buffer.rs:7-14]`) —
-a silent-behavior change invisible to greedy-output tests, caught because
-speculative conditioning is watched separately. The engine's answer
-(tracked default + explicit barrier groups) costs whatever Metal's tracker
-costs on the encode path and buys the safety net back. No Muser document
-isolates the tracked-vs-untracked encode cost on this machine
-[unverified] — the decision is recorded as a correctness ruling, not a
-performance one.
+**Tracked storage vs the untracked gamble.** The story is in §3.2's lineage
+box; here is what it costs. Muser pays for Metal's dependency tracker on
+every encode, plus the explicit barrier groups, and gets back a safety net
+that the one experiment we ran showed it needed: the engine-wide untracked
+build (`b9678d4`) "empirically changed DFlash conditioning while leaving
+final greedy IDs unchanged" `[crates/muser-engine/src/metal/buffer.rs:7-14]`.
+Now notice what that sentence does *not* say. It does not say the untracked
+path was slower, or faster — no Muser document isolates the
+tracked-vs-untracked encode cost on this machine [unverified]. The ruling
+was made on correctness alone, and it would stand unchanged if untracked
+turned out to measure quicker.
 
 **One arena + views vs one buffer per tensor.** Views are cheap (24 bytes,
 one bounds check) and make the whole model one mapping — but they collapse
@@ -516,7 +602,10 @@ that can be many gigabytes (`buffer.rs:248-254`) — in exchange, the ring
 metadata must guarantee write-before-read for every row in
 `[origin, origin + len)`. Muser makes the obligation visible three ways:
 the doc comment's "ONLY", the debug-build `0xDEAD` poison, and the test
-that demonstrates it (`buffer.rs:328-344`).
+that demonstrates it (`buffer.rs:328-344`). That is the shape of the whole
+bargain, and it generalizes past this buffer: when you take a shortcut
+whose safety lives in some other module's invariant, spend part of the
+winnings making that invariant loud.
 
 ## 3.9 What's next
 

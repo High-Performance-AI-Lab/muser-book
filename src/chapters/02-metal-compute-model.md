@@ -41,12 +41,13 @@ Metal gives you three things:
    which you write the code each thread runs. That per-thread program is
    called a **[kernel](../glossary.md#kernel)**: a single function, written
    once, that every thread in a launch runs once over its own slice of the
-   data. Muser's kernels live in
-   `crates/muser-engine/src/shaders/` — 29 `.metal` files under that
-   directory (two Muser-authored; 27 in the `ferrite/` lineage directory
-   with provenance recorded in the extraction manifest
-   `[docs/extraction-manifest.md]`), plus one bench-only candidate shader
-   under `crates/muser-bench/`.
+   data. Muser's kernels live in `crates/muser-engine/src/shaders/`, and
+   the census there is small enough to say out loud: 29 `.metal` files,
+   of which two are Muser-authored and 27 sit in the `ferrite/` lineage
+   directory, plus one bench-only candidate shader under
+   `crates/muser-bench/`. Where an inherited kernel came from is recorded
+   rather than remembered; the extraction manifest is retained
+   `[docs/extraction-manifest.md]`.
 2. A **host API** (Objective-C underneath, wrapped by the Rust crate
    `metal`) — the code the CPU runs to compile kernels, allocate memory,
    and submit work.
@@ -114,16 +115,26 @@ an unbounded block. Recording is pure CPU bookkeeping measured in
 microseconds; the wall-clock time is paid between `commit` and the wait
 returning.
 
-One deliberate difference from the ancestor Ferrite book's engine: Muser
-does not have a `dispatch_*` family of test-only wrappers that each pay a
-full commit-and-wait round trip. Tests hand-roll the same five steps
-inline when they need them (e.g. the multi-column kernel tests at
-`[crates/muser-engine/src/metal/encode/multicol.rs:373-390]`). Everything
-on the hot path is an `encode_*` call onto a shared encoder.
+One deliberate difference from the ancestor Ferrite book's engine is worth
+a paragraph, because it is the reason the cost model you just learned is
+the *only* one you need: Muser does not have a `dispatch_*` family of
+test-only wrappers that each pay a full commit-and-wait round trip. In an
+engine that has them, a kernel can be submitted two ways — the cheap
+shared-tape way on the hot path and the expensive one-tape-per-kernel way
+in tests — and the two drift. Here, tests hand-roll the same five steps
+inline when they need them; the multi-column kernel tests are the example
+to read `[crates/muser-engine/src/metal/encode/multicol.rs:373-390]`.
+Everything on the hot path is an `encode_*` call onto a shared encoder,
+and there is no second submission shape to keep in your head.
 
 ## 2.4 The handles: one struct, five GPU objects
 
-Muser holds its long-lived GPU state in one struct, `MetalContext`:
+Which pieces of GPU state deserve to be created once and kept forever, and
+what does getting that wrong cost? The question is not academic: opening a
+device, building a command queue, and compiling a library of shaders are
+all slow enough that doing any of them per token would swamp the token.
+Muser's answer is to hoard exactly the handles that are expensive to make
+and cheap to share, in one struct, `MetalContext`:
 
 ```rust
 // crates/muser-engine/src/metal/context.rs:32
@@ -168,16 +179,23 @@ wraps `MTLLibrary`.
   upstream kernels Muser dispatches for numerical parity
   (`[crates/muser-engine/src/metal/context.rs:122-131]`).
 
-At *construction* time, every kernel is looked up by name and compiled
-once into a cached pipeline state (the `MetalKernels` constructor and its
-`PIPELINES` registry of 66 names, `[crates/muser-engine/src/metal/encode.rs:21-88]`
-— [Ch 4](04-pso-and-three-kernel-sources.md) again). At *dispatch* time
-you never touch the library; you reference the cached pipeline through the
-registry, e.g. `self.bind(encoder, "sigmoid_gate_inplace")` at
-`[crates/muser-engine/src/metal/encode/gate.rs:17]`. A miss is a loud
-panic — `PsoCache::get` refuses to return silently for an unregistered
-name (`[crates/muser-engine/src/metal/pso_cache.rs:45-49]`) — a programming
-error, never a runtime condition.
+There is a timing rule hiding in that list, and it is the part to carry
+forward. At *construction* time, every kernel is looked up by name and
+compiled once into a cached pipeline state — the `MetalKernels`
+constructor and its `PIPELINES` registry of 66 names
+`[crates/muser-engine/src/metal/encode.rs:21-88]`, which is
+[Ch 4](04-pso-and-three-kernel-sources.md)'s subject again. At *dispatch*
+time you never touch a library at all. You reach for the pipeline the
+registry already holds, and it costs a line:
+`self.bind(encoder, "sigmoid_gate_inplace")`
+`[crates/muser-engine/src/metal/encode/gate.rs:17]`.
+
+Ask the registry for a name nobody put in it and the process dies on the
+spot: `PsoCache::get` refuses to return silently for an unregistered name
+`[crates/muser-engine/src/metal/pso_cache.rs:45-49]`. That loudness is on
+purpose — a missing pipeline is a programming error, never a runtime
+condition — and the tradeoffs section returns to why the crash is the
+kinder outcome.
 
 These five objects are the only long-lived GPU state. Everything else —
 buffers, command buffers, encoders — is created per-use or per-token
@@ -185,9 +203,14 @@ buffers, command buffers, encoders — is created per-use or per-token
 
 ## 2.5 One queue, one owner
 
-Metal serializes command buffers from one queue in FIFO order, but a
-server with several resident sequences could still stampede the queue from
-many threads. Muser's answer is a single owner:
+When several sequences are decoding at once, who is allowed to talk to the
+GPU, and in what order? Metal answers half of that: command buffers from
+one queue run in FIFO order, so the GPU itself will not interleave two
+tokens' work. It does not answer the other half. Several resident
+sequences can still stampede the queue from many threads, and FIFO then
+means only "whoever got there first, repeatedly" — a hot slot can starve
+its peers while staying perfectly ordered. Muser's answer is a single
+owner:
 
 ```rust
 // crates/muser-engine/src/decode.rs:1020
@@ -328,6 +351,17 @@ group. The reduction inside is the classic two-stage pattern:
 6. A second barrier, then every thread re-reads `inv_rms` and scales its
    slice of the row.
 
+Say the same thing the other way round, because this asymmetry is the one
+idea that shapes every kernel in the rest of the book: inside a SIMD group,
+threads talk to each other for free, in a single instruction. Between SIMD
+groups, they cannot talk at all — they can only leave messages in
+threadgroup memory and agree, via a barrier, on when it is safe to read
+them. Two levels of communication, two very different prices. A kernel
+that does its reducing inside SIMD groups and its combining across them
+pays the expensive price as few times as possible; that is what the
+two-stage pattern above is *for*, and it is why the geometry of a launch is
+never an arbitrary choice.
+
 The Rust side that launches it:
 
 ```rust
@@ -375,9 +409,14 @@ per threadgroup). The suffix is the geometry.
 
 ## 2.7 The grid is the output shape
 
-Different kernels launch different grids, and the rule is always: **the
-grid is the output shape.** Two contrasting real geometries from Muser's
-decode path:
+How many threads should a kernel launch? There is a rule, and it is short
+enough to memorize: **the grid is the output shape.** You launch one thread
+per thing you intend to write, and the shape of the launch follows the
+shape of the answer, never the shape of the input. Getting it wrong is not
+a performance bug, it is a correctness bug — too small a grid leaves part
+of the output holding whatever was there before, and too large a grid runs
+off the end of the buffer unless the kernel guards. Two contrasting real
+geometries from Muser's decode path show the rule doing its work:
 
 **An elementwise kernel — one thread per element.** Muse Glimmer's sigmoid
 attention-output gate multiplies one 4,096-wide vector by an
@@ -537,7 +576,14 @@ closure boundary is a real dependency, and `before_dispatch` plants a
 next group starts. The comment names the provenance: this is llama.cpp's
 own dependency-reset discipline, adopted wholesale.
 
-The serial variant exists for one measured reason — an A/B switch:
+So why does the serial encoder still exist at all? Because which flavor
+wins is not obvious from first principles, and the losing side was kept so
+the comparison can be re-run. The decode path had already been converted:
+its projections sit together in one closure and overlap. Prefill was the
+open question, and the argument for leaving it serial was respectable —
+prefill kernels are large, a large kernel should saturate the GPU on its
+own, and concurrency would then be buying overlap nobody needed while
+still paying for barriers. The comment records how that argument fared:
 
 ```rust
 // crates/muser-engine/src/decode.rs:976 (fields of MetalShared)
@@ -547,14 +593,22 @@ The serial variant exists for one measured reason — an A/B switch:
 concurrent_prefill_dispatch: bool,
 ```
 
-`MUSER_SERIAL_PREFILL_DISPATCH` (`[crates/muser-engine/src/decode.rs:1332]`)
-restores the old serial prefill encoder so the two policies can be compared
-on the same binary — the same flag-for-measurement culture you will meet
-throughout the book. The diagnostic route goes further and gives *every*
-dispatch group its own command buffer, so Metal exposes exact GPU
-intervals: the `PhaseProfiler` at
+Serial prefill lost. The launch tax it paid was visible in the
+prompt-processing cell, so concurrent became the default — and the old
+encoder was not deleted. `MUSER_SERIAL_PREFILL_DISPATCH` restores it
+`[crates/muser-engine/src/decode.rs:1332]`, which means the two policies
+can still be raced against each other on one binary, on whatever machine
+doubts the result. That is the flag-for-measurement culture you will meet
+throughout this book: a decision that was made by a number keeps the switch
+that produced the number.
+
+The same instinct, pushed to its diagnostic extreme, gives *every* dispatch
+group its own command buffer. That is deliberately the expensive shape this
+section argued against — and it is exactly why it is useful, because Metal
+then reports an exact GPU interval per group instead of one interval per
+token. It lives in the `PhaseProfiler`
 `[crates/muser-engine/src/decode.rs:6224-6236]`, gated by
-`MUSER_METAL_PHASE_PROFILE` — diagnostic-only, never on the serving path.
+`MUSER_METAL_PHASE_PROFILE`, diagnostic-only and never on the serving path.
 
 ## 2.10 The full cycle, and a bounded wait
 
@@ -584,43 +638,76 @@ The 300-second deadline you saw in `forward_token` is that mechanism.
 
 ## 2.11 Tradeoffs
 
-**One command buffer per token vs. per dispatch.** The alternative — one
-buffer per kernel, committed and awaited — pays a CPU↔GPU round trip per
-dispatch, hundreds per token. Muser records the whole token (embedding
-through softcap) onto one buffer and waits once. The cost side is real too:
-encode-side work and dispatch *count* are measurable, and the campaign
-measured them. The production one-token decode graph reconciles to **760
-profiling closures vs the legacy route's 564 — a +196 difference —
-reconciled exactly into 104 separated norm-boundary groups + 39 SWA
-wrapped-ring staging groups + 52 KV-publication/attention splits + 1
-last-row copy** `[docs/decode-dispatch-gap-20260815.md §Corrected
-closure-count diff]` (closures are Rust profiling closures, not raw Metal
-dispatches). The tempting fix — fusing away the 104 norm-boundary groups —
-was built and **rejected for changing bits**: normalized-logprob max error
-3.197e-4 against a 1e-4 contract, first divergence one f16 ULP in layer-1
-V `[docs/decode-dispatch-gap-20260815.md §Rejected hybrid postmortem]`.
-(In that sentence a *logprob* is the logarithm of the probability the model
+Three decisions in this chapter had a plausible alternative. Here is what
+happened when we took each alternative seriously.
+
+**One command buffer per token vs. per dispatch.** Start with the easy
+half. The obvious way to run a decode graph is one command buffer per
+kernel — record, commit, wait, repeat — and it is what a first engine
+writes, because every step is independently debuggable. It also pays a
+CPU↔GPU round trip per dispatch, hundreds of them per token, which is why
+Muser records the whole token (embedding through softcap) onto one buffer
+and waits once.
+
+The hard half is that the cheap shape is not free either: batching a token
+onto one tape makes encode-side work and dispatch *count* grow, and both
+are measurable. So the campaign measured them. The production one-token
+decode graph reconciles to **760 profiling closures vs the legacy route's
+564 — a +196 difference — reconciled exactly into 104 separated
+norm-boundary groups + 39 SWA wrapped-ring staging groups + 52
+KV-publication/attention splits + 1 last-row copy**
+`[docs/decode-dispatch-gap-20260815.md §Corrected
+closure-count diff]`. (Closures there are Rust profiling closures, not raw
+Metal dispatches; the two counts are not interchangeable.)
+
+Read that reconciliation and one term looks like free money. The 104
+separated norm-boundary groups are the largest single line in the diff, and
+they exist only because a boundary was drawn between two norms. So we built
+the fix: a hybrid that fused across the boundary and deleted the separated
+groups. The expectation was that the graph would shed the biggest slice of
+its extra structure while computing exactly the same numbers, since fusing
+adjacent arithmetic is supposed to be a rearrangement, not a change. It was
+not. The hybrid changed bits — normalized-logprob max error 3.197e-4
+against a 1e-4 contract, with the first divergence tracked down to one f16
+ULP in layer-1 V — and we kept the postmortem instead of the patch
+`[docs/decode-dispatch-gap-20260815.md §Rejected hybrid postmortem]`. (In
+that sentence a *logprob* is the logarithm of the probability the model
 assigns a token, and a *ULP* — unit in the last place — is the smallest
 step a float format can take; the parity contract is measured in exactly
-those units. [Ch 38](38-measuring-against-llama-cpp.md) owns it.) The
-one *exact* removal (a single 6,656-element copy) bought −0.136 ms GPU
-(−0.34 %) `[docs/decode-dispatch-gap-20260815.md §Landed and rejected
-reductions]`. Dispatch structure is a lever, but exactness is the gate.
+those units. [Ch 38](38-measuring-against-llama-cpp.md) owns it.)
 
-**Concurrent vs serial encoding.** Concurrent dispatch lets independent
-projections overlap; the price is that every real dependency needs its
-barrier (§2.9). The engine keeps both, behind a flag, because the prefill
-side measured the difference: "serial prefill paid a launch tax on PP128"
-(`[crates/muser-engine/src/decode.rs:976-979]`) — PP128 being the
-128-token prompt-processing benchmark cell — which is why concurrent
-is the default and `MUSER_SERIAL_PREFILL_DISPATCH` exists only to re-run
-the comparison.
+The lesson is worth stating plainly, because the rest of the book keeps
+running into it: dispatch structure is a lever, but exactness is the gate.
+A restructuring that changes the output is not a faster engine, it is a
+different engine, and it does not get to compete. What survived from the
+same investigation was the one removal that was provably exact — a single
+6,656-element copy — which bought −0.136 ms GPU (−0.34 %)
+`[docs/decode-dispatch-gap-20260815.md §Landed and rejected
+reductions]`. That is the honest size of the prize when you refuse to
+trade bits for it.
 
-**Panicking on an unregistered pipeline.** `PsoCache::get` panics on a
-miss (`[crates/muser-engine/src/metal/pso_cache.rs:45-49]`). That is a
-deliberate trade: a typo'd kernel name becomes an immediate, loud crash at
-first dispatch — a programming error caught in development — rather than a
-silent no-op or a fallback path. Fail-closed, even here.
+**Concurrent vs serial encoding.** Concurrency buys overlap between
+independent projections and sells you a new obligation in return: every
+real dependency now needs its barrier, spelled out by hand, or the engine
+computes garbage fast (§2.9). That is a bad trade whenever the overlap is
+worth nothing — which is what the "prefill kernels are large enough
+already" argument predicted, and what the measurement contradicted:
+"serial prefill paid a launch tax on PP128"
+`[crates/muser-engine/src/decode.rs:976-979]`, PP128 being the 128-token
+prompt-processing benchmark cell. Concurrent is therefore the default, and
+`MUSER_SERIAL_PREFILL_DISPATCH` survives for one purpose only: re-running
+the comparison that settled it.
+
+**Panicking on an unregistered pipeline.** The gentle-looking alternative
+is to hand back nothing and carry on — return an `Option`, skip the
+dispatch when the name is unknown, keep the server up. Follow that path to
+its end, though, and a typo'd kernel name produces no error at all: the
+output buffer keeps whatever was in it, the graph continues, and the model
+goes on emitting plausible tokens computed from a step that never ran.
+Muser takes the crash instead. `PsoCache::get` panics on a miss
+`[crates/muser-engine/src/metal/pso_cache.rs:45-49]`, so the mistake
+surfaces at the first dispatch, in development, as a programming error
+with a name attached. Fail-closed, even here.
 
 ## 2.12 What's next
 
