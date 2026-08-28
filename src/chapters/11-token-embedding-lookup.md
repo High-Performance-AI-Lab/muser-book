@@ -84,7 +84,7 @@ How big is one Q4_K row? Show the arithmetic, because the same multiply
 returns in every kernel chapter:
 
 ```
-  Q4_K super-block = 256 elements in 144 bytes          ([Ch 6](06-the-kquant-family.md))
+  Q4_K super-block = 256 elements in 144 bytes          (Ch 6)
   row_bytes        = (6,656 / 256) × 144 = 26 × 144 = 3,744 B
   table total      = 202,048 × 3,744    = 756,467,712 B ≈ 756 MB
 ```

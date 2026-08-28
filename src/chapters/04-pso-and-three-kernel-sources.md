@@ -23,7 +23,7 @@ between "text a human wrote" and "a kernel the GPU can run":
    ever running the frontend compiler.
 3. **`MTLComputePipelineState` — the PSO** — one function taken from the
    library and lowered all the way to machine code for *this specific
-   GPU*. This `[PSO](../glossary.md#pso)` is the handle you hand to
+   GPU*. This [PSO](../glossary.md#pso) is the handle you hand to
    `set_compute_pipeline_state` on an encoder.
 
 Figure 4.1 shows how Muser's three kernel sources feed that last stage.

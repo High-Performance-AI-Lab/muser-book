@@ -34,7 +34,7 @@ mechanically rather than by convention `[docs/kvpack.md §Why it exists]`:
 
 The scale motivating all three is already derived: a 65k prompt's cache is
 hundreds of megabytes; a 131k prompt's is nearly a gigabyte
-(`[Ch 22](22-the-price-of-context.md)`, Table 22.1); the measured deep wire
+([Ch 22](22-the-price-of-context.md), Table 22.1); the measured deep wire
 payload is 1,823,184,896 B `[receipt phase4-disagg-20260820/130815-g900091/]`.
 State that size cannot be re-checked by eyeball; it needs proof objects.
 
@@ -537,7 +537,7 @@ append-only volume `[AGENTS.md; ledger Arc 2]`. This gate is that lesson
 turned into a fail-closed preflight — the receiver refuses *before* any
 transfer rather than stalling *during* one. It is worth separating this
 fsync tail from the other deep-payload stall of the same campaign (EEE
-link-idle retransmission blackouts, `[Ch 31](31-the-wire-discipline.md)`);
+link-idle retransmission blackouts, [Ch 31](31-the-wire-discipline.md));
 both punished the deep burst schedule, by different mechanisms, and both
 got operationalized — one as this bind-time probe, one as the EEE-off link
 invariant.
@@ -561,7 +561,7 @@ Python-only producer" `[docs/kvpack-merge-handoff §3 F1]`).
 §24.4–§24.5 could, in principle, be advisory — restore anyway, let quality
 absorb it. The format refuses, and the campaign's receipts show what the
 refusal buys: bit-identical warm hits at depth
-(`[Ch 25](25-warm-reuse.md)`) are only claimable *because* a wrong
+([Ch 25](25-warm-reuse.md)) are only claimable *because* a wrong
 tokenizer, template, layout, or scalar-math constant is a miss, not a
 restore. The cost is the opposite of convenience — "a different model,
 tokenizer, template, quantization, layout, or engine ABI is a miss, not a

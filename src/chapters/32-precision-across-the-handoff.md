@@ -589,11 +589,11 @@ the fail-closed refusal, and the measured rejection — with receipts.
 - `[measured-numbers §1i, §1l, §2 Arc 4, §6]` — the quality-gate table,
   wizard validation cells, the arithmetic-ABI arc, and the claim-
   discipline crib sheet (publish the sensitivity; evidence wins).
-- `[Ch 7](07-nvfp4-native-lane.md)` §7.6–7.7 — Fallback B and the
+- [Ch 7](07-nvfp4-native-lane.md) §7.6–7.7 — Fallback B and the
   producer-mode preview this chapter builds on.
-- `[Ch 20](20-final-norm-lm-head-softcap.md)` §20.7 — the soft cap's
+- [Ch 20](20-final-norm-lm-head-softcap.md) §20.7 — the soft cap's
   monotonicity and gap compression; why bounded-logit deltas are capped-
   logit units.
-- `[Ch 30](30-handoff-v2-transport.md)`, `[Ch 31](31-the-wire-discipline.md)`
+- [Ch 30](30-handoff-v2-transport.md), [Ch 31](31-the-wire-discipline.md)
   — the authentication and wire machinery underneath; [Ch 33](33-speculation-and-the-distributed-verdict.md)
   — the verification machinery that never trusts a draft.

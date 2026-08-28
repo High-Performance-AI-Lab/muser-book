@@ -269,7 +269,7 @@ Two boundaries keep this honest rather than purely arithmetic:
   passes, this chapter supports engineering capacity checks only.
 
 Put as a ratio, the two currencies this book tracks: one decode token reads
-≈16.76 GB of weights (`[Ch 1](01-why-inference-is-a-memory-problem.md)`,
+≈16.76 GB of weights ([Ch 1](01-why-inference-is-a-memory-problem.md),
 artifact size above) and writes 53,248 B of KV below the window, 13,312 B
 above it — a factor of ~315,000 between the per-token weight read and the
 per-token KV write. Weights dominate the *speed* of a token
@@ -294,7 +294,7 @@ it reconciles to the byte against this chapter's formula:
 (Two details you will meet again: the NoPE row count is 130,814, not
 130,815, because the receiver deliberately holds back the boundary token and
 decodes it locally; and the SWA rings travel as three 13-layer groups — the
-transfer schedule of `[Ch 24](24-kvpack-the-format.md)`.) By these terms,
+transfer schedule of [Ch 24](24-kvpack-the-format.md).) By these terms,
 **95.5 % of a deep payload is the 13 NoPE planes and 4.5 % is the 39 SWA
 rings** `[docs/kvpack-merge-handoff §3 D1, §6]`. This is not incidental: it
 is the load-bearing fact that the NoPE layers are *position-free*

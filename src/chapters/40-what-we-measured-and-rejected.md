@@ -101,7 +101,7 @@ kquant bar — "Of its 37.619 s decode span, target verification consumes
 128.4 ms in the L-series kquant reference" `[ledger "F-series remediation
 context"]`. The W4A4 batched verify matmul — the one shape where FP4 tensor
 arithmetic should shine — is the very place the lane collapses
-(`[Ch 33](33-speculation-and-the-distributed-verdict.md)`). A remediation
+([Ch 33](33-speculation-and-the-distributed-verdict.md)). A remediation
 lane ("Fallback A": a Mac weight-only E2M1 verifier) was then built and
 measured to its own no-go: best result **227.864 ms GPU** per 16-row cycle,
 "still 13.9 % over the preregistered 200 ms GPU admission gate and 1.77x
