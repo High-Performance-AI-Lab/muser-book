@@ -13,7 +13,7 @@ to a retained evidence receipt.
 ## Read it
 
 The rendered book publishes to GitHub Pages from this repository's `main`
-branch: `https://high-performance-ai-lab.github.io/muser-book/`.
+branch: <https://highperformanceailab.com/muser-book/>.
 
 ## Build it locally
 
@@ -21,6 +21,7 @@ branch: `https://high-performance-ai-lab.github.io/muser-book/`.
 cargo install mdbook mdbook-mermaid   # or brew install mdbook mdbook-mermaid
 mdbook build                          # output in book/
 mdbook serve                          # http://localhost:3000
+python3 scripts/check_social_meta.py  # verify rendered social metadata
 ```
 
 ## How the book keeps itself honest

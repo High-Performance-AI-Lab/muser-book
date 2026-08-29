@@ -194,7 +194,7 @@ hardware contract (one M3 Ultra 96 GB decode host, four slots at 131,072
 context, GX10 as prefill/storage node and never a decode destination), the
 in-scope list (single model, llama-pinned parity, vision, DFlash, GX10,
 dashboard, sessions, migration), the out-of-scope list (LoRA, hot-swap,
-infill, Responses/Anthropic APIs, "public-CoreML ANE DFlash routing
+infill, hosted-provider APIs, "public-CoreML ANE DFlash routing
 (experimental post-release)"), and a release policy that reads like the
 ledger's ethics compressed into six booleans (Figure 39.2):
 

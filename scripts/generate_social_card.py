@@ -2,8 +2,8 @@
 """Generate the muser-book social card (1200x630 PNG).
 
 Deterministic output: no randomness, no external assets. The committed
-assets/muser-book-social-card.png is the render used as the GitHub social
-preview. Re-run after changing any text:
+copies are the GitHub repository preview and the card served by the book.
+Re-run after changing any text:
 
     python3 scripts/generate_social_card.py --check   # verify committed PNG
     python3 scripts/generate_social_card.py           # regenerate
@@ -63,23 +63,29 @@ def main() -> int:
                     help="verify the committed PNG matches a fresh render")
     args = ap.parse_args()
 
-    out = Path(__file__).resolve().parent.parent / "assets" / "muser-book-social-card.png"
+    root = Path(__file__).resolve().parent.parent
+    outputs = [
+        root / "assets" / "muser-book-social-card.png",
+        root / "src" / "muser-book-social-card.png",
+    ]
     fresh = render()
 
     if args.check:
-        if not out.exists():
-            print("FAIL: committed card missing:", out)
-            return 1
-        committed = Image.open(out).convert("RGB")
-        if committed.tobytes() != fresh.tobytes():
-            print("FAIL: committed card differs from fresh render")
-            return 1
+        for output in outputs:
+            if not output.exists():
+                print("FAIL: committed card missing:", output)
+                return 1
+            committed = Image.open(output).convert("RGB")
+            if committed.tobytes() != fresh.tobytes():
+                print("FAIL: committed card differs from fresh render:", output)
+                return 1
         print("PASS: social card matches render")
         return 0
 
-    out.parent.mkdir(parents=True, exist_ok=True)
-    fresh.save(out, format="PNG", optimize=True)
-    print("wrote", out)
+    for output in outputs:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        fresh.save(output, format="PNG", optimize=True)
+        print("wrote", output)
     return 0
 
 
